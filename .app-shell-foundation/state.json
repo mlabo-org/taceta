@@ -1,6 +1,6 @@
 {
   "files": {
-    "src/app_shell_foundation.rs": "ecfe889f61be966911ca8ff22fb75ba8521d5c8560636c2d53325f7691e915ef"
+    "src/app_shell_foundation.rs": "ed8838f8f39bfb0bcaea2b14d4720d91453f6fbe4bf6ba06978cea64a3dac02a"
   },
   "platform": "eframe-egui",
   "schemaVersion": 1,

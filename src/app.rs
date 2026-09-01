@@ -8,8 +8,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use eframe::egui::{
-    self, Align, Button, CentralPanel, ComboBox, Context, Key, Layout, Panel, RichText, ScrollArea,
-    Spinner, TextEdit, Ui, Vec2,
+    self, Align, Button, CentralPanel, Context, Key, Layout, Panel, RichText, ScrollArea, Spinner,
+    TextEdit, Ui, Vec2,
 };
 use taceta::{
     backend::{InferenceBackend, OllamaClient},
@@ -23,9 +23,9 @@ use uuid::Uuid;
 
 use crate::{
     app_shell_foundation::{
-        AppShellLanguage, AppShellPreferences, apply_app_shell_preferences,
-        install_macos_system_fonts, load_app_shell_preferences, save_app_shell_preferences,
-        show_app_shell_preferences,
+        AppShellLanguage, AppShellPreferences, app_shell_control_metrics,
+        apply_app_shell_preferences, install_macos_system_fonts, load_app_shell_preferences,
+        save_app_shell_preferences, show_app_shell_menu_row, show_app_shell_preferences,
     },
     localization::{conversation_title, system_language, text},
     persistence::{
@@ -818,17 +818,28 @@ impl TacetaApp {
                             let context_control_width = ui.available_width();
                             let context_tick_width =
                                 context_control_width / CONTEXT_LENGTH_OPTIONS.len() as f32;
-                            let context_slider_width =
-                                context_control_width - context_tick_width;
+                            let handle_aspect_ratio = 0.75;
+                            let slider_height = ui
+                                .text_style_height(&egui::TextStyle::Body)
+                                .max(ui.spacing().interact_size.y);
+                            let handle_inset = slider_height / 2.5 * handle_aspect_ratio;
+                            let context_slider_width = context_control_width
+                                - context_tick_width
+                                + 2.0 * handle_inset;
                             let slider_response = ui
                                 .horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 0.0;
                                     ui.spacing_mut().slider_width = context_slider_width;
-                                    ui.add_space(context_tick_width / 2.0);
+                                    ui.add_space(
+                                        (context_tick_width / 2.0 - handle_inset).max(0.0),
+                                    );
                                     ui.add(
                                         egui::Slider::new(&mut context_index, 0..=6)
                                             .integer()
-                                            .show_value(false),
+                                            .show_value(false)
+                                            .handle_shape(egui::style::HandleShape::Rect {
+                                                aspect_ratio: handle_aspect_ratio,
+                                            }),
                                     )
                                 })
                                 .inner;
@@ -954,18 +965,20 @@ impl TacetaApp {
         let language = self.language();
         let palette = theme::palette(ui);
         let available = ui.available_width();
-        let max_width = match message.role {
-            Role::User => available.min(650.0),
-            _ => available.min(760.0),
+        let max_width = available * 0.82;
+        let row_layout = match message.role {
+            Role::User => Layout::right_to_left(Align::Min),
+            _ => Layout::left_to_right(Align::Min),
         };
 
-        ui.horizontal(|ui| {
-            if message.role == Role::User {
-                ui.add_space((available - max_width).max(0.0));
-            }
+        ui.with_layout(row_layout, |ui| {
+            let content_layout = match message.role {
+                Role::User => Layout::top_down(Align::Max),
+                _ => Layout::top_down(Align::Min),
+            };
             ui.vertical(|ui| {
-                ui.set_max_width(max_width);
-                match message.role {
+                ui.set_width(max_width);
+                ui.with_layout(content_layout, |ui| match message.role {
                     Role::User => {
                         theme::card(palette.user_bubble, palette.border, 14, 14).show(ui, |ui| {
                             self.show_attachment_names(ui, message, &palette);
@@ -983,7 +996,9 @@ impl TacetaApp {
                                         .color(palette.accent),
                                 );
                                 ui.add_space(5.0);
-                                ui.label(RichText::new(&message.thinking).color(palette.muted));
+                                ui.label(
+                                    RichText::new(&message.thinking).color(palette.contrast_text),
+                                );
                             });
                             ui.add_space(10.0);
                         }
@@ -1001,7 +1016,7 @@ impl TacetaApp {
                     Role::System => {
                         ui.label(RichText::new(&message.content).weak());
                     }
-                }
+                });
             });
         });
     }
@@ -1019,7 +1034,7 @@ impl TacetaApp {
                 ui.label(
                     RichText::new(format!("{icon} {}", attachment.name))
                         .small()
-                        .color(palette.muted),
+                        .color(palette.contrast_text),
                 );
             }
         });
@@ -1039,7 +1054,7 @@ impl TacetaApp {
             .exact_size(panel_height)
             .show_inside(root_ui, |ui| {
                 let available = ui.available_width();
-                let composer_width = available.min(900.0);
+                let composer_width = available;
                 ui.horizontal(|ui| {
                     ui.add_space(((available - composer_width) / 2.0).max(0.0));
                     ui.vertical(|ui| {
@@ -1071,83 +1086,154 @@ impl TacetaApp {
                                 self.state.pending_attachments.remove(index);
                             }
 
-                            let editor = ui.add_sized(
-                                [ui.available_width(), 58.0],
-                                TextEdit::multiline(&mut self.state.draft)
-                                    .hint_text(text(language, "何でもどうぞ", "Message Taceta"))
-                                    .desired_rows(3)
-                                    .frame(egui::Frame::NONE),
-                            );
+                            let editor = ui
+                                .scope(|ui| {
+                                    ui.visuals_mut().weak_text_color =
+                                        Some(palette.placeholder_text);
+                                    ui.add_sized(
+                                        [ui.available_width(), 58.0],
+                                        TextEdit::multiline(&mut self.state.draft)
+                                            .hint_text(text(
+                                                language,
+                                                "何でもどうぞ",
+                                                "Message Taceta",
+                                            ))
+                                            .desired_rows(3)
+                                            .frame(egui::Frame::NONE),
+                                    )
+                                })
+                                .inner;
                             let keyboard_send = editor.has_focus()
                                 && ui.input(|input| {
                                     input.key_pressed(Key::Enter)
                                         && (input.modifiers.command || input.modifiers.ctrl)
                                 });
 
-                            ui.horizontal_wrapped(|ui| {
-                                let file_clicked = ui
-                                    .add_enabled(
-                                        self.generation.is_none(),
-                                        Button::new("＋").small(),
-                                    )
-                                    .on_hover_text(text(language, "ファイルを追加", "Add files"))
-                                    .clicked();
+                            let control = app_shell_control_metrics(ui.ctx());
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(ui.available_width(), control.row_height),
+                                Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().button_padding.y = control.vertical_padding;
+                                    ui.style_mut().override_text_valign = Some(Align::Center);
+                                    ui.visuals_mut().widgets.inactive.bg_fill =
+                                        egui::Color32::TRANSPARENT;
+                                    ui.visuals_mut().widgets.inactive.bg_stroke =
+                                        egui::Stroke::NONE;
+                                    let file_clicked = ui
+                                        .add_enabled(
+                                            self.generation.is_none(),
+                                            Button::new("＋")
+                                                .min_size(Vec2::splat(control.row_height))
+                                                .corner_radius(control.row_height / 2.0),
+                                        )
+                                        .on_hover_text(text(
+                                            language,
+                                            "ファイルを追加",
+                                            "Add files",
+                                        ))
+                                        .clicked();
 
-                                ui.separator();
-                                self.show_model_selector(ui);
-                                self.show_thinking_mode_selector(ui);
+                                    self.show_model_selector(ui);
+                                    self.show_thinking_mode_selector(ui);
 
-                                let trace_label = if self.state.show_thinking_trace {
-                                    text(language, "思考表示: ON", "Trace: Visible")
-                                } else {
-                                    text(language, "思考表示: OFF", "Trace: Hidden")
-                                };
-                                if ui
-                                    .selectable_label(self.state.show_thinking_trace, trace_label)
-                                    .on_hover_text(text(
-                                        language,
-                                        "推論を止めず、思考過程の表示だけを切り替えます",
-                                        "Show or hide the trace without stopping inference",
-                                    ))
-                                    .clicked()
-                                {
-                                    self.state.show_thinking_trace =
-                                        !self.state.show_thinking_trace;
-                                }
-
-                                let mut send_clicked = false;
-                                let mut stop_clicked = false;
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if self.generation.is_some() {
-                                        stop_clicked = ui
-                                            .add(
-                                                Button::new(text(language, "■ 停止", "■ Stop"))
-                                                    .corner_radius(14),
-                                            )
-                                            .clicked();
+                                    let trace_label = if self.state.show_thinking_trace {
+                                        text(language, "思考表示: ON", "Trace: Visible")
                                     } else {
-                                        let ready = self.state.selected_model.is_some()
-                                            && (!self.state.draft.trim().is_empty()
-                                                || !self.state.pending_attachments.is_empty());
-                                        send_clicked = ui
-                                            .add_enabled(
-                                                ready,
-                                                Button::new(text(language, "送信 ↑", "Send ↑"))
-                                                    .corner_radius(14),
-                                            )
-                                            .clicked();
+                                        text(language, "思考表示: OFF", "Trace: Hidden")
+                                    };
+                                    if ui
+                                        .add(
+                                            Button::new(trace_label)
+                                                .min_size(Vec2::new(0.0, control.row_height))
+                                                .corner_radius(control.row_height / 2.0),
+                                        )
+                                        .on_hover_text(text(
+                                            language,
+                                            "推論を止めず、思考過程の表示だけを切り替えます",
+                                            "Show or hide the trace without stopping inference",
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.state.show_thinking_trace =
+                                            !self.state.show_thinking_trace;
                                     }
-                                });
 
-                                if file_clicked {
-                                    self.attach_files();
-                                }
-                                if stop_clicked {
-                                    self.stop_generation();
-                                } else if send_clicked || keyboard_send {
-                                    self.start_generation();
-                                }
-                            });
+                                    let mut send_clicked = false;
+                                    let mut stop_clicked = false;
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if self.generation.is_some() {
+                                            let action_fill = if ui.visuals().dark_mode {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                egui::Color32::BLACK
+                                            };
+                                            let action_text = if ui.visuals().dark_mode {
+                                                egui::Color32::BLACK
+                                            } else {
+                                                egui::Color32::WHITE
+                                            };
+                                            stop_clicked = ui
+                                                .add(
+                                                    Button::new(
+                                                        RichText::new("■").color(action_text),
+                                                    )
+                                                    .min_size(Vec2::splat(control.row_height))
+                                                    .corner_radius(control.row_height / 2.0)
+                                                    .fill(action_fill)
+                                                    .stroke(egui::Stroke::new(1.0, action_fill)),
+                                                )
+                                                .on_hover_text(text(language, "停止", "Stop"))
+                                                .clicked();
+                                        } else {
+                                            let ready = self.state.selected_model.is_some()
+                                                && (!self.state.draft.trim().is_empty()
+                                                    || !self.state.pending_attachments.is_empty());
+                                            let dark = ui.visuals().dark_mode;
+                                            let action_fill = if ready {
+                                                if dark {
+                                                    egui::Color32::WHITE
+                                                } else {
+                                                    egui::Color32::BLACK
+                                                }
+                                            } else {
+                                                palette.border
+                                            };
+                                            let action_text = if ready {
+                                                if dark {
+                                                    egui::Color32::BLACK
+                                                } else {
+                                                    egui::Color32::WHITE
+                                                }
+                                            } else {
+                                                palette.contrast_text
+                                            };
+                                            send_clicked = ui
+                                                .add_enabled(
+                                                    ready,
+                                                    Button::new(
+                                                        RichText::new("↑").color(action_text),
+                                                    )
+                                                    .min_size(Vec2::splat(control.row_height))
+                                                    .corner_radius(control.row_height / 2.0)
+                                                    .fill(action_fill)
+                                                    .stroke(egui::Stroke::new(1.0, action_fill)),
+                                                )
+                                                .on_hover_text(text(language, "送信", "Send"))
+                                                .clicked();
+                                        }
+                                    });
+
+                                    if file_clicked {
+                                        self.attach_files();
+                                    }
+                                    if stop_clicked {
+                                        self.stop_generation();
+                                    } else if send_clicked || keyboard_send {
+                                        self.start_generation();
+                                    }
+                                },
+                            );
                         });
                     });
                 });
@@ -1156,36 +1242,44 @@ impl TacetaApp {
 
     fn show_model_selector(&mut self, ui: &mut Ui) {
         let language = self.language();
+        let control = app_shell_control_metrics(ui.ctx());
+        let radius = control.row_height / 2.0;
         let selected = self
             .state
             .selected_model
             .clone()
             .unwrap_or_else(|| text(language, "モデルなし", "No model").to_owned());
         let mut changed = false;
-        ComboBox::from_id_salt("taceta-model-selector")
-            .selected_text(compact_model_name(&selected))
-            .width(150.0)
-            .show_ui(ui, |ui| {
-                for model in &self.models {
-                    if ui
-                        .selectable_value(
-                            &mut self.state.selected_model,
-                            Some(model.name.clone()),
-                            &model.name,
-                        )
-                        .changed()
-                    {
-                        changed = true;
-                    }
+        egui::containers::menu::MenuButton::from_button(
+            Button::new(compact_model_name(&selected))
+                .min_size(Vec2::new(0.0, control.row_height))
+                .right_text("▼")
+                .corner_radius(radius),
+        )
+        .ui(ui, |ui| {
+            ui.spacing_mut().button_padding.y = control.vertical_padding;
+            let mut selected_model = self.state.selected_model.clone();
+            for model in &self.models {
+                if show_app_shell_menu_row(
+                    ui,
+                    &mut selected_model,
+                    Some(model.name.clone()),
+                    &model.name,
+                )
+                .clicked()
+                {
+                    changed = true;
                 }
-                if self.models.is_empty() {
-                    ui.label(text(
-                        language,
-                        "ローカルモデルが見つかりません",
-                        "No local models found",
-                    ));
-                }
-            });
+            }
+            self.state.selected_model = selected_model;
+            if self.models.is_empty() {
+                ui.label(text(
+                    language,
+                    "ローカルモデルが見つかりません",
+                    "No local models found",
+                ));
+            }
+        });
         if changed {
             self.ensure_selected_thinking_mode();
         }
@@ -1193,8 +1287,15 @@ impl TacetaApp {
 
     fn show_thinking_mode_selector(&mut self, ui: &mut Ui) {
         let language = self.language();
+        let control = app_shell_control_metrics(ui.ctx());
+        let radius = control.row_height / 2.0;
         let Some(model) = self.selected_model().cloned() else {
-            ui.add_enabled(false, Button::new("Thinking: —").small());
+            ui.add_enabled(
+                false,
+                Button::new("Thinking: —")
+                    .min_size(Vec2::new(0.0, control.row_height))
+                    .corner_radius(radius),
+            );
             return;
         };
         let current = self
@@ -1209,7 +1310,9 @@ impl TacetaApp {
             ThinkingCapability::None => {
                 ui.add_enabled(
                     false,
-                    Button::new(text(language, "思考: 非対応", "Thinking: N/A")).small(),
+                    Button::new(text(language, "思考: 非対応", "Thinking: N/A"))
+                        .min_size(Vec2::new(0.0, control.row_height))
+                        .corner_radius(radius),
                 );
             }
             ThinkingCapability::Unverified => {
@@ -1220,7 +1323,8 @@ impl TacetaApp {
                         "思考: モデル既定",
                         "Thinking: Model default",
                     ))
-                    .small(),
+                    .min_size(Vec2::new(0.0, control.row_height))
+                    .corner_radius(radius),
                 )
                 .on_disabled_hover_text(text(
                     language,
@@ -1230,39 +1334,62 @@ impl TacetaApp {
             }
             ThinkingCapability::Toggle => {
                 let mut selected = current;
-                ComboBox::from_id_salt("taceta-thinking-toggle")
-                    .selected_text(thinking_mode_label(language, selected))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut selected,
-                            ThinkingMode::On,
-                            text(language, "思考: ON", "Thinking: On"),
-                        );
-                        ui.selectable_value(
-                            &mut selected,
-                            ThinkingMode::Off,
-                            text(language, "思考: OFF", "Thinking: Off"),
-                        );
-                    });
+                egui::containers::menu::MenuButton::from_button(
+                    Button::new(thinking_mode_label(language, selected))
+                        .min_size(Vec2::new(0.0, control.row_height))
+                        .right_text("▼")
+                        .corner_radius(radius),
+                )
+                .ui(ui, |ui| {
+                    if show_app_shell_menu_row(
+                        ui,
+                        &mut selected,
+                        ThinkingMode::On,
+                        text(language, "ON", "ON"),
+                    )
+                    .clicked()
+                    {
+                        selected = ThinkingMode::On;
+                    }
+                    if show_app_shell_menu_row(
+                        ui,
+                        &mut selected,
+                        ThinkingMode::Off,
+                        text(language, "OFF", "OFF"),
+                    )
+                    .clicked()
+                    {
+                        selected = ThinkingMode::Off;
+                    }
+                });
                 self.state.thinking_modes.insert(model.name, selected);
             }
             ThinkingCapability::Levels => {
                 let mut selected = current;
-                ComboBox::from_id_salt("taceta-thinking-level")
-                    .selected_text(thinking_mode_label(language, selected))
-                    .show_ui(ui, |ui| {
-                        for (level, japanese, english) in [
-                            (ThinkingLevel::Low, "思考: 低", "Thinking: Low"),
-                            (ThinkingLevel::Medium, "思考: 中", "Thinking: Medium"),
-                            (ThinkingLevel::High, "思考: 高", "Thinking: High"),
-                        ] {
-                            ui.selectable_value(
-                                &mut selected,
-                                ThinkingMode::Level(level),
-                                text(language, japanese, english),
-                            );
+                egui::containers::menu::MenuButton::from_button(
+                    Button::new(thinking_mode_label(language, selected))
+                        .min_size(Vec2::new(0.0, control.row_height))
+                        .right_text("▼")
+                        .corner_radius(radius),
+                )
+                .ui(ui, |ui| {
+                    for (level, japanese, english) in [
+                        (ThinkingLevel::Low, "低", "Low"),
+                        (ThinkingLevel::Medium, "中", "Medium"),
+                        (ThinkingLevel::High, "高", "High"),
+                    ] {
+                        if show_app_shell_menu_row(
+                            ui,
+                            &mut selected,
+                            ThinkingMode::Level(level),
+                            text(language, japanese, english),
+                        )
+                        .clicked()
+                        {
+                            selected = ThinkingMode::Level(level);
                         }
-                    });
+                    }
+                });
                 self.state.thinking_modes.insert(model.name, selected);
             }
         }
@@ -1279,6 +1406,7 @@ impl eframe::App for TacetaApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        theme::apply_text_contrast(ui);
         self.show_sidebar(ui);
         self.show_top_bar(ui);
 

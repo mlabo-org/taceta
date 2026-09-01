@@ -7,11 +7,41 @@ pub struct TacetaPalette {
     pub user_bubble: Color32,
     pub thinking: Color32,
     pub border: Color32,
-    pub muted: Color32,
+    pub contrast_text: Color32,
+    pub placeholder_text: Color32,
     pub accent: Color32,
     pub success: Color32,
     pub warning: Color32,
     pub error: Color32,
+}
+
+pub fn apply_text_contrast(ui: &mut egui::Ui) {
+    let dark = ui.visuals().dark_mode;
+    let text_color = if dark { Color32::WHITE } else { Color32::BLACK };
+    let visuals = ui.visuals_mut();
+    visuals.override_text_color = Some(text_color);
+    visuals.weak_text_color = Some(text_color);
+    visuals.widgets.noninteractive.fg_stroke.color = text_color;
+    visuals.widgets.inactive.fg_stroke.color = text_color;
+    visuals.widgets.hovered.fg_stroke.color = text_color;
+    visuals.widgets.active.fg_stroke.color = text_color;
+    visuals.widgets.open.fg_stroke.color = text_color;
+    apply_selection_contrast(visuals);
+}
+
+/// Apply Taceta's selection colors to a local UI scope.
+///
+/// egui menu popups are rendered in a separate `Ui` and therefore do not
+/// inherit the root UI's local visual overrides. Keep this narrowly scoped to
+/// selection visuals so menu-specific styling remains otherwise unchanged.
+pub fn apply_selection_contrast(visuals: &mut egui::Visuals) {
+    let selection_blue = if visuals.dark_mode {
+        Color32::from_rgb(10, 132, 255)
+    } else {
+        Color32::from_rgb(0, 122, 255)
+    };
+    visuals.selection.bg_fill = selection_blue;
+    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
 }
 
 pub fn palette(ui: &egui::Ui) -> TacetaPalette {
@@ -23,7 +53,8 @@ pub fn palette(ui: &egui::Ui) -> TacetaPalette {
             user_bubble: Color32::from_rgb(38, 38, 40),
             thinking: Color32::from_rgb(31, 35, 40),
             border: Color32::from_rgb(67, 67, 70),
-            muted: Color32::from_rgb(164, 164, 170),
+            contrast_text: Color32::WHITE,
+            placeholder_text: Color32::from_rgb(128, 128, 134),
             accent: Color32::from_rgb(176, 135, 255),
             success: Color32::from_rgb(98, 208, 144),
             warning: Color32::from_rgb(244, 183, 82),
@@ -36,7 +67,8 @@ pub fn palette(ui: &egui::Ui) -> TacetaPalette {
             user_bubble: Color32::from_rgb(239, 239, 242),
             thinking: Color32::from_rgb(243, 246, 251),
             border: Color32::from_rgb(216, 216, 220),
-            muted: Color32::from_rgb(101, 101, 108),
+            contrast_text: Color32::BLACK,
+            placeholder_text: Color32::from_rgb(128, 128, 134),
             accent: Color32::from_rgb(107, 68, 188),
             success: Color32::from_rgb(35, 139, 83),
             warning: Color32::from_rgb(173, 104, 15),
