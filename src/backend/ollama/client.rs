@@ -1,6 +1,6 @@
 use super::{
     api::{ChatBody, ChatOptions, ShowResponse, TagsResponse, WireMessage},
-    capability, stream,
+    capability, lifecycle, stream,
 };
 use crate::{
     backend::{BackendError, BackendFuture, InferenceBackend},
@@ -27,6 +27,7 @@ impl OllamaClient {
         format!("{}{path}", self.base_url)
     }
     async fn models(&self) -> Result<Vec<ModelDescriptor>, BackendError> {
+        lifecycle::ensure_ready(&self.http, &self.base_url).await?;
         let tags: TagsResponse = self
             .http
             .get(self.url("/api/tags"))
@@ -71,6 +72,7 @@ impl InferenceBackend for OllamaClient {
     ) -> BackendFuture<()> {
         let client = self.clone_for_task();
         Box::pin(async move {
+            lifecycle::ensure_ready(&client.http, &client.base_url).await?;
             let body = ChatBody {
                 model: request.model,
                 messages: request.messages.iter().map(wire_message).collect(),
