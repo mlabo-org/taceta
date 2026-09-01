@@ -815,14 +815,24 @@ impl TacetaApp {
                                 .iter()
                                 .position(|value| *value == self.state.context_length)
                                 .unwrap_or(3) as u32;
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut context_index, 0..=6)
-                                        .integer()
-                                        .show_value(false),
-                                )
-                                .changed()
-                            {
+                            let context_control_width = ui.available_width();
+                            let context_tick_width =
+                                context_control_width / CONTEXT_LENGTH_OPTIONS.len() as f32;
+                            let context_slider_width =
+                                context_control_width - context_tick_width;
+                            let slider_response = ui
+                                .horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.spacing_mut().slider_width = context_slider_width;
+                                    ui.add_space(context_tick_width / 2.0);
+                                    ui.add(
+                                        egui::Slider::new(&mut context_index, 0..=6)
+                                            .integer()
+                                            .show_value(false),
+                                    )
+                                })
+                                .inner;
+                            if slider_response.changed() {
                                 self.state.context_length =
                                     CONTEXT_LENGTH_OPTIONS[context_index as usize];
                             }
@@ -890,24 +900,30 @@ impl TacetaApp {
             .map(|generation| generation.assistant_id);
         CentralPanel::default().show_inside(root_ui, |ui| {
             let available = ui.available_width();
+            let available_height = ui.available_height();
             let reading_width = available.min(820.0);
             ui.horizontal(|ui| {
                 ui.add_space(((available - reading_width) / 2.0).max(0.0));
-                ui.vertical(|ui| {
-                    ui.set_width(reading_width);
-                    self.show_notice(ui);
-                    ScrollArea::vertical()
-                        .id_salt("chat-transcript")
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(self.scroll_to_bottom || self.generation.is_some())
-                        .show(ui, |ui| {
-                            ui.add_space(18.0);
-                            if messages.is_empty() {
-                                ui.add_space(110.0);
-                                ui.vertical_centered(|ui| {
-                                    ui.heading(RichText::new("Taceta").size(26.0));
-                                    ui.add_space(8.0);
-                                    ui.label(
+                ui.allocate_ui_with_layout(
+                    Vec2::new(reading_width, available_height),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        self.show_notice(ui);
+                        let transcript_height = ui.available_height();
+                        ScrollArea::vertical()
+                            .id_salt("chat-transcript")
+                            .auto_shrink([false, false])
+                            .min_scrolled_height(transcript_height)
+                            .max_height(transcript_height)
+                            .stick_to_bottom(self.scroll_to_bottom || self.generation.is_some())
+                            .show(ui, |ui| {
+                                ui.add_space(18.0);
+                                if messages.is_empty() {
+                                    ui.add_space(110.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.heading(RichText::new("Taceta").size(26.0));
+                                        ui.add_space(8.0);
+                                        ui.label(
                                         RichText::new(text(
                                             language,
                                             "深く考える。経過は、必要な時だけ。",
@@ -915,20 +931,21 @@ impl TacetaApp {
                                         ))
                                         .weak(),
                                     );
-                                });
-                            }
-                            for message in &messages {
-                                self.show_message(
-                                    ui,
-                                    message,
-                                    active_generation_target == Some(message.id),
-                                );
-                                ui.add_space(18.0);
-                            }
-                            ui.add_space(12.0);
-                        });
-                    self.scroll_to_bottom = false;
-                });
+                                    });
+                                }
+                                for message in &messages {
+                                    self.show_message(
+                                        ui,
+                                        message,
+                                        active_generation_target == Some(message.id),
+                                    );
+                                    ui.add_space(18.0);
+                                }
+                                ui.add_space(12.0);
+                            });
+                        self.scroll_to_bottom = false;
+                    },
+                );
             });
         });
     }
