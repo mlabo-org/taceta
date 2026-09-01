@@ -1255,7 +1255,9 @@ impl TacetaApp {
                                     CONTEXT_LENGTH_OPTIONS[context_index as usize];
                             }
                             ui.horizontal(|ui| {
-                                let width = ui.available_width() / 7.0;
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                let width = ui.available_width()
+                                    / CONTEXT_LENGTH_OPTIONS.len() as f32;
                                 for value in CONTEXT_LENGTH_OPTIONS {
                                     ui.add_sized(
                                         [width, 16.0],
