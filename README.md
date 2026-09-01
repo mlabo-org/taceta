@@ -5,6 +5,7 @@
 ## できること
 
 - ローカルのモデルへ接続してストリーミング回答を表示
+- 専用のモデル管理画面から、Ollamaモデルの一覧確認・取得・削除
 - Thinking の「生成」と「経過表示」を独立して切り替え
 - Thinking を動かしたまま、trace は画面に出さない設定
 - 対応モデルの能力に応じた Thinking ON/OFF または強度選択
@@ -25,7 +26,7 @@ Thinking のtraceは会話入力へ混ぜません。表示を隠しても推論
 - Rust 1.92 以降（開発・ビルド時）
 - ローカル推論バックエンドとして [Ollama](https://ollama.com/) を別途インストールし、既定の loopback エンドポイント `http://127.0.0.1:11434` で起動
 
-Taceta は Ollama 本体やモデルを同梱・再配布しません。モデルの取得・削除・設定変更は、利用者がバックエンド側で明示的に行ってください。各モデルのライセンスはモデルごとに異なるため、利用するモデルの配布元の条件を確認してください。Web Searchは会話単位で明示的にONにした場合だけ外部通信を行います。Brave SearchとOllama Web SearchはmacOS Keychainに保存したキーを使います。
+Taceta は Ollama 本体やモデルを同梱・再配布しません。モデルの取得・削除は「モデルを管理」画面で利用者が明示的に実行します。各モデルのライセンスはモデルごとに異なるため、利用するモデルの配布元の条件を確認してください。Web Searchは会話単位で明示的にONにした場合だけ外部通信を行います。Brave SearchとOllama Web SearchはmacOS Keychainに保存したキーを使います。
 
 ## ビルドと起動
 
@@ -90,7 +91,7 @@ Thinking traces are never added to the next conversation input. Hiding a trace d
 - Rust 1.92 or later for development builds
 - Install [Ollama](https://ollama.com/) separately as the local inference backend and run it at the default loopback endpoint, `http://127.0.0.1:11434`
 
-Taceta does not bundle or redistribute the Ollama application or any model. Retrieve, remove, and configure models explicitly on the backend side. Model licenses differ by model; review the terms from each model's distributor before use.
+Taceta does not bundle or redistribute the Ollama application or any model. Retrieve and remove models explicitly from the Manage models screen. Model licenses differ by model; review the terms from each model's distributor before use.
 
 ## Build and launch
 

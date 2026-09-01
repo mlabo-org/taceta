@@ -1,15 +1,16 @@
 use super::{
-    api::{ChatBody, ChatOptions, ShowResponse, TagsResponse, WireMessage},
+    api::{ChatBody, ChatOptions, PullBody, PullChunk, ShowResponse, TagsResponse, WireMessage},
     capability, lifecycle, stream,
 };
 use crate::{
-    backend::{BackendError, BackendFuture, InferenceBackend},
+    backend::{BackendError, BackendFuture, InferenceBackend, ModelManager},
     domain::{
-        AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelDescriptor, Role,
-        ThinkingMode,
+        AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelDescriptor,
+        ModelManagerEvent, ModelPullRequest, Role, ThinkingMode,
     },
     web_search::{self, ProviderKind, ToolCall, WebSearchProvider},
 };
+use futures_util::StreamExt;
 use std::collections::HashSet;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -393,6 +394,158 @@ fn think_value(mode: ThinkingMode) -> Option<serde_json::Value> {
     }
 }
 
+pub struct OllamaModelManager {
+    http: reqwest::Client,
+    base_url: String,
+}
+
+impl OllamaModelManager {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
+        }
+    }
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+    fn clone_for_task(&self) -> Self {
+        Self {
+            http: self.http.clone(),
+            base_url: self.base_url.clone(),
+        }
+    }
+    async fn installed(&self) -> Result<Vec<ModelDescriptor>, BackendError> {
+        lifecycle::ensure_ready(&self.http, &self.base_url).await?;
+        let tags: TagsResponse = self
+            .http
+            .get(self.url("/api/tags"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut result = Vec::with_capacity(tags.models.len());
+        for model in tags.models {
+            let name = model.name;
+            let show: ShowResponse = self
+                .http
+                .post(self.url("/api/show"))
+                .json(&serde_json::json!({"model": name}))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            result.push(ModelDescriptor {
+                name: name.clone(),
+                size: model.size,
+                thinking: capability::classify(&name, &show.details.family),
+                vision: capability::has_vision(&show.capabilities),
+                tools: capability::has_tools(&show.capabilities),
+            });
+        }
+        Ok(result)
+    }
+}
+
+impl ModelManager for OllamaModelManager {
+    fn list_installed(&self) -> BackendFuture<Vec<ModelDescriptor>> {
+        let manager = self.clone_for_task();
+        Box::pin(async move { manager.installed().await })
+    }
+    fn pull(
+        &self,
+        request: ModelPullRequest,
+        events: UnboundedSender<ModelManagerEvent>,
+    ) -> BackendFuture<()> {
+        let manager = self.clone_for_task();
+        Box::pin(async move {
+            let model = request.model.trim().to_owned();
+            if model.is_empty() {
+                return Err(BackendError::Protocol("model name is empty".into()));
+            }
+            lifecycle::ensure_ready(&manager.http, &manager.base_url).await?;
+            let _ = events.send(ModelManagerEvent::Started {
+                model: model.clone(),
+            });
+            let response = manager
+                .http
+                .post(manager.url("/api/pull"))
+                .json(&PullBody {
+                    model: model.clone(),
+                    stream: true,
+                })
+                .send()
+                .await?
+                .error_for_status()?;
+            let mut pending = Vec::new();
+            let mut body = response.bytes_stream();
+            while let Some(chunk) = body.next().await {
+                pending.extend_from_slice(&chunk?);
+                while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=end).collect();
+                    if let Some(event) = parse_pull_line(&line, &model)? {
+                        let done = matches!(event, ModelManagerEvent::Completed { .. });
+                        let _ = events.send(event);
+                        if done {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                if let Some(event) = parse_pull_line(&pending, &model)? {
+                    let _ = events.send(event);
+                }
+            }
+            Ok(())
+        })
+    }
+    fn delete(&self, model: String) -> BackendFuture<()> {
+        let manager = self.clone_for_task();
+        Box::pin(async move {
+            let model = model.trim().to_owned();
+            if model.is_empty() {
+                return Err(BackendError::Protocol("model name is empty".into()));
+            }
+            lifecycle::ensure_ready(&manager.http, &manager.base_url).await?;
+            manager
+                .http
+                .delete(manager.url("/api/delete"))
+                .json(&serde_json::json!({"model": model}))
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok(())
+        })
+    }
+}
+
+fn parse_pull_line(line: &[u8], model: &str) -> Result<Option<ModelManagerEvent>, BackendError> {
+    let line = std::str::from_utf8(line)
+        .map_err(|e| BackendError::Protocol(e.to_string()))?
+        .trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let chunk: PullChunk = serde_json::from_str(line)
+        .map_err(|e| BackendError::Protocol(format!("invalid pull response: {e}")))?;
+    if let Some(error) = chunk.error {
+        return Err(BackendError::Protocol(error));
+    }
+    if chunk.status == "success" {
+        return Ok(Some(ModelManagerEvent::Completed {
+            model: model.to_owned(),
+        }));
+    }
+    Ok(Some(ModelManagerEvent::Progress {
+        status: chunk.status,
+        completed: chunk.completed,
+        total: chunk.total,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +629,44 @@ mod tests {
         });
         assert_eq!(payload["error"], "ページを取得できませんでした");
         assert!(!payload.to_string().contains("connection refused"));
+    }
+
+    #[test]
+    fn pull_wire_body_requests_a_stream_for_the_selected_model() {
+        let value = serde_json::to_value(PullBody {
+            model: "qwen3:8b".into(),
+            stream: true,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"model":"qwen3:8b", "stream":true})
+        );
+    }
+
+    #[test]
+    fn pull_ndjson_parser_handles_progress_completion_and_errors() {
+        let progress = parse_pull_line(
+            br#"{"status":"downloading","completed":5,"total":10}"#,
+            "qwen3:8b",
+        )
+        .unwrap();
+        assert_eq!(
+            progress,
+            Some(ModelManagerEvent::Progress {
+                status: "downloading".into(),
+                completed: Some(5),
+                total: Some(10)
+            })
+        );
+        let done = parse_pull_line(br#"{"status":"success"}"#, "qwen3:8b").unwrap();
+        assert_eq!(
+            done,
+            Some(ModelManagerEvent::Completed {
+                model: "qwen3:8b".into()
+            })
+        );
+        assert!(parse_pull_line(br#"{"error":"not found"}"#, "qwen3:8b").is_err());
+        assert!(parse_pull_line(br#"{"status":"downloading"}"#, "qwen3:8b").is_ok());
     }
 }

@@ -4,4 +4,4 @@ mod client;
 mod lifecycle;
 mod stream;
 
-pub use client::OllamaClient;
+pub use client::{OllamaClient, OllamaModelManager};

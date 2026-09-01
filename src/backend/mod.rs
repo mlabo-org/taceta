@@ -1,6 +1,8 @@
 mod ollama;
 
-use crate::domain::{ChatRequest, GenerationEvent, ModelDescriptor};
+use crate::domain::{
+    ChatRequest, GenerationEvent, ModelDescriptor, ModelManagerEvent, ModelPullRequest,
+};
 use std::{future::Future, pin::Pin};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -33,4 +35,16 @@ pub trait InferenceBackend: Send + Sync {
     ) -> BackendFuture<()>;
 }
 
-pub use ollama::OllamaClient;
+/// Model lifecycle is deliberately separate from chat inference. Dropping the
+/// returned future cancels an in-flight pull by closing its HTTP stream.
+pub trait ModelManager: Send + Sync {
+    fn list_installed(&self) -> BackendFuture<Vec<ModelDescriptor>>;
+    fn pull(
+        &self,
+        request: ModelPullRequest,
+        events: UnboundedSender<ModelManagerEvent>,
+    ) -> BackendFuture<()>;
+    fn delete(&self, model: String) -> BackendFuture<()>;
+}
+
+pub use ollama::{OllamaClient, OllamaModelManager};

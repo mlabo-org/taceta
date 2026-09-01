@@ -87,6 +87,26 @@ pub struct ModelDescriptor {
     pub tools: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelPullRequest {
+    pub model: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelManagerEvent {
+    Started {
+        model: String,
+    },
+    Progress {
+        status: String,
+        completed: Option<u64>,
+        total: Option<u64>,
+    },
+    Completed {
+        model: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
