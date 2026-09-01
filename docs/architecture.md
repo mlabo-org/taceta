@@ -10,8 +10,11 @@ v0.1は次の機能に集中します。
 - Thinkingの生成制御とtrace表示制御
 - UTF-8テキストと、vision能力が確認されたモデルへの画像attachments
 - 現行チャットのcontext length（default 32k）
+- 会話単位で明示的にONにするWeb Search。検索プロバイダーはBrave Search（既定）またはOllama Web Searchから選択する。
 
-`InferenceBackend`はstateless-ishなchat inference boundaryです。モデル選択、会話入力、添付データ、Thinking設定を受け取り、Thinking delta、content delta、完了、失敗などのchat eventsを返します。バックエンドのwire形式はこの境界の内側に隔離します。
+`InferenceBackend`はstateless-ishなchat inference boundaryです。モデル選択、会話入力、添付データ、Thinking設定、明示されたWeb Search設定を受け取り、Thinking delta、content delta、検索進捗、参照元、完了、失敗などのchat eventsを返します。バックエンドのwire形式はこの境界の内側に隔離します。Web SearchがOFFならtoolsは送らず、ONでもtool能力のないモデルには送信前にエラーを返します。プロバイダーは暗黙に切り替えず、キーはmacOS Keychainだけに保存します。
+
+Web Searchはブラウザや外部アプリではなくTaceta内のHTTPハーネスです。検索語と取得先はONにした会話だけで外部へ送信され、検索進捗は会話本文に混ぜません。参照元URLだけをassistant messageへ保存して再起動後も復元します。
 
 ## 将来のCodex harness境界
 
@@ -55,8 +58,11 @@ Version 0.1 focuses on:
 - independent Thinking generation and trace presentation controls
 - UTF-8 text attachments and image attachments only for models with confirmed vision capability
 - the current chat context length (32k by default)
+- explicit per-conversation Web Search, with Brave Search as the default and optional Ollama Web Search
 
-`InferenceBackend` is a stateless-ish chat inference boundary. It accepts model selection, conversation input, attachments, and Thinking settings, then emits chat events such as Thinking deltas, content deltas, completion, and failure. Backend wire formats remain inside this boundary.
+`InferenceBackend` is a stateless-ish chat inference boundary. It accepts model selection, conversation input, attachments, Thinking settings, and explicit Web Search settings, then emits Thinking deltas, content deltas, search progress, citations, completion, and failure. When Web Search is off, no tools are sent; when on, a model without tool capability is rejected before sending. Providers never silently fall back, and credentials are stored only in the macOS Keychain. Backend wire formats remain inside this boundary.
+
+Web Search is an in-process HTTP harness, not a browser or external application. Queries and fetched URLs leave the Mac only for conversations where it is enabled. Search progress is not mixed into conversation content; citation URLs are stored on assistant messages and restored with the conversation.
 
 ## Future Codex harness boundary
 

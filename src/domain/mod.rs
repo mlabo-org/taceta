@@ -27,6 +27,8 @@ pub struct ChatMessage {
     pub content: String,
     pub thinking: String,
     pub attachments: Vec<Attachment>,
+    #[serde(default)]
+    pub citations: Vec<String>,
 }
 
 impl ChatMessage {
@@ -37,6 +39,7 @@ impl ChatMessage {
             content: content.into(),
             thinking: String::new(),
             attachments: Vec::new(),
+            citations: Vec::new(),
         }
     }
     pub fn new_user(content: impl Into<String>) -> Self {
@@ -80,6 +83,8 @@ pub struct ModelDescriptor {
     pub size: u64,
     pub thinking: ThinkingCapability,
     pub vision: bool,
+    #[serde(default)]
+    pub tools: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +93,18 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub thinking: ThinkingMode,
     pub context_length: u32,
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
+    #[serde(default)]
+    pub web_search_provider: Option<String>,
+    #[serde(default = "default_max_search_results")]
+    pub max_search_results: u8,
+    #[serde(default)]
+    pub fetch_search_pages: bool,
+}
+
+fn default_max_search_results() -> u8 {
+    5
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +118,9 @@ pub struct GenerationStats {
 pub enum GenerationEvent {
     ThinkingDelta(String),
     ContentDelta(String),
+    ToolCall(serde_json::Value),
+    SearchProgress(String),
+    Citation(String),
     Completed(GenerationStats),
 }
 

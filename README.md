@@ -12,7 +12,10 @@
 - vision 能力を持つモデルへの画像添付（能力がないモデルへは送信しない）
 - 日本語 / 英語、System / Light / Dark、文字サイズ 10–32 の設定保存
 - 生成中の表示切り替えと停止
-- v0.1ではローカルチャット、Thinking、添付ファイル、32kのコンテキスト長に集中
+- 会話ごとのWeb Search（既定OFF）。Brave Searchを標準プロバイダーとし、Ollama Web SearchもAPIキーをKeychainへ保存して選択可能
+- 検索結果数、本文取得、参照元URLの会話保存・復元
+
+Web SearchをONにした会話では検索語と取得先が外部へ送信されます。OFFの場合は従来どおりローカル推論だけを使用します。
 
 Thinking のtraceは会話入力へ混ぜません。表示を隠しても推論自体は止まらず、表示設定と実行設定は別々に扱います。モデルによって制御できる範囲は異なるため、能力を確認できない選択肢はUIに制御可能とは表示しません。
 
@@ -22,7 +25,7 @@ Thinking のtraceは会話入力へ混ぜません。表示を隠しても推論
 - Rust 1.92 以降（開発・ビルド時）
 - ローカル推論バックエンドとして [Ollama](https://ollama.com/) を別途インストールし、既定の loopback エンドポイント `http://127.0.0.1:11434` で起動
 
-Taceta は Ollama 本体やモデルを同梱・再配布しません。モデルの取得・削除・設定変更は、利用者がバックエンド側で明示的に行ってください。各モデルのライセンスはモデルごとに異なるため、利用するモデルの配布元の条件を確認してください。
+Taceta は Ollama 本体やモデルを同梱・再配布しません。モデルの取得・削除・設定変更は、利用者がバックエンド側で明示的に行ってください。各モデルのライセンスはモデルごとに異なるため、利用するモデルの配布元の条件を確認してください。Web Searchは会話単位で明示的にONにした場合だけ外部通信を行います。Brave SearchとOllama Web SearchはmacOS Keychainに保存したキーを使います。
 
 ## ビルドと起動
 
@@ -44,6 +47,10 @@ open ./dist/Taceta.app
 ## 公開範囲と免責
 
 Taceta は Ollama または OpenAI / Codex と公式に提携・承認・後援された製品ではありません。Ollama は交換可能なローカルバックエンドとして利用しています。名称・商標の権利はそれぞれの権利者に帰属します。Taceta 自体のコードは MIT License で提供しますが、接続先のモデル、依存ソフトウェア、macOS はそれぞれ固有のライセンスまたは利用条件に従います。
+
+## Web Searchの境界
+
+Web SearchはTaceta内のハーネスとして実装しています。ブラウザや外部アプリは起動しません。検索プロバイダーは自動で切り替えず、選択したプロバイダーが利用できない場合はエラーを表示します。検索経過は既定で会話へ保存せず、回答末尾に参照元URLを表示します。
 
 ## 将来の拡張境界
 
@@ -108,7 +115,7 @@ Taceta is not officially affiliated with, endorsed by, or sponsored by Ollama or
 
 ## Future extension boundary
 
-The v0.1 scope is local chat / Thinking / attachments / context length. Future Codex harness integration is not implemented and must not be read as a current feature. See [`docs/architecture.md`](docs/architecture.md) for the responsibility boundary and staged roadmap.
+Web Search is an explicit per-conversation feature. Brave Search is the default provider and Ollama Web Search is optional; both use keys stored in the macOS Keychain. Future Codex harness integration is not implemented and must not be read as a current feature. See [`docs/architecture.md`](docs/architecture.md) for the responsibility boundary and staged roadmap.
 
 ## Acknowledgements
 

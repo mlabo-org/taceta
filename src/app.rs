@@ -34,6 +34,7 @@ use crate::{
     },
     ui::theme::{self, TacetaPalette},
 };
+use taceta::web_search::{self, ProviderKind};
 
 const APP_SHELL_STORAGE_KEY: &str = "taceta.app-shell-preferences.v1";
 const LOCAL_ENGINE_URL: &str = "http://127.0.0.1:11434";
@@ -86,6 +87,7 @@ pub struct TacetaApp {
     generation: Option<ActiveGeneration>,
     notice: Option<Notice>,
     scroll_to_bottom: bool,
+    web_key_draft: String,
 }
 
 impl TacetaApp {
@@ -120,6 +122,7 @@ impl TacetaApp {
             generation: None,
             notice: None,
             scroll_to_bottom: true,
+            web_key_draft: String::new(),
         };
         app.refresh_models();
         app
@@ -200,17 +203,29 @@ impl TacetaApp {
                         self.connection = ConnectionState::Ready;
                     }
                     Err(error) => {
-                        let error = self.safe_backend_error(&error);
-                        self.connection = ConnectionState::Unavailable(error.clone());
-                        self.notice = Some(Notice {
-                            kind: NoticeKind::Error,
-                            text: error.clone(),
-                        });
-                        self.update_assistant(conversation_id, assistant_id, |message| {
-                            if message.content.is_empty() {
-                                message.content = error;
-                            }
-                        });
+                        if is_web_search_error(&error) {
+                            // Web providers are independent of the local
+                            // inference connection. Remove the transient
+                            // assistant placeholder so a provider failure is
+                            // never persisted as an assistant answer.
+                            self.remove_message(conversation_id, assistant_id);
+                            self.notice = Some(Notice {
+                                kind: NoticeKind::Error,
+                                text: web_search_error_message(&error, self.language()),
+                            });
+                        } else {
+                            let error = self.safe_backend_error(&error);
+                            self.connection = ConnectionState::Unavailable(error.clone());
+                            self.notice = Some(Notice {
+                                kind: NoticeKind::Error,
+                                text: error.clone(),
+                            });
+                            self.update_assistant(conversation_id, assistant_id, |message| {
+                                if message.content.is_empty() {
+                                    message.content = error;
+                                }
+                            });
+                        }
                     }
                 }
                 self.generation = None;
@@ -233,6 +248,23 @@ impl TacetaApp {
             GenerationEvent::ContentDelta(delta) => {
                 self.update_assistant(conversation_id, assistant_id, |message| {
                     message.content.push_str(&delta);
+                });
+            }
+            GenerationEvent::ToolCall(_) => {}
+            GenerationEvent::SearchProgress(progress) => {
+                // Progress is intentionally kept out of the transcript.  It is
+                // transient status, not conversation content, and therefore
+                // remains collapsed by default.
+                self.notice = Some(Notice {
+                    kind: NoticeKind::Info,
+                    text: progress,
+                });
+            }
+            GenerationEvent::Citation(url) => {
+                self.update_assistant(conversation_id, assistant_id, |message| {
+                    if !message.citations.contains(&url) {
+                        message.citations.push(url);
+                    }
                 });
             }
             GenerationEvent::Completed(_) => {}
@@ -259,6 +291,19 @@ impl TacetaApp {
             })
         {
             update(message);
+        }
+    }
+
+    fn remove_message(&mut self, conversation_id: Uuid, message_id: Uuid) {
+        if let Some(conversation) = self
+            .state
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            conversation
+                .messages
+                .retain(|message| message.id != message_id);
         }
     }
 
@@ -425,6 +470,18 @@ impl TacetaApp {
             });
             return;
         }
+        let web_search_enabled = self.state.active_conversation().web_search_enabled;
+        if web_search_enabled && !model.tools {
+            self.notice = Some(Notice {
+                kind: NoticeKind::Warning,
+                text: text(
+                    language,
+                    "このモデルはWeb検索に対応していません。モデルを変えるか、Web検索をOFFにしてください。",
+                    "This model does not support Web Search. Choose another model or turn Web Search off.",
+                ).to_owned(),
+            });
+            return;
+        }
 
         let draft = std::mem::take(&mut self.state.draft);
         let attachments = std::mem::take(&mut self.state.pending_attachments);
@@ -451,6 +508,17 @@ impl TacetaApp {
             messages: request_messages,
             thinking: self.selected_thinking_mode(),
             context_length: self.state.context_length,
+            tools: if web_search_enabled {
+                Some(web_search::tool_definitions())
+            } else {
+                None
+            },
+            web_search_provider: web_search_request_config(
+                web_search_enabled,
+                self.state.web_search_provider,
+            ),
+            max_search_results: self.state.max_search_results,
+            fetch_search_pages: self.state.fetch_search_pages,
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (result_tx, result_rx) = std_mpsc::channel();
@@ -749,6 +817,59 @@ impl TacetaApp {
                         });
                         ui.add_space(14.0);
                         let palette = theme::palette(ui);
+                        theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
+                            ui.strong(text(language, "Web検索", "Web Search"));
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(text(
+                                language,
+                                "会話ごとにONにできます。ONにした会話では検索語と取得先が外部へ送信されます。",
+                                "Enable per conversation. When enabled, queries and fetched pages are sent to the selected provider.",
+                            )).weak());
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.label(text(language, "検索プロバイダー", "Search provider"));
+                                for provider in [ProviderKind::Brave, ProviderKind::Ollama] {
+                                    if ui.selectable_label(self.state.web_search_provider == provider, provider.label()).clicked() {
+                                        self.state.web_search_provider = provider;
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label(text(language, "最大検索結果", "Max results"));
+                                let mut value = self.state.max_search_results as i32;
+                                if ui.add(egui::Slider::new(&mut value, 1..=5).integer().show_value(true)).changed() {
+                                    self.state.max_search_results = value as u8;
+                                }
+                            });
+                            ui.checkbox(&mut self.state.fetch_search_pages, text(language, "検索結果の本文も取得", "Fetch result pages"));
+                            if let Some(account) = self.state.web_search_provider.account_name() {
+                                ui.add_space(8.0);
+                                ui.label(text(language, "APIキー（macOS Keychainに保存）", "API key (saved in macOS Keychain)"));
+                                ui.add(egui::TextEdit::singleline(&mut self.web_key_draft).password(true).hint_text(text(language, "キーを入力して保存", "Enter key to save")));
+                                ui.horizontal(|ui| {
+                                    if ui.button(text(language, "保存", "Save")).clicked() {
+                                        let secret = std::mem::take(&mut self.web_key_draft);
+                                        let result = web_search::save_keychain_secret(account, &secret);
+                                        self.notice = Some(match result {
+                                            Ok(()) => Notice { kind: NoticeKind::Info, text: text(language, "APIキーをKeychainに保存しました。", "API key saved to Keychain.").to_owned() },
+                                            Err(error) => Notice { kind: NoticeKind::Error, text: error.to_string() },
+                                        });
+                                    }
+                                    if ui.button(text(language, "削除", "Delete")).clicked() {
+                                        let result = web_search::delete_keychain_secret(account);
+                                        self.notice = Some(match result {
+                                            Ok(()) => Notice { kind: NoticeKind::Info, text: text(language, "APIキーを削除しました。", "API key deleted.").to_owned() },
+                                            Err(error) => Notice { kind: NoticeKind::Error, text: error.to_string() },
+                                        });
+                                    }
+                                    let status = if web_search::has_keychain_secret(account) { text(language, "設定済み", "Configured") } else { text(language, "未設定", "Not configured") };
+                                    ui.label(RichText::new(status).weak());
+                                });
+                            } else {
+                            }
+                        });
+                        ui.add_space(14.0);
+                        let palette = theme::palette(ui);
                         theme::card(
                             ui.visuals().faint_bg_color,
                             palette.border,
@@ -1012,6 +1133,17 @@ impl TacetaApp {
                                 );
                             });
                         }
+                        if !message.citations.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(text(language, "参照元", "Sources"))
+                                    .small()
+                                    .strong(),
+                            );
+                            for citation in &message.citations {
+                                ui.hyperlink_to(citation, citation);
+                            }
+                        }
                     }
                     Role::System => {
                         ui.label(RichText::new(&message.content).weak());
@@ -1157,6 +1289,51 @@ impl TacetaApp {
                                     {
                                         self.state.show_thinking_trace =
                                             !self.state.show_thinking_trace;
+                                    }
+
+                                    // Keep Web Search with the other composer
+                                    // controls. The action button below owns the
+                                    // right edge exclusively, so it can never be
+                                    // clipped by a late-added control.
+                                    let web_enabled = self
+                                        .state
+                                        .active_conversation()
+                                        .web_search_enabled;
+                                    let web_available = self
+                                        .selected_model()
+                                        .is_some_and(|model| model.tools);
+                                    let web_label = if web_enabled {
+                                        text(language, "Web: ON", "Web: ON")
+                                    } else {
+                                        text(language, "Web: OFF", "Web: OFF")
+                                    };
+                                    if ui
+                                        .add_enabled(
+                                            web_available && self.generation.is_none(),
+                                            Button::new(web_label)
+                                                .min_size(Vec2::new(0.0, control.row_height))
+                                                .corner_radius(control.row_height / 2.0),
+                                        )
+                                        .on_hover_text(text(
+                                            language,
+                                            "この会話だけWeb検索を許可します。検索語と取得先が外部へ送信されます。",
+                                            "Allow Web Search for this conversation. Queries and fetched URLs leave this Mac.",
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.state.active_conversation_mut().web_search_enabled =
+                                            !web_enabled;
+                                        if self.state.active_conversation().web_search_enabled {
+                                            self.notice = Some(Notice {
+                                                kind: NoticeKind::Info,
+                                                text: text(
+                                                    language,
+                                                    "Web検索をONにしました。外部通信が発生します。",
+                                                    "Web Search is ON. External requests will be made.",
+                                                )
+                                                .to_owned(),
+                                            });
+                                        }
                                     }
 
                                     let mut send_clicked = false;
@@ -1493,4 +1670,85 @@ fn resolve_model_storage_path() -> PathBuf {
 
 fn format_context_length(value: u32) -> String {
     format!("{}k", value / 1_024)
+}
+
+fn is_web_search_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "web search",
+        "web provider",
+        "web_fetch",
+        "web_search",
+        "tool support",
+        "tool call",
+        "keychain credential",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
+fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("keychain credential") && lower.contains("brave") {
+        return text(
+            language,
+            "Brave Search APIキーが未設定です。設定でAPIキーを保存してから再試行してください。",
+            "The Brave Search API key is not configured. Save it in Settings, then try again.",
+        )
+        .to_owned();
+    }
+    if lower.contains("keychain credential") && lower.contains("ollama") {
+        return text(language, "Ollama Web Search APIキーが未設定です。設定でAPIキーを保存してから再試行してください。", "The Ollama Web Search API key is not configured. Save it in Settings, then try again.").to_owned();
+    }
+    text(
+        language,
+        "Web検索に失敗しました。設定を確認して再試行してください。",
+        "Web Search failed. Check the provider settings, then try again.",
+    )
+    .to_owned()
+}
+
+fn web_search_request_config(enabled: bool, provider: ProviderKind) -> Option<String> {
+    enabled.then(|| provider.wire_value().to_owned())
+}
+
+#[cfg(test)]
+mod web_search_request_tests {
+    use super::*;
+
+    #[test]
+    fn request_uses_stable_provider_value_only_when_enabled() {
+        assert_eq!(
+            web_search_request_config(true, ProviderKind::Brave),
+            Some("brave".to_owned())
+        );
+        assert_eq!(
+            web_search_request_config(true, ProviderKind::Brave),
+            Some("brave".to_owned())
+        );
+        assert_eq!(web_search_request_config(false, ProviderKind::Ollama), None);
+    }
+
+    #[test]
+    fn provider_failures_are_separate_from_local_connection_failures() {
+        assert!(is_web_search_error("web provider request failed"));
+        assert!(is_web_search_error(
+            "selected model does not advertise tool support"
+        ));
+        assert!(!is_web_search_error("Ollama endpoint is unavailable"));
+    }
+
+    #[test]
+    fn missing_provider_keys_get_explicit_guidance_without_local_disconnect() {
+        let language = AppShellLanguage::Japanese;
+        assert!(
+            web_search_error_message("Keychain credential is not configured for Brave", language)
+                .contains("Brave Search APIキーが未設定です")
+        );
+        assert!(
+            web_search_error_message("Keychain credential is not configured for Ollama", language)
+                .contains("Ollama Web Search APIキーが未設定です")
+        );
+        assert!(!is_web_search_error("Ollama endpoint is unavailable"));
+    }
 }

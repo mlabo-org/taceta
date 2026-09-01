@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use taceta::domain::{Attachment, ChatMessage, ThinkingMode};
+use taceta::web_search::ProviderKind;
 use uuid::Uuid;
 
 const APP_STATE_STORAGE_KEY: &str = "taceta.application-state.v1";
@@ -16,6 +17,9 @@ pub struct Conversation {
     pub id: Uuid,
     pub title: String,
     pub messages: Vec<ChatMessage>,
+    /// Web access is deliberately opt-in for each conversation.
+    #[serde(default)]
+    pub web_search_enabled: bool,
 }
 
 impl Default for Conversation {
@@ -24,6 +28,7 @@ impl Default for Conversation {
             id: Uuid::new_v4(),
             title: "New chat".to_owned(),
             messages: Vec::new(),
+            web_search_enabled: false,
         }
     }
 }
@@ -39,6 +44,12 @@ pub struct PersistedAppState {
     pub context_length: u32,
     pub draft: String,
     pub pending_attachments: Vec<Attachment>,
+    #[serde(default)]
+    pub web_search_provider: ProviderKind,
+    #[serde(default = "default_max_search_results")]
+    pub max_search_results: u8,
+    #[serde(default)]
+    pub fetch_search_pages: bool,
 }
 
 impl Default for PersistedAppState {
@@ -53,6 +64,9 @@ impl Default for PersistedAppState {
             context_length: DEFAULT_CONTEXT_LENGTH,
             draft: String::new(),
             pending_attachments: Vec::new(),
+            web_search_provider: ProviderKind::Brave,
+            max_search_results: 5,
+            fetch_search_pages: true,
         }
     }
 }
@@ -70,6 +84,7 @@ impl PersistedAppState {
             self.active_conversation_id = self.conversations[0].id;
         }
         self.context_length = normalize_context_length(self.context_length);
+        self.max_search_results = self.max_search_results.clamp(1, 5);
         self
     }
 
@@ -96,6 +111,10 @@ impl PersistedAppState {
         self.draft.clear();
         self.pending_attachments.clear();
     }
+}
+
+fn default_max_search_results() -> u8 {
+    5
 }
 
 pub fn normalize_context_length(value: u32) -> u32 {
@@ -135,5 +154,15 @@ mod tests {
     fn context_length_is_normalized_to_a_supported_step() {
         assert_eq!(normalize_context_length(40_000), 32_768);
         assert_eq!(normalize_context_length(130_000), 131_072);
+    }
+
+    #[test]
+    fn new_conversations_start_with_web_search_disabled() {
+        assert!(!Conversation::default().web_search_enabled);
+        assert_eq!(
+            PersistedAppState::default().web_search_provider,
+            ProviderKind::Brave
+        );
+        assert_eq!(PersistedAppState::default().max_search_results, 5);
     }
 }
