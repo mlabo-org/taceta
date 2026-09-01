@@ -1,4 +1,7 @@
-use eframe::egui::{self, FontFamily, RichText, ThemePreference, Vec2};
+use eframe::egui::{
+    self, Align, Color32, FontFamily, FontTweak, Layout, RichText, Theme, ThemePreference, Vec2,
+    WidgetText,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
@@ -7,6 +10,13 @@ use std::path::{Path, PathBuf};
 pub const APP_SHELL_FONT_SIZE_MIN_POINTS: u8 = 10;
 pub const APP_SHELL_FONT_SIZE_MAX_POINTS: u8 = 32;
 pub const APP_SHELL_FONT_SIZE_DEFAULT_POINTS: u8 = 16;
+
+pub const APP_SHELL_LIGHT_TEXT: Color32 = Color32::from_rgb(0, 0, 0);
+pub const APP_SHELL_DARK_TEXT: Color32 = Color32::from_rgb(255, 255, 255);
+pub const APP_SHELL_WEAK_TEXT: Color32 = Color32::from_rgb(128, 128, 134);
+pub const APP_SHELL_LIGHT_SELECTION: Color32 = Color32::from_rgb(0, 122, 255);
+pub const APP_SHELL_DARK_SELECTION: Color32 = Color32::from_rgb(10, 132, 255);
+pub const APP_SHELL_SELECTED_TEXT: Color32 = Color32::from_rgb(255, 255, 255);
 
 #[cfg(target_os = "macos")]
 const APP_SHELL_HIRAGINO_FONT_NAME: &str = "app-shell-hiragino-kaku-gothic-w3";
@@ -40,7 +50,12 @@ fn macos_font_definitions(
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         APP_SHELL_HIRAGINO_FONT_NAME.to_owned(),
-        egui::FontData::from_owned(hiragino).into(),
+        egui::FontData::from_owned(hiragino)
+            .tweak(FontTweak {
+                y_offset_factor: 0.05,
+                ..Default::default()
+            })
+            .into(),
     );
     fonts.font_data.insert(
         APP_SHELL_SF_PRO_FONT_NAME.to_owned(),
@@ -56,8 +71,8 @@ fn macos_font_definitions(
     proportional.insert(0, APP_SHELL_HIRAGINO_FONT_NAME.to_owned());
 
     let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
-    monospace.insert(0, APP_SHELL_HIRAGINO_FONT_NAME.to_owned());
     monospace.insert(0, APP_SHELL_SF_MONO_FONT_NAME.to_owned());
+    monospace.insert(0, APP_SHELL_HIRAGINO_FONT_NAME.to_owned());
 
     fonts
 }
@@ -244,11 +259,102 @@ pub fn apply_app_shell_preferences(ctx: &egui::Context, preferences: AppShellPre
     ctx.options_mut(|options| options.zoom_with_keyboard = false);
 
     let family = preferences.font_family.egui_family();
-    ctx.global_style_mut(|style| {
-        for font_id in style.text_styles.values_mut() {
-            font_id.family = family.clone();
-        }
-    });
+    for theme in [Theme::Light, Theme::Dark] {
+        ctx.style_mut_of(theme, |style| {
+            apply_app_shell_style(style, family.clone(), theme == Theme::Dark);
+        });
+    }
+}
+
+fn apply_app_shell_style(style: &mut egui::Style, family: FontFamily, dark: bool) {
+    for font_id in style.text_styles.values_mut() {
+        font_id.family = family.clone();
+    }
+    let text = if dark {
+        APP_SHELL_DARK_TEXT
+    } else {
+        APP_SHELL_LIGHT_TEXT
+    };
+    let selection = if dark {
+        APP_SHELL_DARK_SELECTION
+    } else {
+        APP_SHELL_LIGHT_SELECTION
+    };
+    style.visuals.override_text_color = Some(text);
+    style.visuals.weak_text_color = Some(APP_SHELL_WEAK_TEXT);
+    style.visuals.selection.bg_fill = selection;
+    style.visuals.selection.stroke.color = APP_SHELL_SELECTED_TEXT;
+    for widget in [
+        &mut style.visuals.widgets.noninteractive,
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
+    ] {
+        widget.fg_stroke.color = text;
+    }
+    style.spacing.button_padding.y = app_shell_control_metrics_from_font(
+        style
+            .text_styles
+            .get(&egui::TextStyle::Body)
+            .map_or(14.0, |font| font.size),
+    )
+    .vertical_padding;
+    style.spacing.item_spacing.y = style.spacing.button_padding.y;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AppShellControlMetrics {
+    pub font_size: f32,
+    pub row_height: f32,
+    pub vertical_padding: f32,
+}
+
+fn app_shell_control_metrics_from_font(font_size: f32) -> AppShellControlMetrics {
+    let vertical_padding = font_size * 0.35;
+    AppShellControlMetrics {
+        font_size,
+        row_height: font_size + vertical_padding * 2.0,
+        vertical_padding,
+    }
+}
+
+pub fn app_shell_control_metrics(ctx: &egui::Context) -> AppShellControlMetrics {
+    let style = ctx.global_style();
+    app_shell_control_metrics_from_font(
+        style
+            .text_styles
+            .get(&egui::TextStyle::Body)
+            .map_or(14.0, |font| font.size),
+    )
+}
+
+pub fn show_app_shell_menu_row<T: PartialEq>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    choice: T,
+    label: impl Into<WidgetText>,
+) -> egui::Response {
+    let metrics = app_shell_control_metrics(ui.ctx());
+    let selection = if ui.visuals().dark_mode {
+        APP_SHELL_DARK_SELECTION
+    } else {
+        APP_SHELL_LIGHT_SELECTION
+    };
+    let selected_text = APP_SHELL_SELECTED_TEXT;
+    ui.visuals_mut().selection.bg_fill = selection;
+    ui.visuals_mut().selection.stroke.color = selected_text;
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, metrics.row_height),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.visuals_mut().selection.bg_fill = selection;
+            ui.visuals_mut().selection.stroke.color = selected_text;
+            ui.selectable_value(value, choice, label)
+        },
+    )
+    .response
 }
 
 pub fn show_app_shell_preferences(
@@ -480,7 +586,7 @@ mod tests {
 
         assert_eq!(proportional[0], APP_SHELL_HIRAGINO_FONT_NAME);
         assert_eq!(proportional[1], APP_SHELL_SF_PRO_FONT_NAME);
-        assert_eq!(monospace[0], APP_SHELL_SF_MONO_FONT_NAME);
-        assert_eq!(monospace[1], APP_SHELL_HIRAGINO_FONT_NAME);
+        assert_eq!(monospace[0], APP_SHELL_HIRAGINO_FONT_NAME);
+        assert_eq!(monospace[1], APP_SHELL_SF_MONO_FONT_NAME);
     }
 }
