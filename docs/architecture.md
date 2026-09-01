@@ -9,10 +9,13 @@ v0.1は次の機能に集中します。
 - local chat inference
 - Thinkingの生成制御とtrace表示制御
 - UTF-8テキストと、vision能力が確認されたモデルへの画像attachments
+- 専用Model Manager画面からの明示的なモデル一覧確認・取得・削除
 - 現行チャットのcontext length（default 32k）
 - 会話単位で明示的にONにするWeb Search。検索プロバイダーはBrave Search（既定）またはOllama Web Searchから選択する。
 
 `InferenceBackend`はstateless-ishなchat inference boundaryです。モデル選択、会話入力、添付データ、Thinking設定、明示されたWeb Search設定を受け取り、Thinking delta、content delta、検索進捗、参照元、完了、失敗などのchat eventsを返します。バックエンドのwire形式はこの境界の内側に隔離します。Web SearchがOFFならtoolsは送らず、ONでもtool能力のないモデルには送信前にエラーを返します。プロバイダーは暗黙に切り替えず、キーはmacOS Keychainだけに保存します。
+
+`ModelManager`はチャット推論から分離されたモデルライフサイクル境界です。モデル一覧は画面表示時・更新時に取得し、取得はモデルIDの入力と利用者のボタン操作でのみ開始します。削除は正確なモデル名を表示する確認ダイアログの最終操作でのみ実行します。取得中の停止はHTTPタスクを中断し、チャット生成とは別の状態として扱います。
 
 Web Searchはブラウザや外部アプリではなくTaceta内のHTTPハーネスです。検索語と取得先はONにした会話だけで外部へ送信され、検索進捗は会話本文に混ぜません。参照元URLだけをassistant messageへ保存して再起動後も復元します。
 

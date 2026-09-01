@@ -4,6 +4,24 @@ use serde::{Deserialize, Serialize};
 pub(super) struct TagsResponse {
     pub models: Vec<TagModel>,
 }
+
+#[derive(Debug, Serialize)]
+pub(super) struct PullBody {
+    pub model: String,
+    pub stream: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PullChunk {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub completed: Option<u64>,
+    #[serde(default)]
+    pub total: Option<u64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
 #[derive(Debug, Deserialize)]
 pub(super) struct TagModel {
     pub name: String,
