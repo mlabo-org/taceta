@@ -12,6 +12,14 @@ pub enum BackendError {
     Protocol(String),
     #[error("generation cancelled")]
     Cancelled,
+    #[error("Ollama endpoint is unavailable")]
+    OllamaUnavailable,
+    #[error("Ollama executable was not found in the standard macOS locations or PATH")]
+    OllamaBinaryMissing,
+    #[error("failed to start Ollama: {0}")]
+    OllamaStartFailed(String),
+    #[error("Ollama did not become ready within 10 seconds")]
+    OllamaReadinessTimeout,
 }
 
 pub type BackendFuture<T> = Pin<Box<dyn Future<Output = Result<T, BackendError>> + Send>>;
