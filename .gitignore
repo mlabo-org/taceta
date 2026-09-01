@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+
+# Materialized macOS application bundle
+/dist/
+
+# macOS metadata
+.DS_Store
+
+# Logs and local runtime output
+*.log
+/logs/
+
+# Editor and tooling temporary files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
