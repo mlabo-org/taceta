@@ -586,10 +586,15 @@ impl TacetaApp {
     }
 
     fn attach_files(&mut self) {
-        let language = self.language();
         let Some(paths) = rfd::FileDialog::new().pick_files() else {
             return;
         };
+
+        self.attach_paths(paths);
+    }
+
+    fn attach_paths(&mut self, paths: Vec<PathBuf>) {
+        let language = self.language();
 
         for path in paths {
             let name = path
@@ -646,6 +651,52 @@ impl TacetaApp {
             self.state
                 .pending_attachments
                 .push(Attachment { name, payload });
+        }
+    }
+
+    fn handle_dropped_files(&mut self, ctx: &Context) {
+        let (paths, missing_paths) = ctx.input(|input| {
+            let mut paths = Vec::new();
+            let mut missing_paths = 0;
+            for file in &input.raw.dropped_files {
+                if let Some(path) = file.path.clone() {
+                    paths.push(path);
+                } else {
+                    missing_paths += 1;
+                }
+            }
+            (paths, missing_paths)
+        });
+        if paths.is_empty() && missing_paths == 0 {
+            return;
+        }
+
+        let language = self.language();
+        if self.generation.is_some() {
+            self.notice = Some(Notice {
+                kind: NoticeKind::Warning,
+                text: text(
+                    language,
+                    "生成中はファイルを追加できません。",
+                    "Files cannot be added while generating.",
+                )
+                .to_owned(),
+            });
+            return;
+        }
+        if missing_paths > 0 {
+            self.notice = Some(Notice {
+                kind: NoticeKind::Warning,
+                text: text(
+                    language,
+                    "パスを取得できないドロップ項目は追加しませんでした。",
+                    "Dropped items without a file path were not added.",
+                )
+                .to_owned(),
+            });
+        }
+        if !paths.is_empty() {
+            self.attach_paths(paths);
         }
     }
 
@@ -1591,6 +1642,10 @@ impl TacetaApp {
     }
 
     fn show_composer(&mut self, root_ui: &mut Ui) {
+        self.handle_dropped_files(root_ui.ctx());
+        let files_hovered = root_ui
+            .ctx()
+            .input(|input| !input.raw.hovered_files.is_empty());
         let language = self.language();
         let panel_height = if self.state.pending_attachments.is_empty() {
             154.0
@@ -1607,7 +1662,8 @@ impl TacetaApp {
                     ui.vertical(|ui| {
                         ui.set_width(composer_width);
                         let palette = theme::palette(ui);
-                        theme::card(palette.composer, palette.border, 18, 12).show(ui, |ui| {
+                        let card_response = theme::card(palette.composer, palette.border, 18, 12)
+                            .show(ui, |ui| {
                             let mut remove_attachment = None;
                             if !self.state.pending_attachments.is_empty() {
                                 ui.horizontal_wrapped(|ui| {
@@ -1826,7 +1882,22 @@ impl TacetaApp {
                                     }
                                 },
                             );
-                        });
+                            });
+                        if files_hovered && self.generation.is_none() {
+                            let overlay = card_response.response.rect.shrink(1.0);
+                            ui.painter().rect_filled(
+                                overlay,
+                                17.0,
+                                egui::Color32::from_rgba_unmultiplied(0, 122, 255, 72),
+                            );
+                            ui.painter().text(
+                                overlay.center(),
+                                egui::Align2::CENTER_CENTER,
+                                text(language, "ここにファイルをドロップ", "Drop files here"),
+                                egui::TextStyle::Button.resolve(ui.style()),
+                                egui::Color32::WHITE,
+                            );
+                        }
                     });
                 });
             });
