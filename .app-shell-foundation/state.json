@@ -1,0 +1,13 @@
+{
+  "files": {
+    "src/app_shell_foundation.rs": "ecfe889f61be966911ca8ff22fb75ba8521d5c8560636c2d53325f7691e915ef"
+  },
+  "platform": "eframe-egui",
+  "schemaVersion": 1,
+  "sourceDir": "src",
+  "task": {
+    "deliveryMode": "iterative",
+    "id": "taceta-font-foundation-2026-09-01"
+  },
+  "templateVersion": "0.4.0"
+}
