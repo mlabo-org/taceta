@@ -14,9 +14,10 @@ base64 = "0.22"
 bytes = "1.10"
 futures-util = "0.3"
 rfd = "0.15"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "form", "rustls"] }
 serde_json = "1.0"
 sys-locale = "0.3"
 thiserror = "2.0"
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
+url = "2.5"

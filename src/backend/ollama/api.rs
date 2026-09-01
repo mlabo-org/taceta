@@ -31,17 +31,23 @@ pub(super) struct ChatBody {
     pub options: ChatOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub think: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<serde_json::Value>,
 }
 #[derive(Debug, Serialize)]
 pub(super) struct ChatOptions {
     pub num_ctx: u32,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct WireMessage {
     pub role: String,
     pub content: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 pub(super) struct ChatChunk {
@@ -64,4 +70,6 @@ pub(super) struct ChunkMessage {
     pub thinking: String,
     #[serde(default)]
     pub content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<serde_json::Value>,
 }

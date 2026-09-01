@@ -4,19 +4,28 @@ use crate::domain::{GenerationEvent, GenerationStats};
 use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[derive(Debug)]
+pub(super) struct StreamResult {
+    pub stats: GenerationStats,
+    pub tool_calls: Vec<serde_json::Value>,
+}
+
 pub(super) async fn consume<S, E>(
     mut stream: S,
     events: UnboundedSender<GenerationEvent>,
-) -> Result<(), BackendError>
+) -> Result<StreamResult, BackendError>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
     let mut buffer = Vec::new();
-    let mut stats = GenerationStats {
-        prompt_tokens: None,
-        completion_tokens: None,
-        total_duration_ns: None,
+    let mut result = StreamResult {
+        stats: GenerationStats {
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_duration_ns: None,
+        },
+        tool_calls: Vec::new(),
     };
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| BackendError::Protocol(e.to_string()))?;
@@ -41,13 +50,16 @@ where
                 if !message.content.is_empty() {
                     let _ = events.send(GenerationEvent::ContentDelta(message.content));
                 }
+                for call in message.tool_calls {
+                    let _ = events.send(GenerationEvent::ToolCall(call.clone()));
+                    result.tool_calls.push(call);
+                }
             }
             if item.done {
-                stats.prompt_tokens = item.prompt_eval_count;
-                stats.completion_tokens = item.eval_count;
-                stats.total_duration_ns = item.total_duration;
-                let _ = events.send(GenerationEvent::Completed(stats.clone()));
-                return Ok(());
+                result.stats.prompt_tokens = item.prompt_eval_count;
+                result.stats.completion_tokens = item.eval_count;
+                result.stats.total_duration_ns = item.total_duration;
+                return Ok(result);
             }
         }
     }
@@ -64,13 +76,16 @@ where
             if !message.content.is_empty() {
                 let _ = events.send(GenerationEvent::ContentDelta(message.content));
             }
+            for call in message.tool_calls {
+                let _ = events.send(GenerationEvent::ToolCall(call.clone()));
+                result.tool_calls.push(call);
+            }
         }
         if item.done {
-            stats.prompt_tokens = item.prompt_eval_count;
-            stats.completion_tokens = item.eval_count;
-            stats.total_duration_ns = item.total_duration;
-            let _ = events.send(GenerationEvent::Completed(stats));
-            return Ok(());
+            result.stats.prompt_tokens = item.prompt_eval_count;
+            result.stats.completion_tokens = item.eval_count;
+            result.stats.total_duration_ns = item.total_duration;
+            return Ok(result);
         }
     }
     Err(BackendError::Protocol(
@@ -99,8 +114,6 @@ mod tests {
             rx.recv().await,
             Some(GenerationEvent::ContentDelta("answer".into()))
         );
-        assert!(
-            matches!(rx.recv().await, Some(GenerationEvent::Completed(s)) if s.completion_tokens == Some(2))
-        );
+        assert!(rx.recv().await.is_none());
     }
 }

@@ -21,6 +21,10 @@ pub(super) fn has_vision(capabilities: &[String]) -> bool {
         .any(|v| v.eq_ignore_ascii_case("vision"))
 }
 
+pub(super) fn has_tools(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|v| v.eq_ignore_ascii_case("tools"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
