@@ -16,6 +16,20 @@ Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT We
 
 Web Search が OFF のときは外部リクエストを作りません。ON のときは選択された executor だけを使い、検索結果やブラウザーの回答は untrusted context としてローカル Ollama の最終回答に渡します。Web ON + Send は、その送信に対して一回の Web request を明示的に許可します。
 
+## 画面
+
+### 実動作
+
+ローカルモデルの回答、Thinking trace、Markdown の表や引用、Web Search の状態を同じ画面で確認できます。
+
+![Tacetaの日本語チャット画面](docs/images/taceta-chat-ja.png)
+
+### 設定
+
+表示言語、テーマ、モデル管理、Web Search、モデル保存先、context length を設定できます。
+
+![Tacetaの日本語設定画面](docs/images/taceta-settings-ja.png)
+
 ## 構成とデータフロー
 
 ```text
@@ -133,6 +147,20 @@ Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly star
 - Brave Search / Ollama Web Search APIs, or browser search, Google Search, and ChatGPT Web through Taceta Link
 
 When Web Search is OFF, Taceta creates no external request. When it is ON, only the selected executor is used, and search or browser output is passed to local Ollama as untrusted context for the final answer. Web ON + Send explicitly authorizes one web request for that send.
+
+## Screenshots
+
+### Chat
+
+The main view keeps local-model output, the Thinking trace, Markdown tables and quotes, and Web Search status visible together.
+
+![Taceta chat in English](docs/images/taceta-chat-en.png)
+
+### Settings
+
+Configure language, theme, model management, Web Search, the model location, and context length.
+
+![Taceta settings in English](docs/images/taceta-settings-en.png)
 
 ## Architecture and data flow
 
