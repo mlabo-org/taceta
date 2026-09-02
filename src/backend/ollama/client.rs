@@ -1,6 +1,8 @@
 use super::{
     api::{ChatBody, ChatOptions, PullBody, PullChunk, ShowResponse, TagsResponse, WireMessage},
-    capability, lifecycle, stream,
+    capability,
+    endpoint::OllamaEndpoint,
+    lifecycle, stream,
 };
 use crate::{
     backend::{BackendError, BackendFuture, InferenceBackend, ModelManager},
@@ -21,15 +23,15 @@ const MAX_TOOL_CALLS_PER_ROUND: usize = 5;
 
 pub struct OllamaClient {
     http: reqwest::Client,
-    base_url: String,
+    endpoint: OllamaEndpoint,
     link_service: Option<Arc<TacetaLinkService>>,
 }
 
 impl OllamaClient {
-    pub fn new(base_url: impl Into<String>) -> Self {
+    pub fn new(endpoint: OllamaEndpoint) -> Self {
         Self {
             http: reqwest::Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            endpoint,
             link_service: None,
         }
     }
@@ -38,10 +40,10 @@ impl OllamaClient {
         self
     }
     fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
+        format!("{}{path}", self.endpoint.base_url())
     }
     async fn models(&self) -> Result<Vec<ModelDescriptor>, BackendError> {
-        lifecycle::ensure_ready(&self.http, &self.base_url).await?;
+        lifecycle::ensure_ready(&self.http, &self.endpoint).await?;
         let tags: TagsResponse = self
             .http
             .get(self.url("/api/tags"))
@@ -88,7 +90,7 @@ impl InferenceBackend for OllamaClient {
     ) -> BackendFuture<()> {
         let client = self.clone_for_task();
         Box::pin(async move {
-            lifecycle::ensure_ready(&client.http, &client.base_url).await?;
+            lifecycle::ensure_ready(&client.http, &client.endpoint).await?;
             let tools = validate_tools(request.tools.as_ref())?;
             if tools.is_some() {
                 let show: ShowResponse = client
@@ -263,7 +265,7 @@ impl OllamaClient {
     fn clone_for_task(&self) -> Self {
         Self {
             http: self.http.clone(),
-            base_url: self.base_url.clone(),
+            endpoint: self.endpoint.clone(),
             link_service: self.link_service.clone(),
         }
     }
@@ -644,27 +646,27 @@ fn model_context_length(
 
 pub struct OllamaModelManager {
     http: reqwest::Client,
-    base_url: String,
+    endpoint: OllamaEndpoint,
 }
 
 impl OllamaModelManager {
-    pub fn new(base_url: impl Into<String>) -> Self {
+    pub fn new(endpoint: OllamaEndpoint) -> Self {
         Self {
             http: reqwest::Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            endpoint,
         }
     }
     fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
+        format!("{}{path}", self.endpoint.base_url())
     }
     fn clone_for_task(&self) -> Self {
         Self {
             http: self.http.clone(),
-            base_url: self.base_url.clone(),
+            endpoint: self.endpoint.clone(),
         }
     }
     async fn installed(&self) -> Result<Vec<ModelDescriptor>, BackendError> {
-        lifecycle::ensure_ready(&self.http, &self.base_url).await?;
+        lifecycle::ensure_ready(&self.http, &self.endpoint).await?;
         let tags: TagsResponse = self
             .http
             .get(self.url("/api/tags"))
@@ -754,7 +756,7 @@ impl ModelManager for OllamaModelManager {
             if model.is_empty() {
                 return Err(BackendError::Protocol("model name is empty".into()));
             }
-            lifecycle::ensure_ready(&manager.http, &manager.base_url).await?;
+            lifecycle::ensure_ready(&manager.http, &manager.endpoint).await?;
             let _ = events.send(ModelManagerEvent::Started {
                 model: model.clone(),
             });
@@ -798,7 +800,7 @@ impl ModelManager for OllamaModelManager {
             if model.is_empty() {
                 return Err(BackendError::Protocol("model name is empty".into()));
             }
-            lifecycle::ensure_ready(&manager.http, &manager.base_url).await?;
+            lifecycle::ensure_ready(&manager.http, &manager.endpoint).await?;
             manager
                 .http
                 .delete(manager.url("/api/delete"))

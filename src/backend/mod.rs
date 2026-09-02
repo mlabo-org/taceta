@@ -49,4 +49,7 @@ pub trait ModelManager: Send + Sync {
     fn delete(&self, model: String) -> BackendFuture<()>;
 }
 
-pub use ollama::{OllamaClient, OllamaModelManager};
+pub use ollama::{
+    DEFAULT_OLLAMA_BASE_URL, OllamaClient, OllamaEndpoint, OllamaEndpointError, OllamaEndpointMode,
+    OllamaEndpointSource, OllamaModelManager,
+};

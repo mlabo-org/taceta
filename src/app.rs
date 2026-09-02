@@ -15,7 +15,10 @@ use eframe::egui::{
     style::ScrollStyle,
 };
 use taceta::{
-    backend::{InferenceBackend, ModelManager, OllamaClient, OllamaModelManager},
+    backend::{
+        InferenceBackend, ModelManager, OllamaClient, OllamaEndpoint, OllamaEndpointError,
+        OllamaEndpointMode, OllamaEndpointSource, OllamaModelManager,
+    },
     domain::{
         Attachment, AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelCandidate,
         ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingCapability,
@@ -46,7 +49,6 @@ use taceta::{
 };
 
 const APP_SHELL_STORAGE_KEY: &str = "taceta.app-shell-preferences.v1";
-const LOCAL_ENGINE_URL: &str = "http://127.0.0.1:11434";
 const COMPOSER_EDITOR_MIN_HEIGHT: f32 = 58.0;
 const COMPOSER_EDITOR_MAX_HEIGHT: f32 = 420.0;
 const COMPOSER_EDITOR_MAX_HEIGHT_FRACTION: f32 = 0.42;
@@ -126,6 +128,9 @@ pub struct TacetaApp {
     model_refresh_pending: bool,
     models: Vec<ModelDescriptor>,
     connection: ConnectionState,
+    ollama_endpoint: OllamaEndpoint,
+    ollama_endpoint_mode_draft: OllamaEndpointMode,
+    ollama_custom_endpoint_draft: String,
     model_storage_path: PathBuf,
     generation: Option<ActiveGeneration>,
     external_preview_ids: HashSet<Uuid>,
@@ -187,6 +192,15 @@ impl TacetaApp {
         let (model_catalog_result_tx, model_catalog_result_rx) = std_mpsc::channel();
         let (delete_result_tx, delete_result_rx) = std_mpsc::channel();
         let link_service = Arc::new(TacetaLinkService::default());
+        let state = load_app_state(creation_context.storage);
+        let ollama_endpoint_mode_draft = state.ollama_endpoint_mode;
+        let ollama_custom_endpoint_draft = state.ollama_custom_endpoint.clone();
+        let endpoint_result =
+            OllamaEndpoint::resolve(state.ollama_endpoint_mode, &state.ollama_custom_endpoint);
+        let (ollama_endpoint, initial_endpoint_error) = match endpoint_result {
+            Ok(endpoint) => (endpoint, None),
+            Err(error) => (OllamaEndpoint::default_local(), Some(error)),
+        };
         #[cfg(unix)]
         {
             if let Ok(path) = taceta::browser_harness::default_socket_path() {
@@ -224,18 +238,22 @@ impl TacetaApp {
         let mut app = Self {
             shell_preferences,
             system_language: system_language(),
-            state: load_app_state(creation_context.storage),
+            state,
             screen: Screen::Chat,
             backend: Arc::new(
-                OllamaClient::new(LOCAL_ENGINE_URL).with_link_service(Arc::clone(&link_service)),
+                OllamaClient::new(ollama_endpoint.clone())
+                    .with_link_service(Arc::clone(&link_service)),
             ),
-            model_manager: Arc::new(OllamaModelManager::new(LOCAL_ENGINE_URL)),
+            model_manager: Arc::new(OllamaModelManager::new(ollama_endpoint.clone())),
             runtime,
             model_result_tx,
             model_result_rx,
             model_refresh_pending: false,
             models: Vec::new(),
             connection: ConnectionState::Connecting,
+            ollama_endpoint,
+            ollama_endpoint_mode_draft,
+            ollama_custom_endpoint_draft,
             model_storage_path: resolve_model_storage_path(),
             generation: None,
             external_preview_ids: HashSet::new(),
@@ -299,7 +317,16 @@ impl TacetaApp {
                 });
             }
         }
-        app.refresh_models();
+        if let Some(error) = initial_endpoint_error {
+            let error = ollama_endpoint_error_message(app.language(), &error);
+            app.connection = ConnectionState::Unavailable(error.clone());
+            app.notice = Some(Notice {
+                kind: NoticeKind::Error,
+                text: error,
+            });
+        } else {
+            app.refresh_models();
+        }
         app
     }
 
@@ -309,8 +336,78 @@ impl TacetaApp {
             .resolve(self.system_language)
     }
 
+    fn bind_ollama_endpoint(&mut self, endpoint: OllamaEndpoint) -> bool {
+        if self.ollama_endpoint == endpoint {
+            return false;
+        }
+        self.backend = Arc::new(
+            OllamaClient::new(endpoint.clone()).with_link_service(Arc::clone(&self.link_service)),
+        );
+        self.model_manager = Arc::new(OllamaModelManager::new(endpoint.clone()));
+        self.ollama_endpoint = endpoint;
+        self.models.clear();
+        self.connection = ConnectionState::Connecting;
+        true
+    }
+
+    fn synchronize_auto_ollama_endpoint(&mut self) -> Result<bool, OllamaEndpointError> {
+        if self.state.ollama_endpoint_mode != OllamaEndpointMode::Auto {
+            return Ok(false);
+        }
+        let endpoint = OllamaEndpoint::resolve(OllamaEndpointMode::Auto, "")?;
+        Ok(self.bind_ollama_endpoint(endpoint))
+    }
+
+    fn apply_ollama_endpoint_settings(&mut self) {
+        let language = self.language();
+        match OllamaEndpoint::resolve(
+            self.ollama_endpoint_mode_draft,
+            &self.ollama_custom_endpoint_draft,
+        ) {
+            Ok(endpoint) => {
+                self.state.ollama_endpoint_mode = self.ollama_endpoint_mode_draft;
+                if self.ollama_endpoint_mode_draft == OllamaEndpointMode::Custom {
+                    self.ollama_custom_endpoint_draft = endpoint.base_url().to_owned();
+                    self.state.ollama_custom_endpoint = endpoint.base_url().to_owned();
+                }
+                self.bind_ollama_endpoint(endpoint);
+                self.model_storage_path = resolve_model_storage_path();
+                self.notice = Some(Notice {
+                    kind: NoticeKind::Info,
+                    text: text(
+                        language,
+                        "Ollama接続先を更新しました。",
+                        "Updated the Ollama endpoint.",
+                    )
+                    .to_owned(),
+                });
+                self.refresh_models();
+            }
+            Err(error) => {
+                let error = ollama_endpoint_error_message(language, &error);
+                self.notice = Some(Notice {
+                    kind: NoticeKind::Error,
+                    text: error,
+                });
+            }
+        }
+    }
+
+    fn handle_ollama_endpoint_error(&mut self, error: OllamaEndpointError) {
+        let error = ollama_endpoint_error_message(self.language(), &error);
+        self.connection = ConnectionState::Unavailable(error.clone());
+        self.notice = Some(Notice {
+            kind: NoticeKind::Error,
+            text: error,
+        });
+    }
+
     fn refresh_models(&mut self) {
         if self.model_refresh_pending {
+            return;
+        }
+        if let Err(error) = self.synchronize_auto_ollama_endpoint() {
+            self.handle_ollama_endpoint_error(error);
             return;
         }
         self.model_refresh_pending = true;
@@ -328,6 +425,10 @@ impl TacetaApp {
 
     fn refresh_managed_models(&mut self) {
         if self.model_manager_pending || self.model_pull.is_some() {
+            return;
+        }
+        if let Err(error) = self.synchronize_auto_ollama_endpoint() {
+            self.handle_ollama_endpoint_error(error);
             return;
         }
         self.model_manager_pending = true;
@@ -378,6 +479,26 @@ impl TacetaApp {
     fn start_model_pull(&mut self, model: String) {
         if self.model_pull.is_some() {
             return;
+        }
+        match self.synchronize_auto_ollama_endpoint() {
+            Ok(true) => {
+                self.refresh_models();
+                self.notice = Some(Notice {
+                    kind: NoticeKind::Info,
+                    text: text(
+                        self.language(),
+                        "Ollama接続先が変わったためモデル一覧を更新しています。完了後に再実行してください。",
+                        "The Ollama endpoint changed. Wait for the model list to refresh, then try again.",
+                    )
+                    .to_owned(),
+                });
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.handle_ollama_endpoint_error(error);
+                return;
+            }
         }
         let language = self.language();
         if model.is_empty() {
@@ -434,6 +555,26 @@ impl TacetaApp {
     }
 
     fn start_model_delete(&mut self, model: String) {
+        match self.synchronize_auto_ollama_endpoint() {
+            Ok(true) => {
+                self.refresh_models();
+                self.notice = Some(Notice {
+                    kind: NoticeKind::Info,
+                    text: text(
+                        self.language(),
+                        "Ollama接続先が変わったためモデル一覧を更新しています。完了後に再実行してください。",
+                        "The Ollama endpoint changed. Wait for the model list to refresh, then try again.",
+                    )
+                    .to_owned(),
+                });
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.handle_ollama_endpoint_error(error);
+                return;
+            }
+        }
         let manager = Arc::clone(&self.model_manager);
         let result_tx = self.delete_result_tx.clone();
         self.runtime.spawn(async move {
@@ -464,14 +605,31 @@ impl TacetaApp {
                     }
                     self.ensure_selected_thinking_mode();
                 }
-                Err(error) => {
-                    let error = self.safe_backend_error(&error);
-                    self.connection = ConnectionState::Unavailable(error.clone());
-                    self.notice = Some(Notice {
-                        kind: NoticeKind::Error,
-                        text: error,
-                    });
-                }
+                Err(error) => match self.synchronize_auto_ollama_endpoint() {
+                    Ok(true) => {
+                        self.notice = Some(Notice {
+                                kind: NoticeKind::Info,
+                                text: text(
+                                    self.language(),
+                                    "Ollamaの接続設定変更を検出しました。新しい接続先で再確認しています。",
+                                    "Detected a changed Ollama endpoint and rechecking the new address.",
+                                )
+                                .to_owned(),
+                            });
+                        self.refresh_models();
+                    }
+                    Ok(false) => {
+                        let error = self.safe_backend_error(&error);
+                        self.connection = ConnectionState::Unavailable(error.clone());
+                        self.notice = Some(Notice {
+                            kind: NoticeKind::Error,
+                            text: error,
+                        });
+                    }
+                    Err(endpoint_error) => {
+                        self.handle_ollama_endpoint_error(endpoint_error);
+                    }
+                },
             }
         }
 
@@ -918,6 +1076,26 @@ impl TacetaApp {
     fn start_generation(&mut self) {
         if self.generation.is_some() {
             return;
+        }
+        match self.synchronize_auto_ollama_endpoint() {
+            Ok(true) => {
+                self.refresh_models();
+                self.notice = Some(Notice {
+                    kind: NoticeKind::Info,
+                    text: text(
+                        self.language(),
+                        "Ollama接続先が変わったためモデル一覧を更新しています。完了後に送信してください。",
+                        "The Ollama endpoint changed. Wait for the model list to refresh before sending.",
+                    )
+                    .to_owned(),
+                });
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.handle_ollama_endpoint_error(error);
+                return;
+            }
         }
         let language = self.language();
         let Some(model) = self.selected_model().cloned() else {
@@ -1792,6 +1970,144 @@ impl TacetaApp {
         }
     }
 
+    fn show_ollama_endpoint_settings(&mut self, ui: &mut Ui, language: AppShellLanguage) {
+        let palette = theme::palette(ui);
+        let endpoint_busy = self.generation.is_some()
+            || self.model_pull.is_some()
+            || self.model_refresh_pending
+            || self.model_manager_pending;
+        let mut apply_requested = false;
+        theme::card(
+            ui.visuals().faint_bg_color,
+            palette.border,
+            14,
+            16,
+        )
+        .show(ui, |ui| {
+            ui.strong(text(language, "ローカル接続", "Local connection"));
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(text(
+                    language,
+                    "Ollamaの接続先を自動追従するか、手動で指定します。",
+                    "Follow Ollama's endpoint automatically or specify one manually.",
+                ))
+                .weak(),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(text(language, "接続方式", "Mode"));
+                if ui
+                    .selectable_label(
+                        self.ollama_endpoint_mode_draft == OllamaEndpointMode::Auto,
+                        text(language, "自動", "Automatic"),
+                    )
+                    .clicked()
+                {
+                    self.ollama_endpoint_mode_draft = OllamaEndpointMode::Auto;
+                }
+                if ui
+                    .selectable_label(
+                        self.ollama_endpoint_mode_draft == OllamaEndpointMode::Custom,
+                        text(language, "手動", "Manual"),
+                    )
+                    .clicked()
+                {
+                    self.ollama_endpoint_mode_draft = OllamaEndpointMode::Custom;
+                    if self.ollama_custom_endpoint_draft.trim().is_empty() {
+                        self.ollama_custom_endpoint_draft =
+                            self.ollama_endpoint.base_url().to_owned();
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            if self.ollama_endpoint_mode_draft == OllamaEndpointMode::Auto {
+                ui.label(
+                    RichText::new(text(
+                        language,
+                        "launchctlのOLLAMA_HOST、TacetaプロセスのOLLAMA_HOST、既定値の順で解決し、接続時に再確認します。",
+                        "Resolves launchctl OLLAMA_HOST, then the Taceta process environment, then the default, and rechecks before connecting.",
+                    ))
+                    .small()
+                    .weak(),
+                );
+            } else {
+                ui.add(
+                    TextEdit::singleline(&mut self.ollama_custom_endpoint_draft)
+                        .desired_width(ui.available_width())
+                        .hint_text("http://127.0.0.1:11434"),
+                );
+            }
+            ui.add_space(10.0);
+            ui.label(text(language, "現在の接続先", "Current endpoint"));
+            let mut current_endpoint = self.ollama_endpoint.base_url().to_owned();
+            ui.add(
+                TextEdit::singleline(&mut current_endpoint)
+                    .desired_width(ui.available_width())
+                    .interactive(false),
+            );
+            ui.horizontal(|ui| {
+                ui.label(text(language, "取得元", "Source"));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(ollama_endpoint_source_label(
+                            language,
+                            self.ollama_endpoint.source(),
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(text(
+                    language,
+                    "シェルだけで別ポート起動したOllamaは自動検出できません。その場合は手動を選択してください。既定値以外では誤起動を避けるためOllamaを自動起動しません。",
+                    "A shell-only Ollama port cannot be discovered automatically; use Manual in that case. Taceta does not auto-start Ollama for non-default endpoints to avoid launching the wrong server.",
+                ))
+                .small()
+                .weak(),
+            );
+            ui.add_space(10.0);
+            apply_requested = ui
+                .add_enabled(
+                    !endpoint_busy,
+                    Button::new(if self.ollama_endpoint_mode_draft
+                        == OllamaEndpointMode::Auto
+                    {
+                        text(language, "自動検出を更新", "Refresh automatic detection")
+                    } else {
+                        text(language, "接続先を適用", "Apply endpoint")
+                    }),
+                )
+                .clicked();
+            if endpoint_busy {
+                ui.label(
+                    RichText::new(text(
+                        language,
+                        "実行中の処理が完了すると変更できます。",
+                        "The endpoint can be changed after the active operation finishes.",
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(text(
+                    language,
+                    "生成に必要な会話内容と添付は現在のOllama接続先だけへ送ります。設定はこのMacに保存します。",
+                    "Conversation context and attachments needed for generation are sent only to the current Ollama endpoint. Settings stay on this Mac.",
+                ))
+                .weak(),
+            );
+        });
+        if apply_requested {
+            self.apply_ollama_endpoint_settings();
+        }
+    }
+
     fn show_settings(&mut self, root_ui: &mut Ui) {
         let language = self.language();
         let selected_model_context = self.selected_model().and_then(|model| model.context_length);
@@ -2104,27 +2420,7 @@ impl TacetaApp {
                             });
                         });
                         ui.add_space(14.0);
-                        let palette = theme::palette(ui);
-                        theme::card(
-                            ui.visuals().faint_bg_color,
-                            palette.border,
-                            14,
-                            16,
-                        )
-                        .show(ui, |ui| {
-                            ui.strong(text(language, "ローカル接続", "Local connection"));
-                            ui.add_space(8.0);
-                            ui.monospace(LOCAL_ENGINE_URL);
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(text(
-                                    language,
-                                    "会話、添付、設定を外部サービスへ転送しません。",
-                                    "Chats, attachments, and settings are not forwarded to a cloud service.",
-                                ))
-                                .weak(),
-                            );
-                        });
+                        self.show_ollama_endpoint_settings(ui, language);
                     });
                 });
             });
@@ -3220,6 +3516,40 @@ fn resolve_model_storage_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/Users/Shared"))
         .join(".ollama")
         .join("models")
+}
+
+fn ollama_endpoint_source_label(
+    language: AppShellLanguage,
+    source: OllamaEndpointSource,
+) -> &'static str {
+    match source {
+        OllamaEndpointSource::Custom => text(language, "手動設定", "Manual setting"),
+        OllamaEndpointSource::LaunchctlEnvironment => "launchctl OLLAMA_HOST",
+        OllamaEndpointSource::ProcessEnvironment => "process OLLAMA_HOST",
+        OllamaEndpointSource::Default => text(language, "既定値", "Default"),
+    }
+}
+
+fn ollama_endpoint_error_message(
+    language: AppShellLanguage,
+    error: &OllamaEndpointError,
+) -> String {
+    match error {
+        OllamaEndpointError::MissingCustomEndpoint => text(
+            language,
+            "手動のOllama接続先を入力してください。",
+            "Enter a manual Ollama endpoint.",
+        )
+        .to_owned(),
+        OllamaEndpointError::InvalidEndpoint { origin, reason } => format!(
+            "{} ({origin}: {reason})",
+            text(
+                language,
+                "Ollama接続先の設定が正しくありません。",
+                "The Ollama endpoint configuration is invalid."
+            )
+        ),
+    }
 }
 
 fn format_context_length(value: u32) -> String {

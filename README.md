@@ -10,6 +10,7 @@ Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT We
 - Thinking の実行設定と trace 表示の独立制御
 - UTF-8 テキスト添付、および vision 能力を確認できたモデルへの画像添付
 - 日本語 / 英語、System / Light / Dark、文字サイズ 10–32 の保存
+- Ollamaの `OLLAMA_HOST` 設定とport変更への自動追従、および手動接続先
 - 見出し、装飾、コード、引用、リスト、タスク、リンク、表、脚注などの Markdown 表示
 - 会話ごとの Web Search（既定は OFF）
 - Brave Search / Ollama Web Search API、または Taceta Link 経由のブラウザー検索、Google 検索、ChatGPT Web
@@ -34,7 +35,7 @@ Web Search が OFF のときは外部リクエストを作りません。ON の�
 
 ```text
 Taceta (Rust/egui)
-  ├─ Web Search OFF ───────────────→ Ollama (loopback)
+  ├─ Web Search OFF ───────────────→ Ollama (resolved endpoint)
   ├─ Brave / Ollama Web Search API ─→ 外部検索 → Ollama (最終回答)
   └─ Taceta Link ──────────────────→ Brave / Chrome
                                       └─ 検索または ChatGPT Web
@@ -48,8 +49,8 @@ ChatGPT Web 経路で送るのは現在の入力欄の prompt だけです。会
 
 ## セキュリティとプライバシー
 
-- 通常のチャットと会話履歴はこの Mac のローカルアプリケーションデータにのみ保存します。
-- 既定の接続先は `http://127.0.0.1:11434` です。Ollama とモデルは Taceta に同梱・再配布しません。
+- 通常のチャットと会話履歴はこの Mac のローカルアプリケーションデータに保存します。生成に必要な会話内容と添付は、現在設定されているOllama接続先だけへ送ります。
+- Ollamaの既定接続先は `http://127.0.0.1:11434` です。TacetaはOllamaの設定を自動解決でき、Ollamaとモデルは同梱・再配布しません。
 - Web Search を有効にした場合だけ、設定した検索先へ query、または選択した Web executor の request が送られます。送信前に画面で確認できます。
 - API key が必要な検索 provider の key は macOS Keychain に保存します。Cookie やブラウザーの認証 token を読み出したり、エクスポートしたりしません。
 - Taceta Link の `tabs`、`tabGroups`、`scripting`、`debugger`、`nativeMessaging`、HTTPS host access などの権限は、作業経路と検索ページを扱うために必要です。拡張は Taceta が追跡している tab 以外を対象にしない設計です。
@@ -61,10 +62,24 @@ Taceta Link は OpenAI / ChatGPT の公式拡張ではなく、ChatGPT Web の D
 
 - macOS 13.0 以降（Apple Silicon を主対象）
 - Rust 1.92 以降（ソースからビルドする場合）
-- [Ollama](https://ollama.com/) を別途インストールし、`http://127.0.0.1:11434` で起動
+- [Ollama](https://ollama.com/) を別途インストールして起動
 - Taceta Link を使う場合は Brave または Chrome
 
 モデルの取得・削除は Model Manager から利用者が明示的に行います。モデル、Ollama、ブラウザー、検索 API、ChatGPT Web の利用条件は、それぞれの提供元に従います。
+
+## Ollama接続先
+
+既定の「自動」モードでは、Tacetaは接続時に次の順序でOllamaの接続先を解決します。
+
+1. macOSの `launchctl` に設定された `OLLAMA_HOST`
+2. Tacetaプロセス自身の `OLLAMA_HOST`
+3. 最終フォールバックの `http://127.0.0.1:11434`
+
+Ollamaが `0.0.0.0` または `::` で待ち受ける設定は、Ollama公式の接続用変換と同様に `127.0.0.1` または `::1` へ変換します。接続操作と接続失敗後の再確認で設定を読み直すため、Tacetaの起動後に `launchctl` のportを変更した場合も追従できます。
+
+`OLLAMA_HOST=127.0.0.1:23456 ollama serve` のように、一つのシェルだけへ設定して起動したOllamaのportは、別のGUIアプリから取得できる公式APIがありません。その場合は設定画面で「手動」を選び、接続先を指定してください。既定フォールバック以外の接続先が未到達でも、Tacetaは `11434` へ勝手に戻りません。また、誤ったportで別のOllamaを起動しないよう、Tacetaからの自動起動は既定フォールバック時だけ行います。
+
+Ollamaの公式仕様は [API Base URL](https://docs.ollama.com/api/introduction#base-url)、[macOSの環境変数設定](https://docs.ollama.com/faq#setting-environment-variables-on-mac)、[ネットワーク公開設定](https://docs.ollama.com/faq#how-can-i-expose-ollama-on-my-network) を参照してください。
 
 ## ソースからビルドして使う
 
@@ -116,6 +131,7 @@ Taceta はブラウザーの承認を無断で完了したり、拡張をサイ�
 ## 制限事項と実験的機能
 
 - macOS 専用で、Apple Silicon を主対象としています。
+- Ollamaには稼働中portを問い合わせるAPIがありません。シェルだけに設定した一時的な `OLLAMA_HOST` は自動検出できないため、設定画面の手動接続先を使用してください。
 - Ollama の稼働、モデルの能力、利用可能な context length はモデルごとに異なります。設定値がモデル上限を超える場合は Ollama 側の制約が適用されます。
 - Taceta Link の検索・ChatGPT Web 経路は、ログイン状態、ブラウザーの権限、ネットワーク、対象サイトの UI 変更に依存します。
 - ChatGPT Web は公式 API 統合ではありません。サービス側の変更や利用条件により停止・変更され得ます。安定したプログラム統合が必要な場合は、対象サービスが提供する公式 API を検討してください。
@@ -142,6 +158,7 @@ Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly star
 - Independently control Thinking execution and Thinking-trace visibility
 - Attach UTF-8 text, and images only to models with confirmed vision capability
 - Persist Japanese / English, System / Light / Dark, and font size 10–32
+- Follow Ollama `OLLAMA_HOST` and port changes automatically, with a manual endpoint option
 - Render Markdown including headings, emphasis, code, quotes, lists, tasks, links, tables, and footnotes
 - Per-conversation Web Search, off by default
 - Brave Search / Ollama Web Search APIs, or browser search, Google Search, and ChatGPT Web through Taceta Link
@@ -166,7 +183,7 @@ Configure language, theme, model management, Web Search, the model location, and
 
 ```text
 Taceta (Rust/egui)
-  ├─ Web Search OFF ───────────────→ Ollama (loopback)
+  ├─ Web Search OFF ───────────────→ Ollama (resolved endpoint)
   ├─ Brave / Ollama Web Search API ─→ external search → Ollama (final answer)
   └─ Taceta Link ──────────────────→ Brave / Chrome
                                       └─ search or ChatGPT Web
@@ -180,8 +197,8 @@ The ChatGPT Web route sends only the prompt currently in the composer. It does n
 
 ## Security and privacy
 
-- Normal chats and conversation history are stored only in this Mac's local application data.
-- The default endpoint is `http://127.0.0.1:11434`. Taceta does not bundle or redistribute Ollama or models.
+- Normal chats and conversation history are stored in this Mac's local application data. Conversation context and attachments needed for generation are sent only to the currently configured Ollama endpoint.
+- Ollama's default endpoint is `http://127.0.0.1:11434`. Taceta can resolve Ollama's configuration automatically and does not bundle or redistribute Ollama or models.
 - Only when Web Search is enabled, the configured search provider receives a query or request. The UI asks for confirmation before sending.
 - Where a search provider requires an API key, it is stored in the macOS Keychain. Browser cookies and authentication tokens are never read or exported.
 - Taceta Link requests `tabs`, `tabGroups`, `scripting`, `debugger`, `nativeMessaging`, HTTPS host access, and related permissions to operate its working route and search pages. It is designed to act only on tabs tracked as Taceta-owned.
@@ -193,10 +210,24 @@ Taceta Link is not an official OpenAI / ChatGPT extension. It is an unofficial, 
 
 - macOS 13.0 or later (Apple Silicon is the primary target)
 - Rust 1.92 or later when building from source
-- [Ollama](https://ollama.com/) installed separately and running at `http://127.0.0.1:11434`
+- [Ollama](https://ollama.com/) installed and running separately
 - Brave or Chrome for Taceta Link
 
 Users explicitly retrieve and remove models through Taceta's Model Manager. Ollama, browsers, search APIs, ChatGPT Web, and models remain subject to their respective provider terms and conditions.
+
+## Ollama endpoint
+
+In the default **Automatic** mode, Taceta resolves the Ollama endpoint in this order whenever it connects:
+
+1. `OLLAMA_HOST` in the macOS `launchctl` environment
+2. `OLLAMA_HOST` inherited by the Taceta process
+3. The final fallback `http://127.0.0.1:11434`
+
+Wildcard bind addresses `0.0.0.0` and `::` are converted to the connectable loopback addresses `127.0.0.1` and `::1`, matching Ollama's official client behavior. Taceta re-reads the configuration before connection operations and after a failed connection, so it can follow a `launchctl` port change made while Taceta is running.
+
+There is no official API through which a separate GUI application can discover an Ollama server started with a shell-only setting such as `OLLAMA_HOST=127.0.0.1:23456 ollama serve`. Select **Manual** in Settings for that case. Taceta does not silently fall back to port `11434` when a configured non-default endpoint is unreachable. To avoid starting another server on the wrong port, Taceta auto-starts Ollama only when using the final default fallback.
+
+See Ollama's official documentation for the [API base URL](https://docs.ollama.com/api/introduction#base-url), [macOS environment configuration](https://docs.ollama.com/faq#setting-environment-variables-on-mac), and [network binding](https://docs.ollama.com/faq#how-can-i-expose-ollama-on-my-network).
 
 ## Build and run from source
 
@@ -248,6 +279,7 @@ To uninstall, stop active Taceta Link work, choose **Remove** for Taceta Link in
 ## Limitations and experimental status
 
 - Taceta is macOS-only, with Apple Silicon as the primary target.
+- Ollama has no API for asking a running server which port it uses. A temporary `OLLAMA_HOST` set only in the server's shell cannot be auto-detected; use the manual endpoint in Settings.
 - Ollama availability, model capability, and supported context length vary by model. If a configured context length exceeds a model's limit, Ollama applies its own constraint.
 - Taceta Link search and ChatGPT Web routes depend on login state, browser permissions, network access, and the target site's UI.
 - ChatGPT Web is not an official API integration. It can stop or change because of service changes or applicable terms. For a stable programmatic integration, consider the official API offered by the relevant service.
