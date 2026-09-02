@@ -15,11 +15,11 @@ ICON_SOURCE="$REPO_ROOT/assets/Taceta.icns"
 cd -- "$REPO_ROOT"
 PACKAGE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
 EXT_VERSION="$(tr -d '[:space:]' < browser-extension/VERSION)"
-MANIFEST_VERSION="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("browser-extension/manifest.json", "utf8")).version)')"
+MANIFEST_VERSION="$(/usr/bin/plutil -extract version raw -o - browser-extension/manifest.json)"
 PROTOCOL_VERSION="$(sed -n 's/^pub const PROTOCOL_VERSION: u16 = \([0-9][0-9]*\);/\1/p' src/browser_harness/mod.rs)"
-CONTRACT_SCHEMA_VERSION="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync("protocol/contract.json", "utf8")).properties.schema_version.const))')"
-CONTRACT_PRODUCT_VERSION="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("protocol/contract.json", "utf8")).properties.product_version.const)')"
-CONTRACT_PROTOCOL_VERSION="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync("protocol/contract.json", "utf8")).properties.protocol_version.const))')"
+CONTRACT_SCHEMA_VERSION="$(/usr/bin/plutil -extract properties.schema_version.const raw -o - protocol/contract.json)"
+CONTRACT_PRODUCT_VERSION="$(/usr/bin/plutil -extract properties.product_version.const raw -o - protocol/contract.json)"
+CONTRACT_PROTOCOL_VERSION="$(/usr/bin/plutil -extract properties.protocol_version.const raw -o - protocol/contract.json)"
 test -n "$PACKAGE_VERSION" && test "$PACKAGE_VERSION" = "$EXT_VERSION" \
   && test "$EXT_VERSION" = "$MANIFEST_VERSION" \
   && test "$PACKAGE_VERSION" = "$CONTRACT_PRODUCT_VERSION" \

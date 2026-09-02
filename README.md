@@ -1,118 +1,233 @@
 # Taceta
 
-静かに考え、手元で答える。Taceta は macOS 専用のローカル推論向けネイティブチャットクライアントです。Rust と `eframe` / `egui` で構築します。
+静かに考え、手元で答える。Taceta は、Ollama をバックエンドに使う macOS 専用のローカル推論クライアントです。Rust と `eframe` / `egui` で構築されています。
 
-## できること
+Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT Web とのやり取りを Taceta から明示的に開始できる独立した Manifest V3 拡張です。Taceta と Taceta Link は OpenAI、Ollama、Brave、Google の公式製品ではありません。
 
-- ローカルモデルのストリーミング回答、Thinking の生成と trace 表示の独立制御
-- UTF-8 テキスト添付、vision 能力を確認できたモデルへの画像添付
+## 主な機能
+
+- Ollama モデルのストリーミング回答
+- Thinking の実行設定と trace 表示の独立制御
+- UTF-8 テキスト添付、および vision 能力を確認できたモデルへの画像添付
 - 日本語 / 英語、System / Light / Dark、文字サイズ 10–32 の保存
-- 会話単位の Web Search（既定 OFF）
-- Brave Search / Ollama Web Search API、または Taceta Link 経由のブラウザー既定検索・Google 検索・ChatGPT Web
+- 見出し、装飾、コード、引用、リスト、タスク、リンク、表、脚注などの Markdown 表示
+- 会話ごとの Web Search（既定は OFF）
+- Brave Search / Ollama Web Search API、または Taceta Link 経由のブラウザー検索、Google 検索、ChatGPT Web
 
-Web OFF は完全にローカルです。Web ON は設定された executor を自動適用します。外部結果は untrusted context として扱い、最終回答はローカル Ollama が生成します。Web ON + Send は一回の Web request だけを許可します。ChatGPT Web へは現在の入力欄の prompt だけを正確に渡し、履歴、system message、添付、Thinking trace は渡しません。アカウント操作や破壊的操作は、Web ON でも確認を要求します。
+Web Search が OFF のときは外部リクエストを作りません。ON のときは選択された executor だけを使い、検索結果やブラウザーの回答は untrusted context としてローカル Ollama の最終回答に渡します。Web ON + Send は、その送信に対して一回の Web request を明示的に許可します。
 
-## 製品構成
+## 構成とデータフロー
 
-Taceta は単一 Git repo / version の中で、Rust アプリ `src/` と独立 component `browser-extension/` を物理的に分離しています。Taceta Link は Manifest V3、Native Messaging Host (`org.mlabo.taceta.link`)、user-only Unix socket のローカル経路です。Codex、外部 browser plugin、Node companion、Cookie / token のエクスポートには依存しません。
+```text
+Taceta (Rust/egui)
+  ├─ Web Search OFF ───────────────→ Ollama (loopback)
+  ├─ Brave / Ollama Web Search API ─→ 外部検索 → Ollama (最終回答)
+  └─ Taceta Link ──────────────────→ Brave / Chrome
+                                      └─ 検索または ChatGPT Web
+                                         → Native Messaging
+                                         → Taceta → Ollama (最終回答)
+```
 
-拡張は既存の normal window（focused を優先）を作業コンテナとして再利用し、その中に非アクティブな agent tab と group を作成します。normal window がない場合だけ非フォーカスの window を作成します。window は所有・削除せず、Taceta が作成した exact tab/group だけを追跡し、終了時は ungroup と agent tab の削除を行います。product version と protocol version が一致しない場合は fail-closed します。固定 extension ID は `hefhkgbiiajifedgjlbiklclooifkidg` です。
+Taceta Link は `browser-extension/` の MV3 拡張、Native Messaging Host `org.mlabo.taceta.link`、ユーザー専用 Unix socket で構成されます。拡張は既存の通常ブラウザーウィンドウを優先して作業用 tab / group を作り、Taceta が所有する exact tab / group だけを追跡します。ブラウザーのウィンドウ全体を閉じることはありません。製品 version、protocol version、固定 extension ID が一致しない場合は fail-closed します。
+
+ChatGPT Web 経路で送るのは現在の入力欄の prompt だけです。会話履歴、system message、添付ファイル、Thinking trace、Cookie、token、profile、localStorage は取得・送信・保存しません。ChatGPT Web の出力は逐次的に受信しますが、最終回答の生成はローカル Ollama が担当します。
+
+## セキュリティとプライバシー
+
+- 通常のチャットと会話履歴はこの Mac のローカルアプリケーションデータにのみ保存します。
+- 既定の接続先は `http://127.0.0.1:11434` です。Ollama とモデルは Taceta に同梱・再配布しません。
+- Web Search を有効にした場合だけ、設定した検索先へ query、または選択した Web executor の request が送られます。送信前に画面で確認できます。
+- API key が必要な検索 provider の key は macOS Keychain に保存します。Cookie やブラウザーの認証 token を読み出したり、エクスポートしたりしません。
+- Taceta Link の `tabs`、`tabGroups`、`scripting`、`debugger`、`nativeMessaging`、HTTPS host access などの権限は、作業経路と検索ページを扱うために必要です。拡張は Taceta が追跡している tab 以外を対象にしない設計です。
+- ログイン、アカウント変更、購入、削除などの破壊的またはアカウント操作は自動実行しません。
+
+Taceta Link は OpenAI / ChatGPT の公式拡張ではなく、ChatGPT Web の DOM を使う非公式・実験的な連携です。利用するアカウント、Web サービス、ブラウザーの規約と管理者ポリシーを確認したうえで利用してください。UI やサービス条件の変更により、この経路は動作しなくなる可能性があります。
 
 ## 必要環境
 
 - macOS 13.0 以降（Apple Silicon を主対象）
-- Rust 1.92 以降（開発・ビルド時）
+- Rust 1.92 以降（ソースからビルドする場合）
 - [Ollama](https://ollama.com/) を別途インストールし、`http://127.0.0.1:11434` で起動
 - Taceta Link を使う場合は Brave または Chrome
 
-Taceta は Ollama 本体やモデルを同梱・再配布しません。モデルの取得・削除は利用者が Model Manager 画面で明示的に実行します。API key は必要な provider ごとに macOS Keychain へ保存します。
+モデルの取得・削除は Model Manager から利用者が明示的に行います。モデル、Ollama、ブラウザー、検索 API、ChatGPT Web の利用条件は、それぞれの提供元に従います。
 
-## Taceta Link の初回セットアップ
+## ソースからビルドして使う
 
-Taceta は macOS のデフォルトブラウザーを検出します。初期対応は Brave と Chrome です。起動時に拡張を Taceta の Application Support（`~/Library/Application Support/Taceta/browser-extension`）へ materialize し、選択されたブラウザー用の Native Messaging Host を登録し、version と extension ID を検証します。その後、拡張管理ページを開いて次を案内します。
+```sh
+git clone https://github.com/mlabo-org/taceta.git
+cd taceta
+```
 
-1. Brave は `brave://extensions`、Chrome は `chrome://extensions` を開く。
-2. Developer mode（デベロッパーモード）を ON にする。
-3. **Load unpacked（パッケージ化されていない拡張機能を読み込む）** / **Add（追加）** を押し、表示された Application Support 内の `browser-extension` フォルダーを選ぶ。
-4. ID `hefhkgbiiajifedgjlbiklclooifkidg` と Taceta Link の version が一致することを確認する。
+開発中に直接起動する場合は `cargo run` を使えます。
 
-この最終的なブラウザー確認だけは利用者が行います。Taceta は拡張承認を無断で完了したり、サイレントインストールしたりしません。更新時は拡張管理ページで **Reload（再読み込み）** を押すよう案内します。デフォルトブラウザーが Safari など未対応の場合は、Brave または Chrome をインストールしてデフォルトにするよう案内し、未対応ブラウザーへ登録しません。
-
-## ビルドと起動
-
-```bash
+```sh
 cargo run
 ```
 
-通常利用向け app bundle は次で生成します。
+通常利用で使う app bundle は、次の正規スクリプトで release binary から生成します。version、protocol、extension の整合性を確認し、`dist/Taceta.app` を作成します。
 
-```bash
+```sh
 ./scripts/build-macos-app.sh
-open ./dist/Taceta.app
 ```
 
-署名、公証、インストーラー作成はこのスクリプトの範囲外です。
+生成物をユーザー単位でインストールして起動します（`/Applications` へ Finder でコピーしても構いません）。
 
-## 公開範囲とライセンス
+```sh
+./scripts/install-macos-app.sh
+```
 
-Taceta は Ollama と公式に提携・承認・後援された製品ではありません。将来、GUI 完成後に typed agent-harness 境界を追加する余地はありますが、現在の Taceta Link や通常起動経路の依存ではありません。
+既定のインストール先は `~/Applications` です。別の場所へ置く場合は `./scripts/install-macos-app.sh --install-dir /Applications` のように指定します。`cargo run` は開発用であり、インストール済みランタイムとしては使用しないでください。署名、公証、インストーラー作成は現在のスクリプトの範囲外です。
 
-Taceta 自体のコードは [MIT License](LICENSE) で提供します。Copyright (c) 2026 Makoto Suzuki。
+## Taceta Link のセットアップ
+
+Taceta の「Taceta Link をセットアップ」を押すと、macOS のデフォルトブラウザーが Brave または Chrome の場合に、拡張を `~/Library/Application Support/Taceta/browser-extension` へ materialize し、ユーザー専用の Native Messaging Host を登録して拡張管理ページを開きます。
+
+ブラウザー側で一度だけ次を行います。
+
+1. Brave は `brave://extensions`、Chrome は `chrome://extensions` を開く。
+2. **Developer mode（デベロッパーモード）** を ON にする。
+3. **Load unpacked（パッケージ化されていない拡張機能を読み込む）** / **Add（追加）** を選ぶ。
+4. Taceta が表示した Application Support 内の `browser-extension` フォルダーを選ぶ。
+5. 拡張 ID `hefhkgbiiajifedgjlbiklclooifkidg` と version が一致することを確認する。
+
+Taceta はブラウザーの承認を無断で完了したり、拡張をサイレントインストールしたりしません。Safari などの未対応ブラウザーには登録しません。更新時は拡張管理ページで **Reload（再読み込み）** を押してください。拡張単体の開発・検証と Native Messaging の詳細は [browser-extension/README.md](browser-extension/README.md) を参照してください。
+
+## 更新とアンインストール
+
+更新時は Taceta を終了し、`./scripts/build-macos-app.sh` の後に `./scripts/install-macos-app.sh` を実行します。その後、ブラウザーの拡張管理ページで Taceta Link を Reload します。app bundle の更新と拡張の Reload は別の操作です。
+
+アンインストール時は、Taceta とブラウザーで実行中の処理を終了し、拡張管理ページで Taceta Link を **Remove（削除）** してから、Taceta.app を Finder でゴミ箱へ移動します。必要であれば `~/Library/Application Support/Taceta` を確認して設定・履歴を削除してください。この最後の操作はデータを失うため、先にバックアップしてください。Ollama、Ollama のモデル、macOS Keychain の provider key は Taceta のアンインストールでは削除されません。
+
+## 制限事項と実験的機能
+
+- macOS 専用で、Apple Silicon を主対象としています。
+- Ollama の稼働、モデルの能力、利用可能な context length はモデルごとに異なります。設定値がモデル上限を超える場合は Ollama 側の制約が適用されます。
+- Taceta Link の検索・ChatGPT Web 経路は、ログイン状態、ブラウザーの権限、ネットワーク、対象サイトの UI 変更に依存します。
+- ChatGPT Web は公式 API 統合ではありません。サービス側の変更や利用条件により停止・変更され得ます。安定したプログラム統合が必要な場合は、対象サービスが提供する公式 API を検討してください。
+- 配布用 app bundle のコード署名、公証、更新署名はまだ提供していません。公開バイナリを配布する場合は、Gatekeeper と署名の状態を確認してください。
+- このリポジトリには OpenAI の公式拡張のコードや bundle を同梱・再配布していません。
+
+## ライセンス
+
+Taceta のコードと同梱アセットは [MIT License](LICENSE) で提供します。Copyright (c) 2026 Makoto Suzuki.
+
+Ollama、ブラウザー、検索 API、ChatGPT Web、モデル、および Rust の依存クレートは Taceta とは別の製品・サービスです。それぞれのライセンス、利用規約、商標条件が適用されます。Taceta はそれらの提供元から承認、後援、提携を受けていません。
 
 ---
 
 # Taceta (English)
 
-Think quietly, answer locally. Taceta is a macOS-only native chat client for local inference, built with Rust and `eframe` / `egui`.
+Think quietly, answer locally. Taceta is a macOS-only local inference client using Ollama as its backend. It is built with Rust and `eframe` / `egui`.
+
+Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly start searches and ChatGPT Web interactions in a logged-in browser. Neither project is an official product of OpenAI, Ollama, Brave, or Google.
 
 ## Features
 
-- Stream local-model answers with independent Thinking generation and trace visibility
-- Attach UTF-8 text and images only to models with confirmed vision capability
+- Stream responses from Ollama models
+- Independently control Thinking execution and Thinking-trace visibility
+- Attach UTF-8 text, and images only to models with confirmed vision capability
 - Persist Japanese / English, System / Light / Dark, and font size 10–32
-- Per-conversation Web Search, off by default: Brave Search or Ollama Web Search APIs, or Taceta Link browser-default search, Google Search, and ChatGPT Web
+- Render Markdown including headings, emphasis, code, quotes, lists, tasks, links, tables, and footnotes
+- Per-conversation Web Search, off by default
+- Brave Search / Ollama Web Search APIs, or browser search, Google Search, and ChatGPT Web through Taceta Link
 
-Web OFF is completely local. Web ON automatically applies the configured executor. Browser and search output is untrusted external context; local Ollama always generates the final answer. Web ON + Send authorizes one web request. ChatGPT Web receives exactly the current prompt, never history, system messages, attachments, or Thinking traces. Account and destructive actions still require confirmation.
+When Web Search is OFF, Taceta creates no external request. When it is ON, only the selected executor is used, and search or browser output is passed to local Ollama as untrusted context for the final answer. Web ON + Send explicitly authorizes one web request for that send.
 
-## Product layout
+## Architecture and data flow
 
-One Git repository and product version contain two physically separate components: the Rust app in `src/` and the independent extension in `browser-extension/`. Taceta Link is a local Manifest V3 + Native Messaging Host (`org.mlabo.taceta.link`) + user-only Unix socket path. Taceta has no runtime dependency on Codex, external browser plugins, Node companions, or cookie/token export.
+```text
+Taceta (Rust/egui)
+  ├─ Web Search OFF ───────────────→ Ollama (loopback)
+  ├─ Brave / Ollama Web Search API ─→ external search → Ollama (final answer)
+  └─ Taceta Link ──────────────────→ Brave / Chrome
+                                      └─ search or ChatGPT Web
+                                         → Native Messaging
+                                         → Taceta → Ollama (final answer)
+```
 
-The extension prefers an existing focused normal window as its route container and creates an inactive agent tab and group there; it creates a non-focused normal window only when none exists. The window is never owned or closed. Taceta tracks only its exact agent tab/group, then ungroups and removes that agent tab at the end of the session. Mismatched product or protocol versions fail closed. The fixed extension ID is `hefhkgbiiajifedgjlbiklclooifkidg`.
+Taceta Link consists of the MV3 extension in `browser-extension/`, the Native Messaging Host `org.mlabo.taceta.link`, and a per-user Unix socket. The extension prefers an existing normal browser window, creates a working tab/group, and tracks only the exact tab/group created by Taceta. It never closes the browser window. A product-version, protocol-version, or fixed-extension-ID mismatch fails closed.
+
+The ChatGPT Web route sends only the prompt currently in the composer. It does not read, send, or store conversation history, system messages, attachments, Thinking traces, cookies, tokens, profiles, or local storage. ChatGPT Web output is received incrementally, while local Ollama remains responsible for the final answer. This experimental route can break when the web UI or service conditions change.
+
+## Security and privacy
+
+- Normal chats and conversation history are stored only in this Mac's local application data.
+- The default endpoint is `http://127.0.0.1:11434`. Taceta does not bundle or redistribute Ollama or models.
+- Only when Web Search is enabled, the configured search provider receives a query or request. The UI asks for confirmation before sending.
+- Where a search provider requires an API key, it is stored in the macOS Keychain. Browser cookies and authentication tokens are never read or exported.
+- Taceta Link requests `tabs`, `tabGroups`, `scripting`, `debugger`, `nativeMessaging`, HTTPS host access, and related permissions to operate its working route and search pages. It is designed to act only on tabs tracked as Taceta-owned.
+- Login, account changes, purchases, deletions, and other destructive or account actions are not automated.
+
+Taceta Link is not an official OpenAI / ChatGPT extension. It is an unofficial, experimental integration using the ChatGPT Web DOM. Check the terms and administrator policies of the account, web services, and browser you use.
 
 ## Requirements
 
 - macOS 13.0 or later (Apple Silicon is the primary target)
-- Rust 1.92 or later for development builds
-- [Ollama](https://ollama.com/) installed separately at `http://127.0.0.1:11434`
+- Rust 1.92 or later when building from source
+- [Ollama](https://ollama.com/) installed separately and running at `http://127.0.0.1:11434`
 - Brave or Chrome for Taceta Link
 
-Taceta does not bundle or redistribute Ollama or models. Model retrieval and removal are explicit user actions in Model Manager. Provider API keys, where required, are stored in the macOS Keychain.
+Users explicitly retrieve and remove models through Taceta's Model Manager. Ollama, browsers, search APIs, ChatGPT Web, and models remain subject to their respective provider terms and conditions.
 
-## First-time Taceta Link setup
+## Build and run from source
 
-Taceta detects the macOS default browser. Initial support is Brave and Chrome. It materializes the extension under Taceta Application Support (`~/Library/Application Support/Taceta/browser-extension`), registers the browser-specific Native Messaging Host, and verifies the version and extension ID. It then opens the extension-management page and guides the only manual browser approval:
+```sh
+git clone https://github.com/mlabo-org/taceta.git
+cd taceta
+```
 
-1. Open `brave://extensions` or `chrome://extensions`.
-2. Turn on Developer mode.
-3. Choose **Load unpacked** / **Add**, then select the `browser-extension` folder in the Taceta Application Support directory shown by Taceta.
-4. Confirm extension ID `hefhkgbiiajifedgjlbiklclooifkidg` and the Taceta Link version.
+Use `cargo run` for development-time direct execution:
 
-The final browser approval is manual by design. Taceta cannot silently approve or install an unpacked extension. On updates, it guides the user to press **Reload**. Safari and other unsupported default browsers are directed to install Brave or Chrome and make one the default; Taceta does not register against an unsupported browser.
-
-## Build and launch
-
-```bash
+```sh
 cargo run
 ```
 
-```bash
+For normal use, create the macOS app bundle with the canonical release materialization script. It checks product, protocol, and extension-version consistency and creates `dist/Taceta.app`.
+
+```sh
 ./scripts/build-macos-app.sh
-open ./dist/Taceta.app
 ```
 
-Signing, notarization, and installer creation are outside this script.
+Install and launch the bundle for the current user:
 
-## Scope and license
+```sh
+./scripts/install-macos-app.sh
+```
 
-Taceta is not officially affiliated with, endorsed by, or sponsored by Ollama. A future typed agent-harness boundary may be added after the GUI is complete, but it is not a current dependency or launch route. Taceta's code is released under the [MIT License](LICENSE). Copyright (c) 2026 Makoto Suzuki.
+The default destination is `~/Applications`; use `./scripts/install-macos-app.sh --install-dir /Applications` for another destination. `cargo run` is a development command, not the installed runtime. Code signing, notarization, and installer creation are outside the current scripts.
+
+## Set up Taceta Link
+
+Choose **Set up Taceta Link** in Taceta. If the macOS default browser is Brave or Chrome, Taceta materializes the extension at `~/Library/Application Support/Taceta/browser-extension`, registers a per-user Native Messaging Host, and opens the extension-management page.
+
+Complete these browser steps once:
+
+1. Open `brave://extensions` or `chrome://extensions`.
+2. Turn on **Developer mode**.
+3. Choose **Load unpacked** / **Add**.
+4. Select the `browser-extension` folder in the Application Support location shown by Taceta.
+5. Confirm extension ID `hefhkgbiiajifedgjlbiklclooifkidg` and the matching version.
+
+Taceta does not silently approve or install the browser extension, and does not register with Safari or other unsupported browsers. After an update, press **Reload** for Taceta Link. See [browser-extension/README.md](browser-extension/README.md) for standalone extension development and Native Messaging details.
+
+## Update and uninstall
+
+Quit Taceta before updating, then run `./scripts/build-macos-app.sh` followed by `./scripts/install-macos-app.sh`. Reload Taceta Link on the browser's extension-management page; updating the app bundle and reloading the extension are separate actions.
+
+To uninstall, stop active Taceta Link work, choose **Remove** for Taceta Link in the browser, and move Taceta.app to the Trash in Finder. If desired, inspect `~/Library/Application Support/Taceta` and remove Taceta's settings and history after backing up anything needed. Uninstalling Taceta does not remove Ollama, Ollama models, or provider keys stored in the macOS Keychain.
+
+## Limitations and experimental status
+
+- Taceta is macOS-only, with Apple Silicon as the primary target.
+- Ollama availability, model capability, and supported context length vary by model. If a configured context length exceeds a model's limit, Ollama applies its own constraint.
+- Taceta Link search and ChatGPT Web routes depend on login state, browser permissions, network access, and the target site's UI.
+- ChatGPT Web is not an official API integration. It can stop or change because of service changes or applicable terms. For a stable programmatic integration, consider the official API offered by the relevant service.
+- Code signing, notarization, and signed update delivery for distributed app bundles are not currently provided. Verify Gatekeeper and signing status before running a downloaded binary.
+- This repository does not include, bundle, or redistribute code from the official ChatGPT extension.
+
+## License
+
+Taceta's code and bundled assets are released under the [MIT License](LICENSE). Copyright (c) 2026 Makoto Suzuki.
+
+Ollama, browsers, search APIs, ChatGPT Web, models, and Rust dependency crates are separate products and services. Their own licenses, terms, and trademark conditions apply. Taceta is not endorsed, sponsored, or affiliated with their providers.
