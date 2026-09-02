@@ -45,7 +45,12 @@ use taceta::{
 
 const APP_SHELL_STORAGE_KEY: &str = "taceta.app-shell-preferences.v1";
 const LOCAL_ENGINE_URL: &str = "http://127.0.0.1:11434";
-const COMPOSER_EDITOR_HEIGHT: f32 = 58.0;
+const COMPOSER_EDITOR_MIN_HEIGHT: f32 = 58.0;
+const COMPOSER_EDITOR_MAX_HEIGHT: f32 = 420.0;
+const COMPOSER_EDITOR_MAX_HEIGHT_FRACTION: f32 = 0.42;
+const COMPOSER_PANEL_BASE_HEIGHT: f32 = 154.0;
+const COMPOSER_ATTACHMENT_EXTRA_HEIGHT: f32 = 30.0;
+const COMPOSER_CARD_INNER_MARGIN: f32 = 12.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -1910,11 +1915,22 @@ impl TacetaApp {
             .ctx()
             .input(|input| !input.raw.hovered_files.is_empty());
         let language = self.language();
-        let panel_height = if self.state.pending_attachments.is_empty() {
-            154.0
+        let editor_wrap_width =
+            (root_ui.available_width() - COMPOSER_CARD_INNER_MARGIN * 2.0).max(1.0);
+        let editor_viewport_height = composer_editor_viewport_height(
+            root_ui,
+            &self.state.draft,
+            editor_wrap_width,
+            root_ui.available_height(),
+        );
+        let attachment_height = if self.state.pending_attachments.is_empty() {
+            0.0
         } else {
-            184.0
+            COMPOSER_ATTACHMENT_EXTRA_HEIGHT
         };
+        let panel_height = COMPOSER_PANEL_BASE_HEIGHT
+            + (editor_viewport_height - COMPOSER_EDITOR_MIN_HEIGHT)
+            + attachment_height;
         Panel::bottom("taceta-composer-panel")
             .exact_size(panel_height)
             .show_inside(root_ui, |ui| {
@@ -1957,6 +1973,7 @@ impl TacetaApp {
                                 &mut self.state.draft,
                                 text(language, "何でもどうぞ", "Message Taceta"),
                                 palette.placeholder_text,
+                                editor_viewport_height,
                             )
                             .inner;
                             let keyboard_send = editor.has_focus()
@@ -2317,14 +2334,15 @@ fn show_composer_editor(
     draft: &mut String,
     hint_text: &str,
     placeholder_text: egui::Color32,
+    viewport_height: f32,
 ) -> ScrollAreaOutput<egui::Response> {
     ui.visuals_mut().weak_text_color = Some(placeholder_text);
     ui.style_mut().spacing.scroll = ScrollStyle::solid();
 
     ScrollArea::vertical()
         .id_salt("taceta-composer-draft-scroll")
-        .max_height(COMPOSER_EDITOR_HEIGHT)
-        .min_scrolled_height(COMPOSER_EDITOR_HEIGHT)
+        .max_height(viewport_height)
+        .min_scrolled_height(viewport_height)
         .auto_shrink([false, false])
         .scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
         .show(ui, |ui| {
@@ -2348,6 +2366,18 @@ fn show_composer_editor(
         })
 }
 
+fn composer_editor_viewport_height(
+    ui: &Ui,
+    draft: &str,
+    wrap_width: f32,
+    available_height: f32,
+) -> f32 {
+    let content_height = composer_editor_content_height(ui, draft, wrap_width);
+    let maximum_height = (available_height * COMPOSER_EDITOR_MAX_HEIGHT_FRACTION)
+        .clamp(COMPOSER_EDITOR_MIN_HEIGHT, COMPOSER_EDITOR_MAX_HEIGHT);
+    content_height.clamp(COMPOSER_EDITOR_MIN_HEIGHT, maximum_height)
+}
+
 fn composer_editor_content_height(ui: &Ui, draft: &str, wrap_width: f32) -> f32 {
     let font_id = egui::TextStyle::Body.resolve(ui.style());
     let font_size = if font_id.size > 0.0 {
@@ -2357,7 +2387,7 @@ fn composer_editor_content_height(ui: &Ui, draft: &str, wrap_width: f32) -> f32 
     };
     let measured_row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
     let row_height = measured_row_height.max(font_size * 1.25);
-    let minimum_height = row_height * 3.0;
+    let minimum_height = (row_height * 3.0).max(COMPOSER_EDITOR_MIN_HEIGHT);
     if draft.is_empty() {
         return minimum_height;
     }
@@ -2644,11 +2674,19 @@ mod composer_tests {
         run_test_ui(|ui| {
             ui.set_width(640.0);
             let measured_height = composer_editor_content_height(ui, &draft, ui.available_width());
+            let viewport_height =
+                composer_editor_viewport_height(ui, &draft, ui.available_width(), 800.0);
             assert!(
-                measured_height > COMPOSER_EDITOR_HEIGHT,
+                measured_height > viewport_height,
                 "measured editor height={measured_height}"
             );
-            let output = show_composer_editor(ui, &mut draft, "何でもどうぞ", egui::Color32::GRAY);
+            let output = show_composer_editor(
+                ui,
+                &mut draft,
+                "何でもどうぞ",
+                egui::Color32::GRAY,
+                viewport_height,
+            );
             assert!(
                 output.content_size.y > output.inner_rect.height(),
                 "content={:?}, viewport={:?}, editor={:?}",
@@ -2656,7 +2694,7 @@ mod composer_tests {
                 output.inner_rect.size(),
                 output.inner.rect.size()
             );
-            assert!(output.inner.rect.height() > COMPOSER_EDITOR_HEIGHT);
+            assert!(output.inner.rect.height() > viewport_height);
         });
 
         assert_eq!(draft, original);
@@ -2668,9 +2706,44 @@ mod composer_tests {
 
         run_test_ui(|ui| {
             ui.set_width(640.0);
-            let output = show_composer_editor(ui, &mut draft, "何でもどうぞ", egui::Color32::GRAY);
+            let viewport_height =
+                composer_editor_viewport_height(ui, &draft, ui.available_width(), 800.0);
+            let output = show_composer_editor(
+                ui,
+                &mut draft,
+                "何でもどうぞ",
+                egui::Color32::GRAY,
+                viewport_height,
+            );
             assert!(output.content_size.y <= output.inner_rect.height() + 1.0);
-            assert!(output.inner_rect.height() >= COMPOSER_EDITOR_HEIGHT - 1.0);
+            assert_eq!(viewport_height, COMPOSER_EDITOR_MIN_HEIGHT);
+            assert!(output.inner_rect.height() >= COMPOSER_EDITOR_MIN_HEIGHT - 1.0);
+        });
+    }
+
+    #[test]
+    fn medium_prompt_expands_to_its_measured_height_before_scrolling() {
+        let mut draft = (1..=8)
+            .map(|line| format!("{line}. 入力欄が本文に合わせて伸びる行です。"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        run_test_ui(|ui| {
+            ui.set_width(640.0);
+            let content_height = composer_editor_content_height(ui, &draft, ui.available_width());
+            let viewport_height =
+                composer_editor_viewport_height(ui, &draft, ui.available_width(), 800.0);
+            assert!(viewport_height > COMPOSER_EDITOR_MIN_HEIGHT);
+            assert!((viewport_height - content_height).abs() < f32::EPSILON);
+
+            let output = show_composer_editor(
+                ui,
+                &mut draft,
+                "何でもどうぞ",
+                egui::Color32::GRAY,
+                viewport_height,
+            );
+            assert!(output.content_size.y <= output.inner_rect.height() + 1.0);
         });
     }
 }
