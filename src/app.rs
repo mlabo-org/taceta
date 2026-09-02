@@ -52,6 +52,7 @@ const COMPOSER_PANEL_BASE_HEIGHT: f32 = 154.0;
 const COMPOSER_ATTACHMENT_EXTRA_HEIGHT: f32 = 30.0;
 const COMPOSER_CARD_INNER_MARGIN: f32 = 12.0;
 const SIDEBAR_WIDTH: f32 = 238.0;
+const SIDEBAR_FOOTER_HEIGHT: f32 = 58.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -997,12 +998,51 @@ impl TacetaApp {
         let active_id = self.state.active_conversation_id;
         let generating = self.generation.is_some();
 
-        let sidebar_fill = theme::palette(root_ui).sidebar;
+        let sidebar_palette = theme::palette(root_ui);
+        let sidebar_fill = sidebar_palette.sidebar;
+        let sidebar_footer_frame = egui::Frame::side_top_panel(root_ui.style())
+            .fill(sidebar_fill)
+            .inner_margin(egui::Margin::symmetric(8, 8));
         Panel::left("taceta-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
             .frame(egui::Frame::side_top_panel(root_ui.style()).fill(sidebar_fill))
             .show_inside(root_ui, |ui| {
+                Panel::bottom("taceta-sidebar-footer")
+                    .exact_size(SIDEBAR_FOOTER_HEIGHT)
+                    .resizable(false)
+                    .frame(sidebar_footer_frame)
+                    .show_inside(ui, |ui| {
+                        let selected = matches!(self.screen, Screen::Settings | Screen::Models);
+                        let button_fill = if selected {
+                            ui.visuals().selection.bg_fill
+                        } else {
+                            sidebar_palette.composer
+                        };
+                        let button_text = if selected {
+                            egui::Color32::WHITE
+                        } else {
+                            sidebar_palette.contrast_text
+                        };
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 40.0],
+                                Button::new(
+                                    RichText::new(format!(
+                                        "⚙ {}",
+                                        text(language, "設定", "Settings")
+                                    ))
+                                    .color(button_text),
+                                )
+                                .fill(button_fill)
+                                .stroke(egui::Stroke::new(1.0, sidebar_palette.border)),
+                            )
+                            .clicked()
+                        {
+                            self.screen = Screen::Settings;
+                        }
+                    });
+
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     ui.heading(RichText::new("Taceta").size(19.0));
@@ -1121,20 +1161,6 @@ impl TacetaApp {
                             }
                         }
                     });
-
-                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    let selected = matches!(self.screen, Screen::Settings | Screen::Models);
-                    if ui
-                        .selectable_label(
-                            selected,
-                            format!("⚙ {}", text(language, "設定", "Settings")),
-                        )
-                        .clicked()
-                    {
-                        self.screen = Screen::Settings;
-                    }
-                    ui.add_space(8.0);
-                });
             });
     }
 
