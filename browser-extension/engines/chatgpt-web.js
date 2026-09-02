@@ -62,7 +62,14 @@ export function chatGPTWebActivityFingerprint(state) {
   ]);
 }
 
-export async function runChatGPTWeb({ page, prompt, url = "https://chatgpt.com/", timeoutMs = DEFAULT_HARD_TIMEOUT_MS, idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS, pollMs = 250, stabilityMs = 500 }) {
+export function chatGPTWebProgressChunk(previousText, nextText, sequence) {
+  if (typeof previousText !== "string" || typeof nextText !== "string" || !Number.isInteger(sequence) || sequence <= 0 || !nextText || nextText === previousText) return null;
+  const replace = !nextText.startsWith(previousText);
+  const delta = replace ? nextText : nextText.slice(previousText.length);
+  return delta ? { sequence, delta, replace } : null;
+}
+
+export async function runChatGPTWeb({ page, prompt, url = "https://chatgpt.com/", timeoutMs = DEFAULT_HARD_TIMEOUT_MS, idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS, pollMs = 250, stabilityMs = 500, onProgress = () => {} }) {
   if (!page || typeof page.evaluate !== "function") throw typedError("page_required");
   if (typeof prompt !== "string" || !prompt.trim()) throw typedError("prompt_required");
   const hardTimeout = Number.isFinite(timeoutMs) ? Math.max(1_000, Math.floor(timeoutMs)) : DEFAULT_HARD_TIMEOUT_MS;
@@ -94,6 +101,8 @@ export async function runChatGPTWeb({ page, prompt, url = "https://chatgpt.com/"
   let candidate = null;
   let completed = false;
   let stableSince = 0;
+  let sentText = "";
+  let progressSequence = 0;
   activity = chatGPTWebActivityFingerprint(state);
   idleDeadline = Date.now() + idleTimeout;
   while (Date.now() < hardDeadline && Date.now() < idleDeadline) {
@@ -104,15 +113,23 @@ export async function runChatGPTWeb({ page, prompt, url = "https://chatgpt.com/"
       idleDeadline = Date.now() + idleTimeout;
     }
     const next = [...state.assistants].reverse().find((item) => item.id && !before.has(item.id) && item.text);
-    if (next && !state.stop && state.send) {
+    if (next) {
+      const progress = chatGPTWebProgressChunk(sentText, next.text, progressSequence + 1);
+      if (progress) {
+        progressSequence = progress.sequence;
+        sentText = next.text;
+        await onProgress(progress);
+      }
+    }
+    if (next && !state.stop) {
       if (!candidate || candidate.id !== next.id || candidate.text !== next.text) { candidate = next; stableSince = Date.now(); }
       if (Date.now() - stableSince >= stabilityMs) { completed = true; break; }
     }
     await sleep(pollMs);
   }
   if (!completed) {
-    if (Date.now() >= hardDeadline) throw typedError("response_hard_timeout");
-    throw typedError("response_stalled");
+    if (Date.now() >= hardDeadline) throw typedError("response_hard_timeout", "response_hard_timeout", { partialAnswer: sentText });
+    throw typedError("response_stalled", "response_stalled", { partialAnswer: sentText });
   }
   const result = await page.evaluate((id) => {
     const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];

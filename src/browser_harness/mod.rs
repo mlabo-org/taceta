@@ -16,7 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u16 = 1;
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,7 @@ pub enum Operation {
     Ping,
     ExtensionReady,
     PollJob,
+    JobProgress,
     JobResult,
     Cancel,
     CancelAck,

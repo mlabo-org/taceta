@@ -8,7 +8,7 @@ use crate::{
         AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelCandidate,
         ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingMode,
     },
-    taceta_link_service::{self, TacetaLinkService},
+    taceta_link_service::{self, LinkProgress, LinkResult, TacetaLinkService},
     web_search::{self, ProviderKind, ToolCall, WebSearchProvider},
 };
 use futures_util::StreamExt;
@@ -394,18 +394,54 @@ async fn execute_tool(
                     auth,
                 )
                 .map_err(|e| BackendError::Protocol(e.to_string()))?;
-                // The browser workflow owns its deadline. Add only a small
-                // transport grace period, with saturating arithmetic.
                 let wait_ms = link_wait_duration(job.timeout_ms);
-                let result = tokio::time::timeout(wait_ms, service.enqueue_and_wait(job))
-                    .await
-                    .map_err(|_| {
-                        BackendError::Protocol(format!(
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+                let wait = service.enqueue_and_wait_with_progress(job, progress_tx);
+                let deadline = tokio::time::sleep(wait_ms);
+                tokio::pin!(wait);
+                tokio::pin!(deadline);
+                let mut streamed_answer = String::new();
+                let mut last_sequence = 0;
+                let outcome = loop {
+                    tokio::select! {
+                        result = &mut wait => break result,
+                        _ = &mut deadline => break Err(taceta_link_service::LinkError::Timeout),
+                        progress = progress_rx.recv() => {
+                            if let Some(progress) = progress {
+                                apply_link_progress(progress, &mut last_sequence, &mut streamed_answer, events);
+                            }
+                        }
+                    }
+                };
+                while let Ok(progress) = progress_rx.try_recv() {
+                    apply_link_progress(progress, &mut last_sequence, &mut streamed_answer, events);
+                }
+                let result = match outcome {
+                    Ok(result) => result,
+                    Err(error) if !streamed_answer.is_empty() => {
+                        let _ = events.send(GenerationEvent::SearchProgress(
+                            "ChatGPT Webの受信済み回答を使用します".into(),
+                        ));
+                        LinkResult {
+                            workflow: workflow.clone(),
+                            data: serde_json::json!({
+                                "answer": streamed_answer,
+                                "citations": [],
+                                "partial": true,
+                                "completion_error": error.to_string(),
+                            }),
+                            mutation_state: crate::browser_harness::MutationState::Performed,
+                            lifecycle: Some(crate::browser_harness::LifecycleState::Failed),
+                        }
+                    }
+                    Err(taceta_link_service::LinkError::Timeout) => {
+                        return Err(BackendError::Protocol(format!(
                             "Taceta Link {} request timed out",
                             workflow_wire_name(workflow),
-                        ))
-                    })?
-                    .map_err(|e| BackendError::Protocol(e.to_string()))?;
+                        )));
+                    }
+                    Err(error) => return Err(BackendError::Protocol(error.to_string())),
+                };
                 let urls = result
                     .data
                     .get("citations")
@@ -541,6 +577,27 @@ async fn execute_tool(
         }
         _ => Err(BackendError::Protocol("unsupported web tool".into())),
     }
+}
+
+fn apply_link_progress(
+    progress: LinkProgress,
+    last_sequence: &mut u64,
+    answer: &mut String,
+    events: &UnboundedSender<GenerationEvent>,
+) {
+    if progress.sequence <= *last_sequence {
+        return;
+    }
+    let replace = progress.replace || progress.sequence != last_sequence.saturating_add(1);
+    if replace {
+        answer.clear();
+    }
+    answer.push_str(&progress.delta);
+    *last_sequence = progress.sequence;
+    let _ = events.send(GenerationEvent::ExternalContentDelta {
+        delta: progress.delta,
+        replace,
+    });
 }
 
 fn link_wait_duration(timeout_ms: u64) -> Duration {
@@ -985,6 +1042,60 @@ mod tests {
             link_wait_duration(u64::MAX),
             Duration::from_millis(u64::MAX)
         );
+    }
+
+    #[test]
+    fn chatgpt_progress_is_assembled_in_taceta_and_rewrites_when_required() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let job_id = uuid::Uuid::new_v4();
+        let mut sequence = 0;
+        let mut answer = String::new();
+        apply_link_progress(
+            LinkProgress {
+                job_id,
+                workflow: crate::domain::WebWorkflow::ChatGptWeb,
+                sequence: 1,
+                delta: "回".into(),
+                replace: false,
+            },
+            &mut sequence,
+            &mut answer,
+            &events_tx,
+        );
+        apply_link_progress(
+            LinkProgress {
+                job_id,
+                workflow: crate::domain::WebWorkflow::ChatGptWeb,
+                sequence: 2,
+                delta: "答".into(),
+                replace: false,
+            },
+            &mut sequence,
+            &mut answer,
+            &events_tx,
+        );
+        assert_eq!(answer, "回答");
+        assert!(matches!(
+            events_rx.try_recv().unwrap(),
+            GenerationEvent::ExternalContentDelta { delta, replace: false } if delta == "回"
+        ));
+        assert!(matches!(
+            events_rx.try_recv().unwrap(),
+            GenerationEvent::ExternalContentDelta { delta, replace: false } if delta == "答"
+        ));
+        apply_link_progress(
+            LinkProgress {
+                job_id,
+                workflow: crate::domain::WebWorkflow::ChatGptWeb,
+                sequence: 3,
+                delta: "修正版".into(),
+                replace: true,
+            },
+            &mut sequence,
+            &mut answer,
+            &events_tx,
+        );
+        assert_eq!(answer, "修正版");
     }
 
     #[test]
