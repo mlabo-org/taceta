@@ -10,6 +10,7 @@ HOST_BINARY="$REPO_ROOT/target/release/taceta-link-host"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+ICON_SOURCE="$REPO_ROOT/assets/taceta-icon.png"
 
 cd -- "$REPO_ROOT"
 PACKAGE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
@@ -29,12 +30,33 @@ cargo build --release
 
 test -x "$RELEASE_BINARY"
 test -x "$HOST_BINARY"
+test -f "$ICON_SOURCE"
 rm -rf -- "$APP_DIR"
 mkdir -p -- "$MACOS_DIR" "$RESOURCES_DIR"
 install -m 0755 "$RELEASE_BINARY" "$MACOS_DIR/$APP_NAME"
 install -m 0755 "$HOST_BINARY" "$MACOS_DIR/taceta-link-host"
 mkdir -p "$RESOURCES_DIR/TacetaLink"
 cp -R browser-extension/. "$RESOURCES_DIR/TacetaLink/"
+
+ICONSET_DIR="$APP_DIR/.taceta-icon.iconset"
+mkdir -p "$ICONSET_DIR"
+render_icon() {
+  local size="$1"
+  local name="$2"
+  sips -z "$size" "$size" "$ICON_SOURCE" --out "$ICONSET_DIR/$name" >/dev/null
+}
+render_icon 16 icon_16x16.png
+render_icon 32 icon_16x16@2x.png
+render_icon 32 icon_32x32.png
+render_icon 64 icon_32x32@2x.png
+render_icon 128 icon_128x128.png
+render_icon 256 icon_128x128@2x.png
+render_icon 256 icon_256x256.png
+render_icon 512 icon_256x256@2x.png
+render_icon 512 icon_512x512.png
+render_icon 1024 icon_512x512@2x.png
+iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/Taceta.icns"
+rm -rf -- "$ICONSET_DIR"
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -47,6 +69,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 	<string>Taceta</string>
 	<key>CFBundleIdentifier</key>
 	<string>org.mlabo.taceta</string>
+	<key>CFBundleIconFile</key>
+	<string>Taceta.icns</string>
 	<key>CFBundleName</key>
 	<string>Taceta</string>
 	<key>CFBundlePackageType</key>
