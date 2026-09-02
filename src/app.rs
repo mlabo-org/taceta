@@ -51,6 +51,7 @@ const COMPOSER_EDITOR_MAX_HEIGHT_FRACTION: f32 = 0.42;
 const COMPOSER_PANEL_BASE_HEIGHT: f32 = 154.0;
 const COMPOSER_ATTACHMENT_EXTRA_HEIGHT: f32 = 30.0;
 const COMPOSER_CARD_INNER_MARGIN: f32 = 12.0;
+const SIDEBAR_WIDTH: f32 = 238.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -75,6 +76,16 @@ enum NoticeKind {
 struct Notice {
     kind: NoticeKind,
     text: String,
+}
+
+struct ConversationTitleEditor {
+    conversation_id: Uuid,
+    draft: String,
+}
+
+struct ConversationDeleteConfirmation {
+    conversation_id: Uuid,
+    title: String,
 }
 
 struct ActiveGeneration {
@@ -111,6 +122,8 @@ pub struct TacetaApp {
     model_storage_path: PathBuf,
     generation: Option<ActiveGeneration>,
     notice: Option<Notice>,
+    conversation_title_editor: Option<ConversationTitleEditor>,
+    conversation_delete_confirmation: Option<ConversationDeleteConfirmation>,
     scroll_to_bottom: bool,
     web_key_draft: String,
     model_manager_result_tx: std_mpsc::Sender<Result<Vec<ModelDescriptor>, String>>,
@@ -208,6 +221,8 @@ impl TacetaApp {
             model_storage_path: resolve_model_storage_path(),
             generation: None,
             notice: None,
+            conversation_title_editor: None,
+            conversation_delete_confirmation: None,
             scroll_to_bottom: true,
             web_key_draft: String::new(),
             model_manager_result_tx,
@@ -862,7 +877,7 @@ impl TacetaApp {
         user_message.attachments = attachments;
 
         let conversation = self.state.active_conversation_mut();
-        if conversation.messages.is_empty() {
+        if conversation.should_generate_title() {
             conversation.title = conversation_title(&draft, &attachment_fallback);
         }
         let conversation_id = conversation.id;
@@ -975,7 +990,7 @@ impl TacetaApp {
                 (
                     conversation.id,
                     conversation.title.clone(),
-                    conversation.messages.is_empty(),
+                    conversation.is_untitled(),
                 )
             })
             .collect::<Vec<_>>();
@@ -984,7 +999,7 @@ impl TacetaApp {
 
         let sidebar_fill = theme::palette(root_ui).sidebar;
         Panel::left("taceta-sidebar")
-            .exact_size(238.0)
+            .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
             .frame(egui::Frame::side_top_panel(root_ui.style()).fill(sidebar_fill))
             .show_inside(root_ui, |ui| {
@@ -1024,19 +1039,85 @@ impl TacetaApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for (id, title, empty) in history {
-                            let title = if empty {
+                            let display_title = if empty {
                                 text(language, "新しいチャット", "New chat")
                             } else {
                                 &title
                             };
-                            if ui
-                                .selectable_label(id == active_id, title)
-                                .on_hover_text(title)
-                                .clicked()
-                            {
+                            let mut select_requested = false;
+                            let mut rename_requested = false;
+                            let mut delete_requested = false;
+                            ui.horizontal(|ui| {
+                                let menu_width = 28.0;
+                                let label_width = (ui.available_width()
+                                    - menu_width
+                                    - ui.spacing().item_spacing.x)
+                                    .max(0.0);
+                                select_requested = ui
+                                    .add_sized(
+                                        [label_width, 28.0],
+                                        Button::selectable(id == active_id, display_title)
+                                            .truncate(),
+                                    )
+                                    .on_hover_text(display_title)
+                                    .clicked();
+
+                                let (menu_response, _) =
+                                    egui::containers::menu::MenuButton::from_button(
+                                        Button::new("...")
+                                            .small()
+                                            .min_size(Vec2::new(menu_width, 28.0)),
+                                    )
+                                    .ui(ui, |ui| {
+                                        if ui
+                                            .button(text(language, "表題を変更", "Rename"))
+                                            .clicked()
+                                        {
+                                            rename_requested = true;
+                                        }
+                                        let palette = theme::palette(ui);
+                                        if ui
+                                            .add_enabled(
+                                                !generating,
+                                                Button::new(
+                                                    RichText::new(text(language, "削除", "Delete"))
+                                                        .color(palette.error),
+                                                ),
+                                            )
+                                            .on_disabled_hover_text(text(
+                                                language,
+                                                "生成中は削除できません",
+                                                "Chats cannot be deleted while generating",
+                                            ))
+                                            .clicked()
+                                        {
+                                            delete_requested = true;
+                                        }
+                                    });
+                                menu_response.on_hover_text(text(
+                                    language,
+                                    "チャット操作",
+                                    "Chat actions",
+                                ));
+                            });
+
+                            if select_requested {
                                 self.state.active_conversation_id = id;
                                 self.screen = Screen::Chat;
                                 self.scroll_to_bottom = true;
+                            }
+                            if rename_requested {
+                                self.conversation_title_editor = Some(ConversationTitleEditor {
+                                    conversation_id: id,
+                                    draft: display_title.to_owned(),
+                                });
+                            }
+                            if delete_requested {
+                                self.conversation_delete_confirmation =
+                                    Some(ConversationDeleteConfirmation {
+                                        conversation_id: id,
+                                        title: display_title.to_owned(),
+                                    });
                             }
                         }
                     });
@@ -1055,6 +1136,128 @@ impl TacetaApp {
                     ui.add_space(8.0);
                 });
             });
+    }
+
+    fn show_conversation_history_dialogs(&mut self, ctx: &Context) {
+        self.show_conversation_title_editor(ctx);
+        self.show_conversation_delete_confirmation(ctx);
+    }
+
+    fn show_conversation_title_editor(&mut self, ctx: &Context) {
+        let Some(mut editor) = self.conversation_title_editor.take() else {
+            return;
+        };
+        let language = self.language();
+        let mut save_requested = false;
+        let mut cancel_requested = ctx.input(|input| input.key_pressed(Key::Escape));
+
+        egui::Window::new(text(language, "表題を変更", "Rename chat"))
+            .id(egui::Id::new("conversation-title-editor"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                let response = ui.add_sized(
+                    [ui.available_width(), 30.0],
+                    TextEdit::singleline(&mut editor.draft),
+                );
+                response.request_focus();
+                let title_is_valid = !editor.draft.trim().is_empty();
+                if !title_is_valid {
+                    ui.label(
+                        RichText::new(text(language, "表題を入力してください", "Enter a title"))
+                            .small()
+                            .color(theme::palette(ui).warning),
+                    );
+                }
+                let submit_with_enter =
+                    response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                ui.horizontal(|ui| {
+                    if ui.button(text(language, "キャンセル", "Cancel")).clicked() {
+                        cancel_requested = true;
+                    }
+                    if ui
+                        .add_enabled(title_is_valid, Button::new(text(language, "保存", "Save")))
+                        .clicked()
+                        || (title_is_valid && submit_with_enter)
+                    {
+                        save_requested = true;
+                    }
+                });
+            });
+
+        if save_requested {
+            self.state
+                .rename_conversation(editor.conversation_id, &editor.draft);
+        } else if !cancel_requested {
+            self.conversation_title_editor = Some(editor);
+        }
+    }
+
+    fn show_conversation_delete_confirmation(&mut self, ctx: &Context) {
+        let Some(confirmation) = self.conversation_delete_confirmation.take() else {
+            return;
+        };
+        let language = self.language();
+        let mut delete_requested = false;
+        let mut cancel_requested = ctx.input(|input| input.key_pressed(Key::Escape));
+
+        egui::Window::new(text(language, "チャットを削除", "Delete chat"))
+            .id(egui::Id::new("conversation-delete-confirmation"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(format!(
+                    "{}\n\n{}",
+                    confirmation.title,
+                    text(
+                        language,
+                        "このチャットと履歴を削除します。この操作は元に戻せません。",
+                        "This chat and its history will be deleted. This cannot be undone.",
+                    )
+                ));
+                if self.generation.is_some() {
+                    ui.label(
+                        RichText::new(text(
+                            language,
+                            "生成が終了してから削除してください",
+                            "Wait for generation to finish before deleting",
+                        ))
+                        .small()
+                        .color(theme::palette(ui).warning),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(text(language, "キャンセル", "Cancel")).clicked() {
+                        cancel_requested = true;
+                    }
+                    let palette = theme::palette(ui);
+                    if ui
+                        .add_enabled(
+                            self.generation.is_none(),
+                            Button::new(
+                                RichText::new(text(language, "削除", "Delete"))
+                                    .color(palette.error),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        delete_requested = true;
+                    }
+                });
+            });
+
+        if delete_requested {
+            if self.state.delete_conversation(confirmation.conversation_id) {
+                self.screen = Screen::Chat;
+                self.scroll_to_bottom = true;
+            }
+        } else if !cancel_requested {
+            self.conversation_delete_confirmation = Some(confirmation);
+        }
     }
 
     fn show_top_bar(&mut self, root_ui: &mut Ui) {
@@ -1739,6 +1942,8 @@ impl TacetaApp {
         });
         if let Some(model) = self.delete_confirmation.clone() {
             egui::Window::new(text(language, "モデルを削除しますか？", "Delete model?"))
+                .id(egui::Id::new("model-delete-confirmation"))
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .collapsible(false)
                 .resizable(false)
                 .show(root_ui.ctx(), |ui| {
@@ -2452,6 +2657,7 @@ impl eframe::App for TacetaApp {
             Screen::Settings => self.show_settings(ui),
             Screen::Models => self.show_model_manager(ui),
         }
+        self.show_conversation_history_dialogs(ui.ctx());
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
