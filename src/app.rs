@@ -3280,6 +3280,22 @@ fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
         )
         .to_owned();
     }
+    if lower.contains("chatgpt_web") && lower.contains("progress stalled") {
+        return text(
+            language,
+            "ChatGPT Webの進行が3分間更新されなかったため停止しました。ブラウザーの状態を確認して再試行してください。",
+            "ChatGPT Web stopped because progress did not change for three minutes. Check the browser and try again.",
+        )
+        .to_owned();
+    }
+    if lower.contains("chatgpt_web") && lower.contains("safety time limit") {
+        return text(
+            language,
+            "ChatGPT Webが20分の安全上限に達したため停止しました。ブラウザー上の結果を確認してください。",
+            "ChatGPT Web reached the 20-minute safety limit. Check the result in the browser.",
+        )
+        .to_owned();
+    }
     if lower.contains("timed out") {
         let browser_label = if lower.contains("google_search") {
             text(language, "Google検索", "Google Search")
@@ -3785,6 +3801,25 @@ mod web_search_request_tests {
         assert!(
             web_search_error_message("Taceta Link chatgpt_web request timed out", language)
                 .contains("ChatGPT Web")
+        );
+    }
+
+    #[test]
+    fn chatgpt_web_adaptive_timeout_messages_explain_the_actual_exit() {
+        let language = AppShellLanguage::Japanese;
+        assert!(
+            web_search_error_message(
+                "Taceta Link chatgpt_web response progress stalled",
+                language,
+            )
+            .contains("3分間")
+        );
+        assert!(
+            web_search_error_message(
+                "Taceta Link chatgpt_web exceeded the safety time limit",
+                language,
+            )
+            .contains("20分")
         );
     }
 }

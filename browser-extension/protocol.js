@@ -20,6 +20,7 @@ export function validateEnvelope(message, expectedType) {
 }
 export function validateJob(job, request) {
   if (!job || typeof job.job_id !== "string" || !WORKFLOWS.has(job.workflow) || !Number.isInteger(job.limit) || !Number.isInteger(job.timeout_ms)) throw new Error("invalid job");
+  if (job.idle_timeout_ms != null && (!Number.isInteger(job.idle_timeout_ms) || job.idle_timeout_ms <= 0 || job.idle_timeout_ms > job.timeout_ms)) throw new Error("invalid idle timeout");
   const search = ["default_search", "google_search"].includes(job.workflow);
   const validInput = search
     ? typeof job.query === "string" && Boolean(job.query.trim()) && !job.url && !job.prompt
