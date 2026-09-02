@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::PathBuf,
     process::Command,
@@ -90,6 +91,10 @@ struct ConversationDeleteConfirmation {
     title: String,
 }
 
+struct ConversationBulkDeleteConfirmation {
+    conversation_ids: Vec<Uuid>,
+}
+
 struct ActiveGeneration {
     conversation_id: Uuid,
     assistant_id: Uuid,
@@ -126,6 +131,9 @@ pub struct TacetaApp {
     notice: Option<Notice>,
     conversation_title_editor: Option<ConversationTitleEditor>,
     conversation_delete_confirmation: Option<ConversationDeleteConfirmation>,
+    conversation_bulk_delete_mode: bool,
+    conversation_bulk_selection: HashSet<Uuid>,
+    conversation_bulk_delete_confirmation: Option<ConversationBulkDeleteConfirmation>,
     scroll_to_bottom: bool,
     web_key_draft: String,
     model_manager_result_tx: std_mpsc::Sender<Result<Vec<ModelDescriptor>, String>>,
@@ -232,6 +240,9 @@ impl TacetaApp {
             notice: None,
             conversation_title_editor: None,
             conversation_delete_confirmation: None,
+            conversation_bulk_delete_mode: false,
+            conversation_bulk_selection: HashSet::new(),
+            conversation_bulk_delete_confirmation: None,
             scroll_to_bottom: true,
             web_key_draft: String::new(),
             model_manager_result_tx,
@@ -1068,6 +1079,11 @@ impl TacetaApp {
             .collect::<Vec<_>>();
         let active_id = self.state.active_conversation_id;
         let generating = self.generation.is_some();
+        self.conversation_bulk_selection.retain(|id| {
+            history
+                .iter()
+                .any(|(conversation_id, _, _)| conversation_id == id)
+        });
 
         let sidebar_palette = theme::palette(root_ui);
         let sidebar_fill = sidebar_palette.sidebar;
@@ -1125,7 +1141,7 @@ impl TacetaApp {
 
                 if ui
                     .add_enabled(
-                        !generating,
+                        !generating && !self.conversation_bulk_delete_mode,
                         Button::new(format!(
                             "＋ {}",
                             text(language, "新しいチャット", "New chat")
@@ -1139,11 +1155,90 @@ impl TacetaApp {
                 }
 
                 ui.add_space(14.0);
-                ui.label(
-                    RichText::new(text(language, "会話", "Chats"))
-                        .small()
-                        .weak(),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(text(language, "会話", "Chats"))
+                            .small()
+                            .weak(),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self.conversation_bulk_delete_mode {
+                            if ui
+                                .small_button(text(language, "キャンセル", "Cancel"))
+                                .clicked()
+                            {
+                                self.conversation_bulk_delete_mode = false;
+                                self.conversation_bulk_selection.clear();
+                            }
+                        } else if ui
+                            .add_enabled(
+                                !generating,
+                                Button::new(text(language, "一括削除", "Bulk delete")).small(),
+                            )
+                            .on_disabled_hover_text(text(
+                                language,
+                                "生成中は削除できません",
+                                "Chats cannot be deleted while generating",
+                            ))
+                            .clicked()
+                        {
+                            self.conversation_bulk_delete_mode = true;
+                            self.conversation_bulk_selection.clear();
+                            self.conversation_title_editor = None;
+                            self.conversation_delete_confirmation = None;
+                        }
+                    });
+                });
+                if self.conversation_bulk_delete_mode {
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        let selected_count = self.conversation_bulk_selection.len();
+                        ui.label(
+                            RichText::new(match language {
+                                AppShellLanguage::Japanese => format!("{selected_count}件選択"),
+                                AppShellLanguage::English => {
+                                    format!("{selected_count} selected")
+                                }
+                            })
+                            .small(),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let palette = theme::palette(ui);
+                            if ui
+                                .add_enabled(
+                                    selected_count > 0 && !generating,
+                                    Button::new(
+                                        RichText::new(text(language, "削除", "Delete"))
+                                            .color(palette.error),
+                                    )
+                                    .small(),
+                                )
+                                .on_disabled_hover_text(if generating {
+                                    text(
+                                        language,
+                                        "生成が終了してから削除してください",
+                                        "Wait for generation to finish before deleting",
+                                    )
+                                } else {
+                                    text(
+                                        language,
+                                        "削除するチャットを選択してください",
+                                        "Select chats to delete",
+                                    )
+                                })
+                                .clicked()
+                            {
+                                let conversation_ids = history
+                                    .iter()
+                                    .map(|(id, _, _)| *id)
+                                    .filter(|id| self.conversation_bulk_selection.contains(id))
+                                    .collect::<Vec<_>>();
+                                self.conversation_bulk_delete_confirmation =
+                                    Some(ConversationBulkDeleteConfirmation { conversation_ids });
+                            }
+                        });
+                    });
+                }
                 ui.add_space(5.0);
                 ScrollArea::vertical()
                     .id_salt("conversation-history")
@@ -1158,6 +1253,31 @@ impl TacetaApp {
                             let mut select_requested = false;
                             let mut rename_requested = false;
                             let mut delete_requested = false;
+                            if self.conversation_bulk_delete_mode {
+                                ui.horizontal(|ui| {
+                                    let mut checked =
+                                        self.conversation_bulk_selection.contains(&id);
+                                    let checkbox_changed = ui.checkbox(&mut checked, "").changed();
+                                    let row_clicked = ui
+                                        .add_sized(
+                                            [ui.available_width(), 28.0],
+                                            Button::selectable(checked, display_title).truncate(),
+                                        )
+                                        .on_hover_text(display_title)
+                                        .clicked();
+                                    if row_clicked {
+                                        checked = !checked;
+                                    }
+                                    if checkbox_changed || row_clicked {
+                                        if checked {
+                                            self.conversation_bulk_selection.insert(id);
+                                        } else {
+                                            self.conversation_bulk_selection.remove(&id);
+                                        }
+                                    }
+                                });
+                                continue;
+                            }
                             ui.horizontal(|ui| {
                                 let menu_width = 28.0;
                                 let label_width = (ui.available_width()
@@ -1238,6 +1358,7 @@ impl TacetaApp {
     fn show_conversation_history_dialogs(&mut self, ctx: &Context) {
         self.show_conversation_title_editor(ctx);
         self.show_conversation_delete_confirmation(ctx);
+        self.show_conversation_bulk_delete_confirmation(ctx);
     }
 
     fn show_conversation_title_editor(&mut self, ctx: &Context) {
@@ -1354,6 +1475,81 @@ impl TacetaApp {
             }
         } else if !cancel_requested {
             self.conversation_delete_confirmation = Some(confirmation);
+        }
+    }
+
+    fn show_conversation_bulk_delete_confirmation(&mut self, ctx: &Context) {
+        let Some(confirmation) = self.conversation_bulk_delete_confirmation.take() else {
+            return;
+        };
+        let language = self.language();
+        let selected_count = confirmation.conversation_ids.len();
+        let mut delete_requested = false;
+        let mut cancel_requested = ctx.input(|input| input.key_pressed(Key::Escape));
+
+        egui::Window::new(text(
+            language,
+            "選択したチャットを削除",
+            "Delete selected chats",
+        ))
+        .id(egui::Id::new("conversation-bulk-delete-confirmation"))
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(match language {
+                AppShellLanguage::Japanese => format!(
+                    "選択した{selected_count}件のチャットと履歴を削除します。この操作は元に戻せません。"
+                ),
+                AppShellLanguage::English => format!(
+                    "The selected {selected_count} chats and their histories will be deleted. This cannot be undone."
+                ),
+            });
+            if self.generation.is_some() {
+                ui.label(
+                    RichText::new(text(
+                        language,
+                        "生成が終了してから削除してください",
+                        "Wait for generation to finish before deleting",
+                    ))
+                    .small()
+                    .color(theme::palette(ui).warning),
+                );
+            }
+            ui.horizontal(|ui| {
+                if ui.button(text(language, "キャンセル", "Cancel")).clicked() {
+                    cancel_requested = true;
+                }
+                let palette = theme::palette(ui);
+                if ui
+                    .add_enabled(
+                        self.generation.is_none() && selected_count > 0,
+                        Button::new(
+                            RichText::new(text(language, "削除", "Delete"))
+                                .color(palette.error),
+                        ),
+                    )
+                    .clicked()
+                {
+                    delete_requested = true;
+                }
+            });
+        });
+
+        if delete_requested {
+            if self
+                .state
+                .delete_conversations(&confirmation.conversation_ids)
+                > 0
+            {
+                self.conversation_bulk_delete_mode = false;
+                self.conversation_bulk_selection.clear();
+                self.screen = Screen::Chat;
+                self.scroll_to_bottom = true;
+            }
+        } else if !cancel_requested {
+            self.conversation_bulk_delete_confirmation = Some(confirmation);
         }
     }
 

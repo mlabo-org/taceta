@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use taceta::domain::{Attachment, ChatMessage, ThinkingMode};
@@ -150,30 +150,58 @@ impl PersistedAppState {
     }
 
     pub fn delete_conversation(&mut self, id: Uuid) -> bool {
-        let Some(index) = self
-            .conversations
-            .iter()
-            .position(|conversation| conversation.id == id)
-        else {
-            return false;
+        self.delete_conversations(&[id]) == 1
+    }
+
+    pub fn delete_conversations(&mut self, ids: &[Uuid]) -> usize {
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        if selected.is_empty() {
+            return 0;
+        }
+
+        let deleted_active_conversation = selected.contains(&self.active_conversation_id);
+        let replacement_id = if deleted_active_conversation {
+            let active_index = self
+                .conversations
+                .iter()
+                .position(|conversation| conversation.id == self.active_conversation_id)
+                .unwrap_or(0);
+            self.conversations
+                .iter()
+                .skip(active_index + 1)
+                .find(|conversation| !selected.contains(&conversation.id))
+                .or_else(|| {
+                    self.conversations[..active_index]
+                        .iter()
+                        .rev()
+                        .find(|conversation| !selected.contains(&conversation.id))
+                })
+                .map(|conversation| conversation.id)
+        } else {
+            None
         };
-        let deleted_active_conversation = id == self.active_conversation_id;
-        self.conversations.remove(index);
+
+        let previous_count = self.conversations.len();
+        self.conversations
+            .retain(|conversation| !selected.contains(&conversation.id));
+        let deleted_count = previous_count - self.conversations.len();
+        if deleted_count == 0 {
+            return 0;
+        }
 
         if self.conversations.is_empty() {
             let conversation = Conversation::default();
             self.active_conversation_id = conversation.id;
             self.conversations.push(conversation);
         } else if deleted_active_conversation {
-            let replacement_index = index.min(self.conversations.len() - 1);
-            self.active_conversation_id = self.conversations[replacement_index].id;
+            self.active_conversation_id = replacement_id.unwrap_or(self.conversations[0].id);
         }
 
         if deleted_active_conversation {
             self.draft.clear();
             self.pending_attachments.clear();
         }
-        true
+        deleted_count
     }
 }
 
@@ -269,6 +297,54 @@ mod tests {
         assert!(state.delete_conversation(deleted_id));
         assert_eq!(state.conversations.len(), 1);
         assert_ne!(state.active_conversation_id, deleted_id);
+        assert!(state.active_conversation().is_untitled());
+    }
+
+    #[test]
+    fn deleting_multiple_non_active_conversations_preserves_the_active_chat() {
+        let mut state = PersistedAppState::default();
+        let first_id = state.active_conversation_id;
+        state.start_new_conversation();
+        let second_id = state.active_conversation_id;
+        state.start_new_conversation();
+        let active_id = state.active_conversation_id;
+        state.draft = "keep this draft".to_owned();
+
+        assert_eq!(state.delete_conversations(&[first_id, second_id]), 2);
+        assert_eq!(state.conversations.len(), 1);
+        assert_eq!(state.active_conversation_id, active_id);
+        assert_eq!(state.draft, "keep this draft");
+    }
+
+    #[test]
+    fn deleting_multiple_conversations_including_active_selects_the_next_survivor() {
+        let mut state = PersistedAppState::default();
+        let oldest_id = state.active_conversation_id;
+        state.start_new_conversation();
+        let active_id = state.active_conversation_id;
+        state.start_new_conversation();
+        let newest_id = state.active_conversation_id;
+        state.active_conversation_id = active_id;
+        state.draft = "discard this draft".to_owned();
+
+        assert_eq!(state.delete_conversations(&[newest_id, active_id]), 2);
+        assert_eq!(state.active_conversation_id, oldest_id);
+        assert!(state.draft.is_empty());
+    }
+
+    #[test]
+    fn deleting_all_conversations_in_bulk_creates_one_fresh_chat() {
+        let mut state = PersistedAppState::default();
+        state.start_new_conversation();
+        let deleted_ids = state
+            .conversations
+            .iter()
+            .map(|conversation| conversation.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(state.delete_conversations(&deleted_ids), 2);
+        assert_eq!(state.conversations.len(), 1);
+        assert!(!deleted_ids.contains(&state.active_conversation_id));
         assert!(state.active_conversation().is_untitled());
     }
 
