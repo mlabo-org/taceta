@@ -2075,6 +2075,7 @@ impl TacetaApp {
 
     fn show_model_manager(&mut self, root_ui: &mut Ui) {
         let language = self.language();
+        let candidate_list_height = model_candidate_list_height(root_ui.available_height());
         CentralPanel::default().show_inside(root_ui, |ui| {
             ScrollArea::vertical().show(ui, |ui| {
                 let width = ui.available_width().min(820.0);
@@ -2161,58 +2162,78 @@ impl TacetaApp {
                                         );
                                     });
                                 });
+                                if self.model_candidates.len() > 12 {
+                                    ui.label(
+                                        RichText::new(text(
+                                            language,
+                                            "一覧内を上下にスクロールして、すべての候補を確認できます。",
+                                            "Scroll within the list to review all available options.",
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
                                 ui.add_space(6.0);
                                 let candidates = self.model_candidates.clone();
-                                ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                                    for candidate in candidates {
-                                        ui.horizontal(|ui| {
-                                            let selected = self.selected_model_candidate.as_deref()
-                                                == Some(candidate.model.as_str());
-                                            if ui
-                                                .selectable_label(selected, &candidate.model)
-                                                .clicked()
-                                            {
-                                                self.selected_model_candidate =
-                                                    Some(candidate.model.clone());
-                                            }
-                                            if candidate.recommended {
-                                                ui.label(
-                                                    RichText::new(text(
-                                                        language,
-                                                        "推奨",
-                                                        "Recommended",
-                                                    ))
-                                                    .color(palette.accent)
-                                                    .small(),
-                                                );
-                                            }
-                                            ui.with_layout(
-                                                Layout::right_to_left(Align::Center),
-                                                |ui| {
+                                ScrollArea::vertical()
+                                    .id_salt("model-download-candidates")
+                                    .min_scrolled_height(candidate_list_height)
+                                    .max_height(candidate_list_height)
+                                    .scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
+                                    .show(ui, |ui| {
+                                        for candidate in candidates {
+                                            ui.horizontal(|ui| {
+                                                let selected = self
+                                                    .selected_model_candidate
+                                                    .as_deref()
+                                                    == Some(candidate.model.as_str());
+                                                if ui
+                                                    .selectable_label(selected, &candidate.model)
+                                                    .clicked()
+                                                {
+                                                    self.selected_model_candidate =
+                                                        Some(candidate.model.clone());
+                                                }
+                                                if candidate.recommended {
                                                     ui.label(
-                                                        RichText::new(
-                                                            candidate
-                                                                .estimated_size
-                                                                .as_deref()
-                                                                .map(|size| {
-                                                                    format_catalog_size(
-                                                                        language, size,
-                                                                    )
-                                                                })
-                                                                .unwrap_or_else(|| {
-                                                                    text(
-                                                                        language, "不明", "Unknown",
-                                                                    )
-                                                                    .to_owned()
-                                                                }),
-                                                        )
-                                                        .weak(),
+                                                        RichText::new(text(
+                                                            language,
+                                                            "推奨",
+                                                            "Recommended",
+                                                        ))
+                                                        .color(palette.accent)
+                                                        .small(),
                                                     );
-                                                },
-                                            );
-                                        });
-                                    }
-                                });
+                                                }
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        ui.label(
+                                                            RichText::new(
+                                                                candidate
+                                                                    .estimated_size
+                                                                    .as_deref()
+                                                                    .map(|size| {
+                                                                        format_catalog_size(
+                                                                            language, size,
+                                                                        )
+                                                                    })
+                                                                    .unwrap_or_else(|| {
+                                                                        text(
+                                                                            language,
+                                                                            "不明",
+                                                                            "Unknown",
+                                                                        )
+                                                                        .to_owned()
+                                                                    }),
+                                                            )
+                                                            .weak(),
+                                                        );
+                                                    },
+                                                );
+                                            });
+                                        }
+                                    });
                                 ui.add_space(10.0);
                                 let selected = self.selected_model_candidate.clone();
                                 if ui
@@ -3350,6 +3371,14 @@ fn default_model_candidate(query: &str, candidates: &[ModelCandidate]) -> Option
         .map(|candidate| candidate.model.clone())
 }
 
+fn model_candidate_list_height(available_height: f32) -> f32 {
+    if available_height.is_finite() {
+        (available_height * 0.42).clamp(240.0, 420.0)
+    } else {
+        320.0
+    }
+}
+
 #[cfg(test)]
 mod composer_tests {
     use super::*;
@@ -3464,6 +3493,13 @@ mod model_manager_tests {
         pulls: Arc<AtomicUsize>,
         deletes: Arc<AtomicUsize>,
         listed: Vec<ModelDescriptor>,
+    }
+
+    #[test]
+    fn candidate_list_grows_with_the_window_up_to_a_readable_maximum() {
+        assert_eq!(model_candidate_list_height(400.0), 240.0);
+        assert_eq!(model_candidate_list_height(800.0), 336.0);
+        assert_eq!(model_candidate_list_height(1_400.0), 420.0);
     }
 
     #[test]
