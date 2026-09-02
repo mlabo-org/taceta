@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct TagsResponse {
@@ -34,6 +35,8 @@ pub(super) struct ShowResponse {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub details: Details,
+    #[serde(default)]
+    pub model_info: HashMap<String, serde_json::Value>,
 }
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct Details {

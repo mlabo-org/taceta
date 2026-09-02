@@ -1777,6 +1777,9 @@ impl TacetaApp {
 
     fn show_settings(&mut self, root_ui: &mut Ui) {
         let language = self.language();
+        let selected_model_context = self
+            .selected_model()
+            .and_then(|model| model.context_length);
         CentralPanel::default().show_inside(root_ui, |ui| {
             ScrollArea::vertical().show(ui, |ui| {
                 let width = ui.available_width().min(680.0);
@@ -1979,6 +1982,46 @@ impl TacetaApp {
                                 ))
                                 .weak(),
                             );
+                            ui.add_space(8.0);
+                            let configured_context = self.state.context_length;
+                            let reported_limit = selected_model_context;
+                            ui.horizontal(|ui| {
+                                ui.label(text(
+                                    language,
+                                    "選択中モデルの上限（参考）",
+                                    "Selected model limit (reference)",
+                                ));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.monospace(
+                                        reported_limit
+                                            .map(format_context_length)
+                                            .unwrap_or_else(|| {
+                                                text(language, "不明", "Unknown").to_owned()
+                                            }),
+                                    );
+                                });
+                            });
+                            let exceeds_reported_limit = reported_limit
+                                .is_some_and(|limit| configured_context > limit);
+                            let adjustment_note = text(
+                                language,
+                                if exceeds_reported_limit {
+                                    "設定値がモデル上限を超えています。Ollama側でモデルが利用可能な範囲へ調整されます。"
+                                } else {
+                                    "上限を超える設定は、Ollama側でモデルが利用可能な範囲へ調整されます。"
+                                },
+                                if exceeds_reported_limit {
+                                    "The configured value exceeds this model's limit. Ollama adjusts it to the range the model can use."
+                                } else {
+                                    "Values above the limit are adjusted by Ollama to the range the model can use."
+                                },
+                            );
+                            let note = RichText::new(adjustment_note).small();
+                            ui.label(if exceeds_reported_limit {
+                                note.color(palette.warning)
+                            } else {
+                                note.weak()
+                            });
                             ui.add_space(10.0);
                             let mut context_index = CONTEXT_LENGTH_OPTIONS
                                 .iter()
@@ -3565,6 +3608,7 @@ mod model_manager_tests {
             thinking: ThinkingCapability::None,
             vision: false,
             tools: false,
+            context_length: None,
         }
     }
 

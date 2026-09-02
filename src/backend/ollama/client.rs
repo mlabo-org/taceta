@@ -69,6 +69,7 @@ impl OllamaClient {
                 thinking,
                 vision: capability::has_vision(&show.capabilities),
                 tools: capability::has_tools(&show.capabilities),
+                context_length: model_context_length(&show.model_info),
             });
         }
         Ok(result)
@@ -571,6 +572,17 @@ fn think_value(mode: ThinkingMode) -> Option<serde_json::Value> {
     }
 }
 
+fn model_context_length(
+    model_info: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<u32> {
+    model_info
+        .iter()
+        .filter(|(key, _)| key.ends_with(".context_length"))
+        .filter_map(|(_, value)| value.as_u64())
+        .filter_map(|value| u32::try_from(value).ok())
+        .max()
+}
+
 pub struct OllamaModelManager {
     http: reqwest::Client,
     base_url: String,
@@ -620,6 +632,7 @@ impl OllamaModelManager {
                 thinking: capability::classify(&name, &show.details.family),
                 vision: capability::has_vision(&show.capabilities),
                 tools: capability::has_tools(&show.capabilities),
+                context_length: model_context_length(&show.model_info),
             });
         }
         Ok(result)
@@ -945,6 +958,21 @@ mod tests {
         let json = serde_json::to_value(body).unwrap();
         assert!(!json.as_object().unwrap().contains_key("think"));
         assert_eq!(json["options"]["num_ctx"], serde_json::json!(4096));
+    }
+
+    #[test]
+    fn model_context_length_uses_model_capacity_not_rope_original_length() {
+        let model_info = std::collections::HashMap::from([
+            (
+                "gptoss.context_length".to_owned(),
+                serde_json::json!(131_072),
+            ),
+            (
+                "gptoss.rope.scaling.original_context_length".to_owned(),
+                serde_json::json!(4_096),
+            ),
+        ]);
+        assert_eq!(model_context_length(&model_info), Some(131_072));
     }
 
     #[test]
