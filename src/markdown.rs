@@ -1,5 +1,9 @@
-use eframe::egui::{Grid, Label, RichText, TextStyle, Ui};
+use eframe::egui::{Grid, Label, RichText, ScrollArea, TextStyle, Ui};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
+
+const MIN_TABLE_COLUMN_WIDTH: f32 = 120.0;
+const TABLE_COLUMN_SPACING: f32 = 12.0;
+const TABLE_ROW_SPACING: f32 = 8.0;
 
 /// Draws model-authored Markdown without changing the conversation text that is stored on disk.
 ///
@@ -415,31 +419,78 @@ fn render_table(ui: &mut Ui, children: &[Node], list_depth: usize, next_table_id
     let id = ui.id().with(("markdown-table", *next_table_id));
     *next_table_id += 1;
 
+    let column_count = children
+        .iter()
+        .filter_map(|row| match row {
+            Node::TableHead { cells } | Node::TableRow { cells } => Some(cells.len()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+
+    if column_count == 0 {
+        return;
+    }
+
     ui.group(|ui| {
-        Grid::new(id).striped(true).show(ui, |ui| {
-            for row in children {
-                let (header, cells) = match row {
-                    Node::TableHead { cells } => (true, cells.as_slice()),
-                    Node::TableRow { cells } => (false, cells.as_slice()),
-                    _ => continue,
-                };
-                for cell in cells {
-                    match cell {
-                        Node::TableCell { content } => render_inlines(
-                            ui,
-                            content,
-                            InlinePresentation {
-                                force_strong: header,
-                                ..Default::default()
-                            },
-                        ),
-                        other => render_block(ui, other, list_depth, next_table_id),
-                    }
-                }
-                ui.end_row();
-            }
-        });
+        ui.take_available_width();
+        let layout = responsive_table_layout(ui.available_width(), column_count);
+
+        ScrollArea::horizontal()
+            .id_salt(id.with("horizontal-scroll"))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.set_width(layout.table_width);
+                Grid::new(id)
+                    .num_columns(column_count)
+                    .min_col_width(layout.column_width)
+                    .max_col_width(layout.column_width)
+                    .spacing([TABLE_COLUMN_SPACING, TABLE_ROW_SPACING])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for row in children {
+                            let (header, cells) = match row {
+                                Node::TableHead { cells } => (true, cells.as_slice()),
+                                Node::TableRow { cells } => (false, cells.as_slice()),
+                                _ => continue,
+                            };
+                            for cell in cells {
+                                match cell {
+                                    Node::TableCell { content } => render_inlines(
+                                        ui,
+                                        content,
+                                        InlinePresentation {
+                                            force_strong: header,
+                                            ..Default::default()
+                                        },
+                                    ),
+                                    other => render_block(ui, other, list_depth, next_table_id),
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
     });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResponsiveTableLayout {
+    column_width: f32,
+    table_width: f32,
+}
+
+fn responsive_table_layout(available_width: f32, column_count: usize) -> ResponsiveTableLayout {
+    let column_count = column_count.max(1);
+    let spacing_width = TABLE_COLUMN_SPACING * column_count.saturating_sub(1) as f32;
+    let responsive_column_width = ((available_width.max(0.0) - spacing_width).max(0.0)
+        / column_count as f32)
+        .max(MIN_TABLE_COLUMN_WIDTH);
+
+    ResponsiveTableLayout {
+        column_width: responsive_column_width,
+        table_width: responsive_column_width * column_count as f32 + spacing_width,
+    }
 }
 
 fn render_inlines(ui: &mut Ui, content: &[Inline], presentation: InlinePresentation) {
@@ -537,5 +588,20 @@ mod tests {
         assert!(matches!(children.get(1), Some(Node::TableRow { .. })));
 
         eframe::egui::__run_test_ui(|ui| show(ui, markdown));
+    }
+
+    #[test]
+    fn table_columns_follow_available_width_and_keep_a_readable_minimum() {
+        let wide = responsive_table_layout(900.0, 3);
+        assert_eq!(wide.table_width, 900.0);
+        assert!(wide.column_width > 290.0);
+
+        let wider = responsive_table_layout(1_200.0, 3);
+        assert!(wider.column_width > wide.column_width);
+        assert_eq!(wider.table_width, 1_200.0);
+
+        let narrow = responsive_table_layout(240.0, 3);
+        assert_eq!(narrow.column_width, MIN_TABLE_COLUMN_WIDTH);
+        assert!(narrow.table_width > 240.0);
     }
 }
