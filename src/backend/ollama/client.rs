@@ -630,8 +630,14 @@ impl OllamaModelManager {
         let model_url = format!("https://ollama.com/library/{base}");
         let tags_url = format!("{model_url}/tags");
         let (model_response, tags_response) = tokio::join!(
-            self.http.get(model_url).send(),
-            self.http.get(tags_url).send()
+            self.http
+                .get(model_url)
+                .header(reqwest::header::CACHE_CONTROL, "no-cache")
+                .send(),
+            self.http
+                .get(tags_url)
+                .header(reqwest::header::CACHE_CONTROL, "no-cache")
+                .send()
         );
         let model_response = model_response?;
         let tags_response = tags_response?;
@@ -646,6 +652,7 @@ impl OllamaModelManager {
         let tags_html = tags_response.error_for_status()?.text().await?;
         let preferred = parse_library_recommendation(&model_html, &base);
         let candidates = parse_library_candidates(&tags_html, &base, preferred.as_deref());
+        validate_library_candidate_count(&tags_html, candidates.len(), &base)?;
         if candidates.is_empty() {
             return Err(BackendError::Protocol(format!(
                 "no downloadable tags found in Ollama Library for {base}"
@@ -771,8 +778,6 @@ fn parse_library_candidates(
     preferred: Option<&str>,
 ) -> Vec<ModelCandidate> {
     const INPUT_MARKER: &str = "<input class=\"command hidden\" value=\"";
-    const SIZE_PREFIX: &str = ">";
-    const SIZE_SUFFIX: &str = "</p>";
     let prefix = format!("{base}:");
     let mut candidates = Vec::new();
     for section in html.split(INPUT_MARKER).skip(1) {
@@ -787,30 +792,85 @@ fn parse_library_candidates(
         {
             continue;
         }
-        let estimated_size = section[end..]
-            .find("<p class=\"col-span-2 text-neutral-500 text-[13px]\"")
-            .and_then(|start| {
-                section[end + start..]
-                    .find(SIZE_PREFIX)
-                    .map(|offset| end + start + offset + 1)
-            })
-            .and_then(|start| {
-                section[start..]
-                    .find(SIZE_SUFFIX)
-                    .map(|offset| &section[start..start + offset])
-            })
-            .map(str::trim)
-            .filter(|size| !size.is_empty())
-            .map(ToOwned::to_owned);
-        candidates.push(ModelCandidate {
-            model: model.to_owned(),
-            estimated_size,
-            recommended: preferred.is_some_and(|preferred| preferred == model)
-                || (preferred.is_none() && model == format!("{base}:latest")),
-        });
+        add_library_candidate(
+            &mut candidates,
+            model,
+            parse_library_size(&section[end..]),
+            base,
+            preferred,
+        );
+    }
+
+    // The command input is a desktop-only copy affordance and is not the
+    // authoritative tag inventory. Collect the actual tag links as well so a
+    // partial/responsive rendering cannot silently reduce the available list.
+    let link_marker = format!("href=\"/library/{base}:");
+    for section in html.split(&link_marker).skip(1) {
+        let Some(end) = section.find('"') else {
+            continue;
+        };
+        let model = format!("{base}:{}", &section[..end]);
+        add_library_candidate(&mut candidates, &model, None, base, preferred);
     }
     candidates.sort_by_key(|candidate| !candidate.recommended);
     candidates
+}
+
+fn add_library_candidate(
+    candidates: &mut Vec<ModelCandidate>,
+    model: &str,
+    estimated_size: Option<String>,
+    base: &str,
+    preferred: Option<&str>,
+) {
+    let prefix = format!("{base}:");
+    if !model.starts_with(&prefix) {
+        return;
+    }
+    if let Some(candidate) = candidates.iter_mut().find(|entry| entry.model == model) {
+        if candidate.estimated_size.is_none() {
+            candidate.estimated_size = estimated_size;
+        }
+        return;
+    }
+    candidates.push(ModelCandidate {
+        model: model.to_owned(),
+        estimated_size,
+        recommended: preferred.is_some_and(|preferred| preferred == model)
+            || (preferred.is_none() && model == format!("{base}:latest")),
+    });
+}
+
+fn parse_library_size(section: &str) -> Option<String> {
+    const SIZE_MARKER: &str = "<p class=\"col-span-2 text-neutral-500 text-[13px]\"";
+    let marker = section.find(SIZE_MARKER)?;
+    let start = section[marker..].find('>')? + marker + 1;
+    let end = section[start..].find("</p>")? + start;
+    let size = section[start..end].trim();
+    (!size.is_empty()).then(|| size.to_owned())
+}
+
+fn parse_library_declared_count(html: &str) -> Option<usize> {
+    html.match_indices(" models</p>").find_map(|(end, _)| {
+        let before = &html[..end];
+        let start = before.rfind('>')? + 1;
+        before[start..].trim().parse().ok()
+    })
+}
+
+fn validate_library_candidate_count(
+    html: &str,
+    parsed_count: usize,
+    base: &str,
+) -> Result<(), BackendError> {
+    if let Some(declared_count) = parse_library_declared_count(html) {
+        if parsed_count < declared_count {
+            return Err(BackendError::Protocol(format!(
+                "incomplete Ollama Library tag list for {base}: expected {declared_count}, parsed {parsed_count}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_pull_line(line: &[u8], model: &str) -> Result<Option<ModelManagerEvent>, BackendError> {
@@ -1001,5 +1061,33 @@ mod tests {
         assert_eq!(preferred.as_deref(), Some("qwen3.8:latest"));
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].recommended);
+    }
+
+    #[test]
+    fn library_catalog_recovers_tags_from_links_when_command_inputs_are_partial() {
+        let tags_html = r#"
+            <p class="block col-span-6 md:hidden">3 models</p>
+            <a href="/library/gemma4:latest">gemma4:latest</a>
+            <input class="command hidden" value="gemma4:latest" />
+            <p class="col-span-2 text-neutral-500 text-[13px]">9.6GB</p>
+            <a href="/library/gemma4:cloud">gemma4:cloud</a>
+            <input class="command hidden" value="gemma4:cloud" />
+            <p class="col-span-2 text-neutral-500 text-[13px]">Low Usage</p>
+            <a href="/library/gemma4:26b-mlx">gemma4:26b-mlx</a>
+        "#;
+        let candidates = parse_library_candidates(tags_html, "gemma4", Some("gemma4:latest"));
+        assert_eq!(candidates.len(), 3);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.model == "gemma4:26b-mlx")
+        );
+        assert!(validate_library_candidate_count(tags_html, candidates.len(), "gemma4").is_ok());
+    }
+
+    #[test]
+    fn library_catalog_rejects_a_silently_truncated_candidate_list() {
+        let tags_html = r#"<p class="block col-span-6 md:hidden">50 models</p>"#;
+        assert!(validate_library_candidate_count(tags_html, 2, "gemma4").is_err());
     }
 }

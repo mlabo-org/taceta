@@ -2140,11 +2140,16 @@ impl TacetaApp {
                             if !self.model_candidates.is_empty() {
                                 ui.add_space(14.0);
                                 ui.horizontal(|ui| {
-                                    ui.strong(text(
-                                        language,
-                                        "ダウンロード候補",
-                                        "Download options",
-                                    ));
+                                    ui.strong(match language {
+                                        AppShellLanguage::Japanese => format!(
+                                            "ダウンロード候補（{}件）",
+                                            self.model_candidates.len()
+                                        ),
+                                        AppShellLanguage::English => format!(
+                                            "Download options ({})",
+                                            self.model_candidates.len()
+                                        ),
+                                    });
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         ui.label(
                                             RichText::new(text(
@@ -3248,6 +3253,14 @@ fn web_search_request_config(enabled: bool, provider: ProviderKind) -> Option<St
 
 fn safe_model_manager_error(language: AppShellLanguage, error: &str) -> String {
     let lower = error.to_ascii_lowercase();
+    if lower.contains("incomplete ollama library tag list") {
+        return text(
+            language,
+            "Ollama Libraryの候補一覧を全件取得できませんでした。不完全な一覧は表示していません。再試行してください。",
+            "Could not retrieve the complete Ollama Library option list. The incomplete list was not shown; try again.",
+        )
+        .to_owned();
+    }
     if lower.contains("unsupported catalog characters") {
         return text(
             language,
