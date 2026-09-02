@@ -10,6 +10,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use eframe::egui::{
     self, Align, Button, CentralPanel, Context, Key, Layout, Panel, RichText, ScrollArea, Spinner,
     TextEdit, Ui, Vec2,
+    containers::scroll_area::{ScrollAreaOutput, ScrollBarVisibility},
+    style::ScrollStyle,
 };
 use taceta::{
     backend::{InferenceBackend, ModelManager, OllamaClient, OllamaModelManager},
@@ -43,6 +45,7 @@ use taceta::{
 
 const APP_SHELL_STORAGE_KEY: &str = "taceta.app-shell-preferences.v1";
 const LOCAL_ENGINE_URL: &str = "http://127.0.0.1:11434";
+const COMPOSER_EDITOR_HEIGHT: f32 = 58.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -1949,23 +1952,13 @@ impl TacetaApp {
                                 self.state.pending_attachments.remove(index);
                             }
 
-                            let editor = ui
-                                .scope(|ui| {
-                                    ui.visuals_mut().weak_text_color =
-                                        Some(palette.placeholder_text);
-                                    ui.add_sized(
-                                        [ui.available_width(), 58.0],
-                                        TextEdit::multiline(&mut self.state.draft)
-                                            .hint_text(text(
-                                                language,
-                                                "何でもどうぞ",
-                                                "Message Taceta",
-                                            ))
-                                            .desired_rows(3)
-                                            .frame(egui::Frame::NONE),
-                                    )
-                                })
-                                .inner;
+                            let editor = show_composer_editor(
+                                ui,
+                                &mut self.state.draft,
+                                text(language, "何でもどうぞ", "Message Taceta"),
+                                palette.placeholder_text,
+                            )
+                            .inner;
                             let keyboard_send = editor.has_focus()
                                 && ui.input(|input| {
                                     input.key_pressed(Key::Enter)
@@ -2319,6 +2312,90 @@ impl TacetaApp {
     }
 }
 
+fn show_composer_editor(
+    ui: &mut Ui,
+    draft: &mut String,
+    hint_text: &str,
+    placeholder_text: egui::Color32,
+) -> ScrollAreaOutput<egui::Response> {
+    ui.visuals_mut().weak_text_color = Some(placeholder_text);
+    ui.style_mut().spacing.scroll = ScrollStyle::solid();
+
+    ScrollArea::vertical()
+        .id_salt("taceta-composer-draft-scroll")
+        .max_height(COMPOSER_EDITOR_HEIGHT)
+        .min_scrolled_height(COMPOSER_EDITOR_HEIGHT)
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
+        .show(ui, |ui| {
+            let editor_width = ui.available_width();
+            let editor_height = composer_editor_content_height(ui, draft, editor_width);
+            ui.allocate_ui_with_layout(
+                Vec2::new(editor_width, editor_height),
+                Layout::top_down(Align::LEFT),
+                |ui| {
+                    ui.add(
+                        TextEdit::multiline(draft)
+                            .hint_text(hint_text)
+                            .desired_rows(3)
+                            .desired_width(editor_width)
+                            .min_size(Vec2::new(editor_width, editor_height))
+                            .frame(egui::Frame::NONE),
+                    )
+                },
+            )
+            .inner
+        })
+}
+
+fn composer_editor_content_height(ui: &Ui, draft: &str, wrap_width: f32) -> f32 {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let font_size = if font_id.size > 0.0 {
+        font_id.size
+    } else {
+        14.0
+    };
+    let measured_row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
+    let row_height = measured_row_height.max(font_size * 1.25);
+    let minimum_height = row_height * 3.0;
+    if draft.is_empty() {
+        return minimum_height;
+    }
+
+    let measured_height = ui.fonts_mut(|fonts| {
+        fonts
+            .layout(
+                draft.to_owned(),
+                font_id,
+                ui.visuals().text_color(),
+                wrap_width,
+            )
+            .size()
+            .y
+    });
+    let estimated_rows = draft
+        .split('\n')
+        .map(|line| {
+            let estimated_width = line.chars().fold(0.0, |width, character| {
+                width
+                    + if character.is_ascii() {
+                        font_size * 0.6
+                    } else {
+                        font_size
+                    }
+            });
+            (estimated_width / wrap_width.max(font_size))
+                .ceil()
+                .max(1.0) as usize
+        })
+        .sum::<usize>()
+        .max(3);
+
+    measured_height
+        .max(estimated_rows as f32 * row_height)
+        .max(minimum_height)
+}
+
 impl eframe::App for TacetaApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.drain_background_work();
@@ -2537,6 +2614,65 @@ fn safe_model_manager_error(language: AppShellLanguage, _error: &str) -> String 
         "The model management operation failed. Check the connection and model ID, then try again.",
     )
     .to_owned()
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+
+    fn run_test_ui(mut add_contents: impl FnMut(&mut Ui)) {
+        let context = egui::Context::default();
+        context.set_fonts(egui::FontDefinitions::default());
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(800.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = context.run_ui(input, |ui| add_contents(ui));
+    }
+
+    #[test]
+    fn long_prompt_creates_a_vertical_scroll_range_without_truncating_text() {
+        let original = (1..=80)
+            .map(|line| format!("{line}. Markdownの長文入力を編集する行です。"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut draft = original.clone();
+
+        run_test_ui(|ui| {
+            ui.set_width(640.0);
+            let measured_height = composer_editor_content_height(ui, &draft, ui.available_width());
+            assert!(
+                measured_height > COMPOSER_EDITOR_HEIGHT,
+                "measured editor height={measured_height}"
+            );
+            let output = show_composer_editor(ui, &mut draft, "何でもどうぞ", egui::Color32::GRAY);
+            assert!(
+                output.content_size.y > output.inner_rect.height(),
+                "content={:?}, viewport={:?}, editor={:?}",
+                output.content_size,
+                output.inner_rect.size(),
+                output.inner.rect.size()
+            );
+            assert!(output.inner.rect.height() > COMPOSER_EDITOR_HEIGHT);
+        });
+
+        assert_eq!(draft, original);
+    }
+
+    #[test]
+    fn short_prompt_keeps_the_compact_three_row_editor() {
+        let mut draft = "短い入力".to_owned();
+
+        run_test_ui(|ui| {
+            ui.set_width(640.0);
+            let output = show_composer_editor(ui, &mut draft, "何でもどうぞ", egui::Color32::GRAY);
+            assert!(output.content_size.y <= output.inner_rect.height() + 1.0);
+            assert!(output.inner_rect.height() >= COMPOSER_EDITOR_HEIGHT - 1.0);
+        });
+    }
 }
 
 #[cfg(test)]
