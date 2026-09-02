@@ -85,6 +85,9 @@ pub struct ModelDescriptor {
     pub vision: bool,
     #[serde(default)]
     pub tools: bool,
+    /// Context capacity reported by the backend for this exact model.
+    #[serde(default)]
+    pub context_length: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
