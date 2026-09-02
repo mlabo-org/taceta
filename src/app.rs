@@ -16,8 +16,9 @@ use eframe::egui::{
 use taceta::{
     backend::{InferenceBackend, ModelManager, OllamaClient, OllamaModelManager},
     domain::{
-        Attachment, AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelDescriptor,
-        ModelManagerEvent, ModelPullRequest, Role, ThinkingCapability, ThinkingLevel, ThinkingMode,
+        Attachment, AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelCandidate,
+        ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingCapability,
+        ThinkingLevel, ThinkingMode,
     },
 };
 use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
@@ -130,6 +131,12 @@ pub struct TacetaApp {
     model_manager_result_tx: std_mpsc::Sender<Result<Vec<ModelDescriptor>, String>>,
     model_manager_result_rx: std_mpsc::Receiver<Result<Vec<ModelDescriptor>, String>>,
     model_manager_pending: bool,
+    model_catalog_result_tx: std_mpsc::Sender<(String, Result<Vec<ModelCandidate>, String>)>,
+    model_catalog_result_rx: std_mpsc::Receiver<(String, Result<Vec<ModelCandidate>, String>)>,
+    model_catalog_pending: bool,
+    model_catalog_query: Option<String>,
+    model_candidates: Vec<ModelCandidate>,
+    selected_model_candidate: Option<String>,
     model_pull: Option<ActiveModelPull>,
     model_id_draft: String,
     delete_confirmation: Option<String>,
@@ -168,6 +175,7 @@ impl TacetaApp {
             .expect("Taceta could not start its local async runtime");
         let (model_result_tx, model_result_rx) = std_mpsc::channel();
         let (model_manager_result_tx, model_manager_result_rx) = std_mpsc::channel();
+        let (model_catalog_result_tx, model_catalog_result_rx) = std_mpsc::channel();
         let (delete_result_tx, delete_result_rx) = std_mpsc::channel();
         let link_service = Arc::new(TacetaLinkService::default());
         #[cfg(unix)]
@@ -229,6 +237,12 @@ impl TacetaApp {
             model_manager_result_tx,
             model_manager_result_rx,
             model_manager_pending: false,
+            model_catalog_result_tx,
+            model_catalog_result_rx,
+            model_catalog_pending: false,
+            model_catalog_query: None,
+            model_candidates: Vec::new(),
+            selected_model_candidate: None,
             model_pull: None,
             model_id_draft: String::new(),
             delete_confirmation: None,
@@ -315,11 +329,43 @@ impl TacetaApp {
         });
     }
 
-    fn start_model_pull(&mut self) {
+    fn search_model_candidates(&mut self) {
+        if self.model_catalog_pending || self.model_pull.is_some() {
+            return;
+        }
+        let query = self.model_id_draft.trim().to_owned();
+        if query.is_empty() {
+            self.notice = Some(Notice {
+                kind: NoticeKind::Warning,
+                text: text(
+                    self.language(),
+                    "モデル名を入力してください。",
+                    "Enter a model name.",
+                )
+                .to_owned(),
+            });
+            return;
+        }
+        self.model_catalog_pending = true;
+        self.model_catalog_query = Some(query.clone());
+        self.model_candidates.clear();
+        self.selected_model_candidate = None;
+        self.notice = None;
+        let manager = Arc::clone(&self.model_manager);
+        let result_tx = self.model_catalog_result_tx.clone();
+        self.runtime.spawn(async move {
+            let result = manager
+                .list_available(query.clone())
+                .await
+                .map_err(|error| error.to_string());
+            let _ = result_tx.send((query, result));
+        });
+    }
+
+    fn start_model_pull(&mut self, model: String) {
         if self.model_pull.is_some() {
             return;
         }
-        let model = self.model_id_draft.trim().to_owned();
         let language = self.language();
         if model.is_empty() {
             self.notice = Some(Notice {
@@ -442,6 +488,28 @@ impl TacetaApp {
             }
         }
 
+        if let Ok((query, result)) = self.model_catalog_result_rx.try_recv() {
+            if self.model_catalog_query.as_deref() == Some(query.as_str()) {
+                self.model_catalog_pending = false;
+                match result {
+                    Ok(candidates) => {
+                        self.selected_model_candidate =
+                            default_model_candidate(&query, &candidates);
+                        self.model_candidates = candidates;
+                        self.notice = None;
+                    }
+                    Err(error) => {
+                        self.model_candidates.clear();
+                        self.selected_model_candidate = None;
+                        self.notice = Some(Notice {
+                            kind: NoticeKind::Error,
+                            text: safe_model_manager_error(self.language(), &error),
+                        });
+                    }
+                }
+            }
+        }
+
         let mut pull_finished = None;
         let language = self.language();
         if let Some(active) = self.model_pull.as_mut() {
@@ -472,6 +540,9 @@ impl TacetaApp {
             match result {
                 Ok(model) => {
                     self.model_id_draft.clear();
+                    self.model_catalog_query = None;
+                    self.model_candidates.clear();
+                    self.selected_model_candidate = None;
                     self.notice = Some(Notice {
                         kind: NoticeKind::Info,
                         text: format!(
@@ -1827,30 +1898,140 @@ impl TacetaApp {
                             .weak(),
                         );
                         ui.add_space(18.0);
+                        self.show_notice(ui);
                         let palette = theme::palette(ui);
                         theme::card(palette.composer, palette.border, 14, 14).show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [ui.available_width() - 90.0, 34.0],
-                                    TextEdit::singleline(&mut self.model_id_draft).hint_text(text(
-                                        language,
-                                        "モデルID（例: qwen3:8b）",
-                                        "Model ID (e.g. qwen3:8b)",
-                                    )),
+                                let busy = self.model_catalog_pending || self.model_pull.is_some();
+                                let response = ui.add_enabled(
+                                    !busy,
+                                    TextEdit::singleline(&mut self.model_id_draft)
+                                        .desired_width((ui.available_width() - 116.0).max(160.0))
+                                        .hint_text(text(
+                                            language,
+                                            "モデル名（例: qwen3.8）",
+                                            "Model name (e.g. qwen3.8)",
+                                        )),
                                 );
-                                let pulling = self.model_pull.is_some();
+                                if response.changed() {
+                                    self.model_catalog_query = None;
+                                    self.model_candidates.clear();
+                                    self.selected_model_candidate = None;
+                                }
                                 if ui
                                     .add_enabled(
-                                        !pulling && !self.model_id_draft.trim().is_empty(),
-                                        Button::new(text(language, "取得", "Download"))
+                                        !busy && !self.model_id_draft.trim().is_empty(),
+                                        Button::new(text(language, "候補を確認", "Find options"))
                                             .fill(palette.accent)
-                                            .min_size(Vec2::new(78.0, 34.0)),
+                                            .min_size(Vec2::new(104.0, 34.0)),
                                     )
                                     .clicked()
                                 {
-                                    self.start_model_pull();
+                                    self.search_model_candidates();
                                 }
                             });
+                            if self.model_catalog_pending {
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(text(
+                                        language,
+                                        "利用可能な候補とサイズを確認しています…",
+                                        "Checking available options and sizes…",
+                                    ));
+                                });
+                            }
+                            if !self.model_candidates.is_empty() {
+                                ui.add_space(14.0);
+                                ui.horizontal(|ui| {
+                                    ui.strong(text(
+                                        language,
+                                        "ダウンロード候補",
+                                        "Download options",
+                                    ));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(
+                                            RichText::new(text(
+                                                language,
+                                                "予測サイズ",
+                                                "Estimated size",
+                                            ))
+                                            .weak(),
+                                        );
+                                    });
+                                });
+                                ui.add_space(6.0);
+                                let candidates = self.model_candidates.clone();
+                                ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                                    for candidate in candidates {
+                                        ui.horizontal(|ui| {
+                                            let selected = self.selected_model_candidate.as_deref()
+                                                == Some(candidate.model.as_str());
+                                            if ui
+                                                .selectable_label(selected, &candidate.model)
+                                                .clicked()
+                                            {
+                                                self.selected_model_candidate =
+                                                    Some(candidate.model.clone());
+                                            }
+                                            if candidate.recommended {
+                                                ui.label(
+                                                    RichText::new(text(
+                                                        language,
+                                                        "推奨",
+                                                        "Recommended",
+                                                    ))
+                                                    .color(palette.accent)
+                                                    .small(),
+                                                );
+                                            }
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(
+                                                            candidate
+                                                                .estimated_size
+                                                                .as_deref()
+                                                                .map(|size| {
+                                                                    format_catalog_size(
+                                                                        language, size,
+                                                                    )
+                                                                })
+                                                                .unwrap_or_else(|| {
+                                                                    text(
+                                                                        language, "不明", "Unknown",
+                                                                    )
+                                                                    .to_owned()
+                                                                }),
+                                                        )
+                                                        .weak(),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    }
+                                });
+                                ui.add_space(10.0);
+                                let selected = self.selected_model_candidate.clone();
+                                if ui
+                                    .add_enabled(
+                                        self.model_pull.is_none() && selected.is_some(),
+                                        Button::new(text(
+                                            language,
+                                            "選択したモデルを取得",
+                                            "Download selected model",
+                                        ))
+                                        .fill(palette.accent)
+                                        .min_size(Vec2::new(180.0, 34.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(model) = selected {
+                                        self.start_model_pull(model);
+                                    }
+                                }
+                            }
                             if let Some(active) = self.model_pull.as_ref() {
                                 let status = active.status.clone();
                                 let completed = active.completed;
@@ -2869,13 +3050,95 @@ fn web_search_request_config(enabled: bool, provider: ProviderKind) -> Option<St
     enabled.then(|| provider.wire_value().to_owned())
 }
 
-fn safe_model_manager_error(language: AppShellLanguage, _error: &str) -> String {
+fn safe_model_manager_error(language: AppShellLanguage, error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("unsupported catalog characters") {
+        return text(
+            language,
+            "モデル名の形式が正しくありません。Ollama Libraryのモデル名を入力してください。",
+            "The model name format is invalid. Enter a model name from Ollama Library.",
+        )
+        .to_owned();
+    }
+    if lower.contains("model not found in ollama library")
+        || lower.contains("no downloadable tags found")
+    {
+        return text(
+            language,
+            "Ollama Libraryにそのモデルのダウンロード候補がありません。モデル名を確認してください。",
+            "Ollama Library has no download options for that model. Check the model name.",
+        )
+        .to_owned();
+    }
+    if lower.contains("manifest")
+        || lower.contains("file does not exist")
+        || lower.contains("not found")
+    {
+        return text(
+            language,
+            "指定したモデルまたはタグが存在しません。候補を確認して、実在するタグを選択してください。",
+            "The selected model or tag does not exist. Check the options and select an available tag.",
+        )
+        .to_owned();
+    }
+    if lower.contains("no space") || lower.contains("disk") && lower.contains("space") {
+        return text(
+            language,
+            "モデルを保存するディスク空き容量が不足しています。空き容量を確保して再試行してください。",
+            "There is not enough free disk space to store the model. Free space and try again.",
+        )
+        .to_owned();
+    }
+    if lower.contains("connection refused")
+        || lower.contains("unavailable")
+        || lower.contains("failed to connect")
+        || lower.contains("dns")
+    {
+        return text(
+            language,
+            "OllamaまたはOllama Libraryへ接続できません。接続状態を確認して再試行してください。",
+            "Could not connect to Ollama or Ollama Library. Check the connection and try again.",
+        )
+        .to_owned();
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return text(
+            language,
+            "モデル情報またはダウンロードの応答がタイムアウトしました。再試行してください。",
+            "The model lookup or download timed out. Try again.",
+        )
+        .to_owned();
+    }
     text(
         language,
-        "モデル管理の操作に失敗しました。接続とモデルIDを確認して再試行してください。",
-        "The model management operation failed. Check the connection and model ID, then try again.",
+        "モデル管理の操作に失敗しましたが、Ollamaから詳しい原因を取得できませんでした。再試行してください。",
+        "The model management operation failed, but Ollama did not provide a detailed cause. Try again.",
     )
     .to_owned()
+}
+
+fn format_catalog_size(language: AppShellLanguage, size: &str) -> String {
+    let spaced = size
+        .strip_suffix("GB")
+        .map(|value| format!("{} GB", value.trim()))
+        .or_else(|| {
+            size.strip_suffix("MB")
+                .map(|value| format!("{} MB", value.trim()))
+        })
+        .unwrap_or_else(|| size.to_owned());
+    match language {
+        AppShellLanguage::Japanese => format!("約 {spaced}"),
+        AppShellLanguage::English => format!("Approx. {spaced}"),
+    }
+}
+
+fn default_model_candidate(query: &str, candidates: &[ModelCandidate]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.model == query)
+        .or_else(|| candidates.iter().find(|candidate| candidate.recommended))
+        .or_else(|| candidates.first())
+        .map(|candidate| candidate.model.clone())
 }
 
 #[cfg(test)]
@@ -3117,6 +3380,52 @@ mod model_manager_tests {
         assert!(!message.contains("secret"));
         assert!(!message.contains("internal"));
         assert!(message.contains("モデル管理"));
+    }
+
+    #[test]
+    fn model_manager_missing_manifest_explains_that_the_tag_does_not_exist() {
+        let message = safe_model_manager_error(
+            AppShellLanguage::Japanese,
+            "pull model manifest: file does not exist",
+        );
+        assert!(message.contains("タグが存在しません"));
+        assert!(message.contains("候補"));
+    }
+
+    #[test]
+    fn catalog_size_is_clearly_marked_as_an_estimate() {
+        assert_eq!(
+            format_catalog_size(AppShellLanguage::Japanese, "105GB"),
+            "約 105 GB"
+        );
+        assert_eq!(
+            format_catalog_size(AppShellLanguage::English, "18GB"),
+            "Approx. 18 GB"
+        );
+    }
+
+    #[test]
+    fn explicit_tag_is_selected_before_the_general_recommendation() {
+        let candidates = vec![
+            ModelCandidate {
+                model: "qwen3.8:latest".into(),
+                estimated_size: Some("18GB".into()),
+                recommended: true,
+            },
+            ModelCandidate {
+                model: "qwen3.8:27b-mlx".into(),
+                estimated_size: Some("18GB".into()),
+                recommended: false,
+            },
+        ];
+        assert_eq!(
+            default_model_candidate("qwen3.8:27b-mlx", &candidates).as_deref(),
+            Some("qwen3.8:27b-mlx")
+        );
+        assert_eq!(
+            default_model_candidate("qwen3.8", &candidates).as_deref(),
+            Some("qwen3.8:latest")
+        );
     }
 
     #[test]
