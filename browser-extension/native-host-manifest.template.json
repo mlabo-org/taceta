@@ -1,0 +1,7 @@
+{
+  "name": "org.mlabo.taceta.link",
+  "description": "Taceta Link Native Messaging host",
+  "path": "ABSOLUTE_PATH_TO_TACETA_LINK_HOST",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://hefhkgbiiajifedgjlbiklclooifkidg/"]
+}

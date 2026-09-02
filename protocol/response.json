@@ -1,0 +1,5 @@
+{
+  "schema_version": 1, "product_version": "0.1.0", "protocol_version": 1,
+  "message_type": "response", "request_id": "00000000-0000-4000-8000-000000000001",
+  "session_id": "00000000-0000-4000-8000-000000000002", "operation": "poll_job", "payload": {"job": null}
+}

@@ -121,6 +121,23 @@ pub struct ChatRequest {
     pub max_search_results: u8,
     #[serde(default)]
     pub fetch_search_pages: bool,
+    /// The one-shot authorization granted by the Web: ON control for this request.
+    #[serde(default)]
+    pub web_authorization: Option<WebAuthorization>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebAuthorization {
+    pub request_id: Uuid,
+    pub session_id: Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WebWorkflow {
+    DefaultSearch,
+    GoogleSearch,
+    PageFetch,
+    ChatGptWeb,
 }
 
 fn default_max_search_results() -> u8 {

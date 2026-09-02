@@ -8,15 +8,21 @@ use crate::{
         AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelDescriptor,
         ModelManagerEvent, ModelPullRequest, Role, ThinkingMode,
     },
+    taceta_link_service::{self, TacetaLinkService},
     web_search::{self, ProviderKind, ToolCall, WebSearchProvider},
 };
 use futures_util::StreamExt;
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
+
+const MAX_TOOL_CALLS_PER_ROUND: usize = 5;
 
 pub struct OllamaClient {
     http: reqwest::Client,
     base_url: String,
+    link_service: Option<Arc<TacetaLinkService>>,
 }
 
 impl OllamaClient {
@@ -24,7 +30,12 @@ impl OllamaClient {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            link_service: None,
         }
+    }
+    pub fn with_link_service(mut self, service: Arc<TacetaLinkService>) -> Self {
+        self.link_service = Some(service);
+        self
     }
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
@@ -99,13 +110,36 @@ impl InferenceBackend for OllamaClient {
                 .as_deref()
                 .map(parse_provider)
                 .transpose()?;
-            let provider = tools
-                .as_ref()
-                .map(|_| WebSearchProvider::from_kind(provider_kind.unwrap_or_default()))
-                .transpose()
-                .map_err(|e| BackendError::Protocol(e.to_string()))?;
+            let link_workflow = provider_kind.and_then(link_workflow);
+            let provider = if link_workflow.is_some() {
+                None
+            } else {
+                tools
+                    .as_ref()
+                    .map(|_| WebSearchProvider::from_kind(provider_kind.unwrap_or_default()))
+                    .transpose()
+                    .map_err(|e| BackendError::Protocol(e.to_string()))?
+            };
+            if link_workflow.is_some() && client.link_service.is_none() {
+                return Err(BackendError::Protocol("Taceta Link is unavailable".into()));
+            }
             let mut messages: Vec<WireMessage> =
                 request.messages.iter().map(wire_message).collect();
+            if request.fetch_search_pages
+                && matches!(
+                    &link_workflow,
+                    Some(crate::domain::WebWorkflow::DefaultSearch)
+                        | Some(crate::domain::WebWorkflow::GoogleSearch)
+                )
+            {
+                messages.push(WireMessage {
+                    role: "system".into(),
+                    content: "Web検索では、まずweb_searchで候補URLを取得し、その中から信頼できる関連URLを1〜5件選んでweb_fetchで本文を確認してから回答してください。検索結果の見出しやスニペットだけで事実を断定しないでください。".into(),
+                    images: Vec::new(),
+                    tool_calls: None,
+                    tool_name: None,
+                });
+            }
             let mut seen = HashSet::new();
             let mut fetch_count = 0usize;
             for round in 0..4 {
@@ -131,12 +165,12 @@ impl InferenceBackend for OllamaClient {
                     let _ = events.send(GenerationEvent::Completed(streamed.stats));
                     return Ok(());
                 }
-                let Some(provider) = provider.as_ref() else {
+                if provider.is_none() && link_workflow.is_none() {
                     return Err(BackendError::Protocol(
                         "model returned tool calls while web search is disabled".into(),
                     ));
-                };
-                let round_budget_exhausted = streamed.tool_calls.len() > 2;
+                }
+                let round_budget_exhausted = streamed.tool_calls.len() > MAX_TOOL_CALLS_PER_ROUND;
                 messages.push(WireMessage {
                     role: "assistant".into(),
                     content: String::new(),
@@ -147,7 +181,7 @@ impl InferenceBackend for OllamaClient {
                 for (index, raw) in streamed.tool_calls.into_iter().enumerate() {
                     let call = web_search::parse_tool_call(&raw)
                         .map_err(|e| BackendError::Protocol(e.to_string()))?;
-                    let (content, urls) = if index >= 2 {
+                    let (content, urls) = if index >= MAX_TOOL_CALLS_PER_ROUND {
                         let _ = events.send(GenerationEvent::SearchProgress(
                             "このラウンドの検索上限に達しました".into(),
                         ));
@@ -157,7 +191,11 @@ impl InferenceBackend for OllamaClient {
                         )
                     } else {
                         execute_tool(
-                            provider,
+                            provider.as_ref(),
+                            client.link_service.as_ref(),
+                            link_workflow.clone(),
+                            request.web_authorization.clone(),
+                            request.messages.iter().rev().find(|m| m.role == Role::User),
                             &call,
                             &events,
                             &mut fetch_count,
@@ -225,6 +263,7 @@ impl OllamaClient {
         Self {
             http: self.http.clone(),
             base_url: self.base_url.clone(),
+            link_service: self.link_service.clone(),
         }
     }
 }
@@ -295,14 +334,30 @@ fn parse_provider(value: &str) -> Result<ProviderKind, BackendError> {
     match value {
         "Brave" | "brave" => Ok(ProviderKind::Brave),
         "Ollama" | "ollama" => Ok(ProviderKind::Ollama),
+        "Default Browser Search" | "default_search" => Ok(ProviderKind::DefaultSearch),
+        "Google Search" | "google_search" => Ok(ProviderKind::GoogleSearch),
+        "ChatGPT Web" | "chatgpt_web" => Ok(ProviderKind::ChatGptWeb),
         _ => Err(BackendError::Protocol(
             "unsupported web search provider".into(),
         )),
     }
 }
 
+fn link_workflow(provider: ProviderKind) -> Option<crate::domain::WebWorkflow> {
+    match provider {
+        ProviderKind::DefaultSearch => Some(crate::domain::WebWorkflow::DefaultSearch),
+        ProviderKind::GoogleSearch => Some(crate::domain::WebWorkflow::GoogleSearch),
+        ProviderKind::ChatGptWeb => Some(crate::domain::WebWorkflow::ChatGptWeb),
+        _ => None,
+    }
+}
+
 async fn execute_tool(
-    provider: &WebSearchProvider,
+    provider: Option<&WebSearchProvider>,
+    link_service: Option<&Arc<TacetaLinkService>>,
+    link_workflow: Option<crate::domain::WebWorkflow>,
+    authorization: Option<crate::domain::WebAuthorization>,
+    current_input: Option<&ChatMessage>,
     call: &ToolCall,
     events: &UnboundedSender<GenerationEvent>,
     fetch_count: &mut usize,
@@ -322,6 +377,48 @@ async fn execute_tool(
                 .unwrap_or(max_results.max(1) as u64)
                 .clamp(1, max_results.clamp(1, 5) as u64) as usize;
             let _ = events.send(GenerationEvent::SearchProgress(format!("検索中: {query}")));
+            if let Some(workflow) = link_workflow {
+                let service = link_service
+                    .ok_or_else(|| BackendError::Protocol("Taceta Link is unavailable".into()))?;
+                let auth = authorization.ok_or_else(|| {
+                    BackendError::Protocol("Taceta Link authorization is missing".into())
+                })?;
+                let input = current_input.ok_or_else(|| {
+                    BackendError::Protocol("current user input is missing".into())
+                })?;
+                let job = taceta_link_service::job_for_workflow(
+                    workflow.clone(),
+                    Some(query),
+                    input,
+                    auth,
+                )
+                .map_err(|e| BackendError::Protocol(e.to_string()))?;
+                // The browser workflow owns its deadline. Add only a small
+                // transport grace period, with saturating arithmetic.
+                let wait_ms = link_wait_duration(job.timeout_ms);
+                let result = tokio::time::timeout(wait_ms, service.enqueue_and_wait(job))
+                    .await
+                    .map_err(|_| {
+                        BackendError::Protocol(format!(
+                            "Taceta Link {} request timed out",
+                            workflow_wire_name(workflow),
+                        ))
+                    })?
+                    .map_err(|e| BackendError::Protocol(e.to_string()))?;
+                let urls = result
+                    .data
+                    .get("citations")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok((result.untrusted_context(), urls));
+            }
+            let provider = provider
+                .ok_or_else(|| BackendError::Protocol("web provider is unavailable".into()))?;
             let results = provider
                 .search(query, limit)
                 .await
@@ -348,12 +445,78 @@ async fn execute_tool(
                 ));
                 return Ok((budget_payload("本文取得の上限に達しました"), Vec::new()));
             }
-            *fetch_count += 1;
-            let url = call.arguments["url"]
+            let requested_url = call.arguments["url"]
                 .as_str()
                 .ok_or_else(|| BackendError::Protocol("web_fetch requires a URL".into()))?;
+            let url = web_search::validate_public_url(requested_url)
+                .map_err(|error| BackendError::Protocol(error.to_string()))?;
+            if url.scheme() != "https" {
+                return Err(BackendError::Protocol(
+                    "web_fetch requires a public HTTPS URL".into(),
+                ));
+            }
+            *fetch_count += 1;
+            let url = url.to_string();
             let _ = events.send(GenerationEvent::SearchProgress(format!("取得中: {url}")));
-            match provider.fetch(url).await {
+            if let Some(workflow) = link_workflow {
+                if !matches!(
+                    workflow,
+                    crate::domain::WebWorkflow::DefaultSearch
+                        | crate::domain::WebWorkflow::GoogleSearch
+                ) {
+                    return Err(BackendError::Protocol(
+                        "the selected browser workflow cannot read external pages".into(),
+                    ));
+                }
+                let service = link_service
+                    .ok_or_else(|| BackendError::Protocol("Taceta Link is unavailable".into()))?;
+                let auth = authorization.ok_or_else(|| {
+                    BackendError::Protocol("Taceta Link authorization is missing".into())
+                })?;
+                let job = taceta_link_service::page_fetch_job(url.clone(), auth)
+                    .map_err(|error| BackendError::Protocol(error.to_string()))?;
+                let wait_ms = link_wait_duration(job.timeout_ms);
+                return match tokio::time::timeout(wait_ms, service.enqueue_and_wait(job)).await {
+                    Ok(Ok(result)) => {
+                        let urls = result
+                            .data
+                            .get("citations")
+                            .and_then(|value| value.as_array())
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(|value| value.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Ok((result.untrusted_context(), urls))
+                    }
+                    Ok(Err(error)) => {
+                        let _ = events
+                            .send(GenerationEvent::SearchProgress(format!("取得失敗: {url}")));
+                        let payload = serde_json::json!({
+                            "error": "ページを取得できませんでした",
+                            "url": url,
+                            "retryable": false,
+                            "detail": error.to_string(),
+                        });
+                        Ok((serde_json::to_string(&payload).unwrap(), Vec::new()))
+                    }
+                    Err(_) => {
+                        let _ = events
+                            .send(GenerationEvent::SearchProgress(format!("取得失敗: {url}")));
+                        let payload = serde_json::json!({
+                            "error": "ページの取得が時間切れになりました",
+                            "url": url,
+                            "retryable": true,
+                        });
+                        Ok((serde_json::to_string(&payload).unwrap(), Vec::new()))
+                    }
+                };
+            }
+            let provider = provider
+                .ok_or_else(|| BackendError::Protocol("web provider is unavailable".into()))?;
+            match provider.fetch(&url).await {
                 Ok(page) => {
                     let citation = page.url.clone();
                     Ok((serde_json::to_string(&serde_json::json!({"url":page.url,"content_type":page.content_type,"text":page.text})).unwrap(), vec![citation]))
@@ -378,6 +541,20 @@ async fn execute_tool(
         _ => Err(BackendError::Protocol("unsupported web tool".into())),
     }
 }
+
+fn link_wait_duration(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.saturating_add(1_000))
+}
+
+fn workflow_wire_name(workflow: crate::domain::WebWorkflow) -> &'static str {
+    match workflow {
+        crate::domain::WebWorkflow::DefaultSearch => "default_search",
+        crate::domain::WebWorkflow::GoogleSearch => "google_search",
+        crate::domain::WebWorkflow::PageFetch => "page_fetch",
+        crate::domain::WebWorkflow::ChatGptWeb => "chatgpt_web",
+    }
+}
+
 fn think_value(mode: ThinkingMode) -> Option<serde_json::Value> {
     match mode {
         ThinkingMode::Default => None,
@@ -594,6 +771,16 @@ mod tests {
         let json = serde_json::to_value(body).unwrap();
         assert!(!json.as_object().unwrap().contains_key("think"));
         assert_eq!(json["options"]["num_ctx"], serde_json::json!(4096));
+    }
+
+    #[test]
+    fn browser_wait_uses_job_deadline_plus_bounded_transport_grace() {
+        assert_eq!(link_wait_duration(30_000), Duration::from_millis(31_000));
+        assert_eq!(link_wait_duration(120_000), Duration::from_millis(121_000));
+        assert_eq!(
+            link_wait_duration(u64::MAX),
+            Duration::from_millis(u64::MAX)
+        );
     }
 
     #[test]

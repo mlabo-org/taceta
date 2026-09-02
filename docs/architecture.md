@@ -1,96 +1,53 @@
 # Taceta architecture boundary
 
-この文書は、Taceta v0.1の実装範囲と、将来のCodex harness統合を混同しないための設計境界です。ここに記載した将来機能は未実装です。
+この文書は、Taceta の Rust アプリと Taceta Link の責務、そして Web Search の外部作用を定義します。Taceta は単一 Git repo / version 内に、Rust app `src/` と独立 component `browser-extension/` を物理的に持ちます。
 
-## v0.1の範囲
+## アプリとローカル経路
 
-v0.1は次の機能に集中します。
+`InferenceBackend` は local chat の境界です。モデル、会話入力、添付、Thinking 設定、Web Search 設定を受け取り、Thinking delta、content delta、検索進捗、参照元、完了、失敗を返します。Thinking trace は次の入力へ混ぜません。
 
-- local chat inference
-- Thinkingの生成制御とtrace表示制御
-- UTF-8テキストと、vision能力が確認されたモデルへの画像attachments
-- 専用Model Manager画面からの明示的なモデル一覧確認・取得・削除
-- 現行チャットのcontext length（default 32k）
-- 会話単位で明示的にONにするWeb Search。検索プロバイダーはBrave Search（既定）またはOllama Web Searchから選択する。
+Web Search OFF では外部 request を作りません。ON では設定された executor を適用します。Brave Search / Ollama Web Search は API 経路、Taceta Link はブラウザー経路です。外部結果は untrusted context としてローカル Ollama の最終回答に渡します。provider は暗黙に切り替えません。
 
-`InferenceBackend`はstateless-ishなchat inference boundaryです。モデル選択、会話入力、添付データ、Thinking設定、明示されたWeb Search設定を受け取り、Thinking delta、content delta、検索進捗、参照元、完了、失敗などのchat eventsを返します。バックエンドのwire形式はこの境界の内側に隔離します。Web SearchがOFFならtoolsは送らず、ONでもtool能力のないモデルには送信前にエラーを返します。プロバイダーは暗黙に切り替えず、キーはmacOS Keychainだけに保存します。
+Taceta Link は同じ version を持つ MV3 拡張、Native Messaging Host `org.mlabo.taceta.link`、user-only Unix socket で構成します。アプリが job を socket へ置き、拡張が poll して実行結果を返します。product version / protocol version / extension ID の不一致は fail-closed です。Cookie、token、profile、local storage を読み出したり輸出したりしません。
 
-`ModelManager`はチャット推論から分離されたモデルライフサイクル境界です。モデル一覧は画面表示時・更新時に取得し、取得はモデルIDの入力と利用者のボタン操作でのみ開始します。削除は正確なモデル名を表示する確認ダイアログの最終操作でのみ実行します。取得中の停止はHTTPタスクを中断し、チャット生成とは別の状態として扱います。
+ブラウザー executor は focused を優先して既存の normal window を作業コンテナとして再利用し、その中に非アクティブな agent tab / group を作成します。normal window がない場合だけ非フォーカス window を作成します。window は所有・削除せず、終了時は追跡した exact agent tab を ungroup して削除します。Default Search と Google Search は query を渡します。ChatGPT Web は現在の prompt だけを exact に渡し、履歴、system message、attachments、Thinking trace は渡しません。
 
-Web Searchはブラウザや外部アプリではなくTaceta内のHTTPハーネスです。検索語と取得先はONにした会話だけで外部へ送信され、検索進捗は会話本文に混ぜません。参照元URLだけをassistant messageへ保存して再起動後も復元します。
+## Web ON の承認と安全境界
 
-## 将来のCodex harness境界
+Web ON + Send は一つの `WebAuthorization` に結びついた一回の Web request だけを許可します。同じ authorization の再利用や結果不明状態は拒否します。検索結果は最終回答そのものではなく、ローカル Ollama が生成する回答の untrusted context です。ログイン、アカウント変更、購入、削除などの destructive/account action は別途利用者の確認が必要です。
 
-Codexとの統合は、InferenceBackendへ機能を押し込む拡張ではありません。将来追加する別責務 `AgentHarness` が、次のライフサイクルを所有します。
+## インストール責務
 
-- tool callsとその結果
-- approval（人間の承認）
-- sandbox境界
-- workdir
-- 子processの起動、監視、停止を含むprocess lifecycle
+アプリは macOS のデフォルトブラウザーを検出し、初期対応の Brave / Chrome に限って、拡張を Taceta Application Support 配下へ materialize します。Native Messaging Host をそのユーザー専用のブラウザー領域へ登録し、version と固定 ID `hefhkgbiiajifedgjlbiklclooifkidg` を検証してから、拡張管理ページを開きます。利用者は Developer mode を ON にし、Load unpacked / Add で materialized `browser-extension` directory を選びます。この最後の browser approval は自動化しません。更新時は拡張管理ページで Reload を案内します。Safari 等は Brave / Chrome の導入とデフォルト設定へ案内し、未対応ブラウザーへの登録は行いません。
 
-`InferenceBackend`はchat eventsだけを扱い、tool call、approval、sandbox、workdir、process lifecycleをchat eventへ偽装して流しません。両者の責務は独立したhandoffで接続します。
+## 将来の typed agent-harness 境界
 
-将来のCodex harness launcherは、既定ではCodex設定を書き換えず、認証情報を管理せず、子processを起動しません。利用者が明示的に操作した場合だけlauncherを実行します。
-
-## 段階的なロードマップ
-
-1. **First milestone:** 利用者が明示的にインストール済みCodex CLIを起動するlauncher。
-2. **Later milestone:** 必要性とAPI契約を確認したうえで、optionalなCodex App Server integration。
-
-Codex App Server統合は将来の選択肢であり、v0.1の実装・依存・通常起動経路には含めません。
-
-Ollamaの公式Codex integration文書が推奨する最低64k contextは、将来のharnessで検討する要件です。現行chatのdefault 32kとは別の設定・別の受け入れ条件として扱います。
-
-根拠:
-
-- [Ollama Codex integration](https://docs.ollama.com/integrations/codex)
-- [Codex App Server](https://developers.openai.com/codex/app-server)
+GUI 完成後に、tool calls、approval、sandbox、workdir、子 process lifecycle を扱う optional な typed agent-harness を追加する余地があります。これは `InferenceBackend` や Taceta Link の責務へ混ぜず、明示的な handoff で接続します。現時点の Taceta はその harness、Codex、または別の外部実行基盤に依存しません。
 
 ---
 
 # Taceta architecture boundary (English)
 
-This document defines the v0.1 implementation boundary so that future Codex harness work is not confused with shipped functionality. Everything described as future work below is not implemented.
+This document defines the responsibilities of Taceta's Rust app and Taceta Link, plus the external-effect boundary for Web Search. One Git repository and product version contain two physically separate components: the Rust app in `src/` and the independent component in `browser-extension/`.
 
-## v0.1 scope
+## App and local transport
 
-Version 0.1 focuses on:
+`InferenceBackend` owns local chat. It accepts model, conversation input, attachments, Thinking settings, and Web Search settings, then emits Thinking deltas, content deltas, search progress, citations, completion, and failure. Thinking traces never enter the next input.
 
-- local chat inference
-- independent Thinking generation and trace presentation controls
-- UTF-8 text attachments and image attachments only for models with confirmed vision capability
-- the current chat context length (32k by default)
-- explicit per-conversation Web Search, with Brave Search as the default and optional Ollama Web Search
+With Web Search OFF, no external request is created. With it ON, the configured executor is applied: Brave Search / Ollama Web Search through their APIs, or Taceta Link through the browser. Returned external data is untrusted context for a final answer generated locally by Ollama. Providers never silently fall back.
 
-`InferenceBackend` is a stateless-ish chat inference boundary. It accepts model selection, conversation input, attachments, Thinking settings, and explicit Web Search settings, then emits Thinking deltas, content deltas, search progress, citations, completion, and failure. When Web Search is off, no tools are sent; when on, a model without tool capability is rejected before sending. Providers never silently fall back, and credentials are stored only in the macOS Keychain. Backend wire formats remain inside this boundary.
+Taceta Link consists of a same-version MV3 extension, Native Messaging Host `org.mlabo.taceta.link`, and a user-only Unix socket. The app places jobs on the socket; the extension polls and returns results. Product version, protocol version, or extension-ID mismatch fails closed. Cookies, tokens, profiles, and local storage are never read or exported.
 
-Web Search is an in-process HTTP harness, not a browser or external application. Queries and fetched URLs leave the Mac only for conversations where it is enabled. Search progress is not mixed into conversation content; citation URLs are stored on assistant messages and restored with the conversation.
+The browser executor prefers an existing focused normal window as its route container, creating an inactive agent tab and group there; only when no normal window exists does it create a non-focused normal window. The window is never owned or closed. At session end it ungroups and removes only the exact tracked agent tab. Default Search and Google Search receive a query. ChatGPT Web receives exactly the current prompt and never history, system messages, attachments, or Thinking traces.
 
-## Future Codex harness boundary
+## Web ON authorization and safety
 
-Codex integration is not an expansion of InferenceBackend. A separate future `AgentHarness` responsibility will own:
+Web ON + Send authorizes exactly one web request through one `WebAuthorization`. Reusing an authorization or retrying an unknown outcome is rejected. Search output is untrusted context, not the final answer; local Ollama generates that answer. Login, account changes, purchases, deletions, and other destructive/account actions still require separate user confirmation.
 
-- tool calls and their results
-- human approvals
-- sandbox boundaries
-- workdir
-- process lifecycle, including launching, monitoring, and stopping child processes
+## Installation responsibility
 
-`InferenceBackend` handles chat events only. Tool calls, approvals, sandbox, workdir, and process lifecycle must not be disguised as chat events. The two responsibilities connect through an explicit independent handoff.
+The app detects the macOS default browser and supports Brave and Chrome initially. It materializes the extension under Taceta Application Support, registers the per-user Native Messaging Host, verifies version and fixed ID `hefhkgbiiajifedgjlbiklclooifkidg`, and opens the extension-management page. The user turns on Developer mode and chooses Load unpacked / Add for the materialized `browser-extension` directory. This final browser approval remains manual; it is not silently automated. Updates guide the user to press Reload. Safari and other unsupported browsers are directed to install Brave or Chrome and make one the default; no registration is attempted for an unsupported browser.
 
-A future Codex harness launcher will not rewrite Codex configuration by default, manage authentication, or start a child process. It runs only after an explicit user action.
+## Future typed agent-harness boundary
 
-## Staged roadmap
-
-1. **First milestone:** a launcher that explicitly starts an already-installed Codex CLI.
-2. **Later milestone:** optional Codex App Server integration after its need and API contract are verified.
-
-Codex App Server integration is a future option; it is not part of the v0.1 implementation, dependencies, or normal launch path.
-
-The minimum 64k context recommended by Ollama's official Codex integration documentation is a future harness requirement to evaluate. It is separate from the current chat default of 32k and has separate acceptance criteria.
-
-Sources:
-
-- [Ollama Codex integration](https://docs.ollama.com/integrations/codex)
-- [Codex App Server](https://developers.openai.com/codex/app-server)
+After the GUI is complete, an optional typed agent-harness may be added for tool calls, approvals, sandbox, workdir, and child-process lifecycle. It will remain separate from `InferenceBackend` and Taceta Link and connect through an explicit handoff. Current Taceta has no dependency on that harness, Codex, or another external execution platform.
