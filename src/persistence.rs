@@ -50,6 +50,11 @@ pub struct PersistedAppState {
     pub max_search_results: u8,
     #[serde(default)]
     pub fetch_search_pages: bool,
+    /// Whether the one-time Taceta Link browser setup guide was acknowledged.
+    /// Missing fields are treated as acknowledged so upgrades do not repeat
+    /// the guide for existing users.
+    #[serde(default = "default_link_setup_acknowledged")]
+    pub taceta_link_setup_acknowledged: bool,
 }
 
 impl Default for PersistedAppState {
@@ -67,6 +72,7 @@ impl Default for PersistedAppState {
             web_search_provider: ProviderKind::Brave,
             max_search_results: 5,
             fetch_search_pages: true,
+            taceta_link_setup_acknowledged: false,
         }
     }
 }
@@ -115,6 +121,10 @@ impl PersistedAppState {
 
 fn default_max_search_results() -> u8 {
     5
+}
+
+fn default_link_setup_acknowledged() -> bool {
+    true
 }
 
 pub fn normalize_context_length(value: u32) -> u32 {
@@ -183,5 +193,24 @@ mod tests {
         let value = serde_json::json!({"web_search_provider":"chatgpt_browser"});
         let state: PersistedAppState = serde_json::from_value(value).unwrap();
         assert_eq!(state.web_search_provider, ProviderKind::Unknown);
+    }
+
+    #[test]
+    fn fresh_state_shows_link_setup_but_legacy_state_is_acknowledged() {
+        assert!(!PersistedAppState::default().taceta_link_setup_acknowledged);
+
+        let legacy: PersistedAppState = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(legacy.taceta_link_setup_acknowledged);
+    }
+
+    #[test]
+    fn link_setup_acknowledgement_round_trips() {
+        let value = serde_json::to_value(PersistedAppState {
+            taceta_link_setup_acknowledged: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let restored: PersistedAppState = serde_json::from_value(value).unwrap();
+        assert!(restored.taceta_link_setup_acknowledged);
     }
 }
