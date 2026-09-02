@@ -127,6 +127,10 @@ impl TacetaApp {
         installer.setup(detected).map_err(|error| error.to_string())
     }
 
+    fn should_show_startup_link_setup(state: &PersistedAppState) -> bool {
+        !state.taceta_link_setup_acknowledged
+    }
+
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         install_macos_system_fonts(&creation_context.egui_ctx)
             .expect("Taceta could not install its managed macOS UI fonts");
@@ -217,11 +221,13 @@ impl TacetaApp {
             Ok(detected @ BrowserDetection::Supported(_)) => {
                 match Self::prepare_startup_link_setup(&app.link_installer, detected) {
                     Ok(status) => {
-                        app.link_setup_open = status.needs_load_unpacked || status.needs_reload;
-                        app.notice = Some(Notice {
-                            kind: NoticeKind::Info,
-                            text: text(app.language(), "Taceta Linkを準備しました。ブラウザー側でLoad unpacked／追加を一度だけ完了してください。", "Taceta Link is prepared. Complete Load unpacked / Add in the browser once.").to_owned(),
-                        });
+                        if Self::should_show_startup_link_setup(&app.state) {
+                            app.link_setup_open = status.needs_load_unpacked || status.needs_reload;
+                            app.notice = Some(Notice {
+                                kind: NoticeKind::Info,
+                                text: text(app.language(), "Taceta Linkを準備しました。ブラウザー側でLoad unpacked／追加を一度だけ完了してください。", "Taceta Link is prepared. Complete Load unpacked / Add in the browser once.").to_owned(),
+                            });
+                        }
                         app.link_status = Some(status);
                     }
                     Err(error) => {
@@ -1259,6 +1265,7 @@ impl TacetaApp {
                     ui.label(RichText::new(text(language, "Safariは未対応です。BraveまたはChromeを使用してください。更新後は拡張機能のReloadが必要です。", "Safari is unsupported. Use Brave or Chrome. After an update, reload the extension.")).weak());
                     if ui.button(text(language, "閉じる", "Close")).clicked() {
                         self.link_setup_open = false;
+                        self.state.taceta_link_setup_acknowledged = true;
                     }
                 });
         }
@@ -2557,6 +2564,22 @@ mod model_manager_tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unsupported default browser"));
+    }
+
+    #[test]
+    fn startup_link_setup_is_suppressed_after_acknowledgement() {
+        let fresh = PersistedAppState::default();
+        assert!(TacetaApp::should_show_startup_link_setup(&fresh));
+
+        let acknowledged = PersistedAppState {
+            taceta_link_setup_acknowledged: true,
+            ..fresh
+        };
+        assert!(!TacetaApp::should_show_startup_link_setup(&acknowledged));
+        // The explicit Settings action owns this flag independently and can
+        // still open the guide when the user requests setup again.
+        let explicit_setup_open = true;
+        assert!(explicit_setup_open);
     }
 
     impl FakeModelManager {
