@@ -544,7 +544,9 @@ async fn execute_tool(
 }
 
 fn link_wait_duration(timeout_ms: u64) -> Duration {
-    Duration::from_millis(timeout_ms.saturating_add(1_000))
+    // The extension owns workflow timing. Keep a separate bounded allowance
+    // for Native Messaging result delivery after the browser finishes.
+    Duration::from_millis(timeout_ms.saturating_add(5_000))
 }
 
 fn workflow_wire_name(workflow: crate::domain::WebWorkflow) -> &'static str {
@@ -977,8 +979,8 @@ mod tests {
 
     #[test]
     fn browser_wait_uses_job_deadline_plus_bounded_transport_grace() {
-        assert_eq!(link_wait_duration(30_000), Duration::from_millis(31_000));
-        assert_eq!(link_wait_duration(120_000), Duration::from_millis(121_000));
+        assert_eq!(link_wait_duration(30_000), Duration::from_millis(35_000));
+        assert_eq!(link_wait_duration(120_000), Duration::from_millis(125_000));
         assert_eq!(
             link_wait_duration(u64::MAX),
             Duration::from_millis(u64::MAX)

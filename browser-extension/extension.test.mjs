@@ -29,6 +29,11 @@ test("page fetch is a separately authorized browser job",()=>{
   assert.equal(validateJob(job,{request_id:"r1",session_id:"s1"}),job);
   assert.throws(()=>validateJob({...job,url:"http://127.0.0.1/"},{request_id:"r1",session_id:"s1"}));
 });
+test("ChatGPT Web accepts a bounded sliding idle timeout",()=>{
+  const job={job_id:"j2",workflow:"chatgpt_web",query:null,url:null,prompt:"調査して",limit:1,timeout_ms:1200000,idle_timeout_ms:180000,authorization:{kind:"web_request",request_id:"r2",session_id:"s2",once:true}};
+  assert.equal(validateJob(job,{request_id:"r2",session_id:"s2"}),job);
+  assert.throws(()=>validateJob({...job,idle_timeout_ms:1200001},{request_id:"r2",session_id:"s2"}));
+});
 test("workflow allowlist and exact ChatGPT passthrough",()=>{ assert.throws(()=>workflowSpec("shell","x")); assert.equal(workflowSpec("page_fetch","https://example.com").workflow,"page_fetch"); assert.deepEqual(chatgptPromptContract("  exact?  ").text,"  exact?  "); });
 test("confirmation and unknown mutation are fail closed",()=>{assert.equal(effectFor("job_result"),"external_submit"); assert.equal(requiresConfirmation("external_submit",false),true); assert.equal(mutationTransition("pending",true,false),"performed_or_unknown");});
 test("web authorization is exact request/session scoped and cannot authorize mutations",()=>{

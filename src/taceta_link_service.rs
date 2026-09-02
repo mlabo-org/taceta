@@ -31,8 +31,16 @@ pub struct LinkJob {
     pub prompt: Option<String>,
     pub authorization: WebAuthorization,
     pub limit: u8,
+    /// Absolute safety ceiling owned by the whole browser job.
     pub timeout_ms: u64,
+    /// Sliding no-progress limit. ChatGPT Web refreshes this while generation
+    /// or visible response activity continues.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
 }
+
+const CHATGPT_WEB_HARD_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
+const CHATGPT_WEB_IDLE_TIMEOUT_MS: u64 = 3 * 60 * 1_000;
 
 impl LinkJob {
     pub fn search(
@@ -59,6 +67,7 @@ impl LinkJob {
             authorization,
             limit: 5,
             timeout_ms: 30_000,
+            idle_timeout_ms: None,
         })
     }
 
@@ -79,6 +88,7 @@ impl LinkJob {
             authorization,
             limit: 1,
             timeout_ms: 30_000,
+            idle_timeout_ms: None,
         })
     }
 
@@ -98,7 +108,8 @@ impl LinkJob {
             prompt: Some(prompt),
             authorization,
             limit: 1,
-            timeout_ms: 120_000,
+            timeout_ms: CHATGPT_WEB_HARD_TIMEOUT_MS,
+            idle_timeout_ms: Some(CHATGPT_WEB_IDLE_TIMEOUT_MS),
         })
     }
 }
@@ -274,7 +285,7 @@ fn wire_job(job: &LinkJob, session_id: Uuid) -> Value {
         WebWorkflow::PageFetch => "page_fetch",
         WebWorkflow::ChatGptWeb => "chatgpt_web",
     };
-    serde_json::json!({"job_id":job.job_id,"workflow":workflow,"query":job.query,"url":job.url,"prompt":job.prompt,"limit":job.limit,"timeout_ms":job.timeout_ms,
+    serde_json::json!({"job_id":job.job_id,"workflow":workflow,"query":job.query,"url":job.url,"prompt":job.prompt,"limit":job.limit,"timeout_ms":job.timeout_ms,"idle_timeout_ms":job.idle_timeout_ms,
         "authorization":{"kind":"web_request","request_id":job.authorization.request_id,"session_id":session_id,"once":true}})
 }
 
@@ -309,6 +320,12 @@ fn normalize_result(payload: Value) -> Result<LinkResult, LinkError> {
             "timeout" | "search_timeout" | "composer_timeout" | "response_timeout" => {
                 LinkError::Protocol(format!("Taceta Link {workflow_name} request timed out"))
             }
+            "response_stalled" => LinkError::Protocol(format!(
+                "Taceta Link {workflow_name} response progress stalled"
+            )),
+            "response_hard_timeout" => LinkError::Protocol(format!(
+                "Taceta Link {workflow_name} exceeded the safety time limit"
+            )),
             "performed_or_unknown" => LinkError::PerformedOrUnknown,
             _ => LinkError::Protocol(format!("{workflow_name} {code}: {message}")),
         });
@@ -426,6 +443,8 @@ mod tests {
         .unwrap();
         assert_eq!(job.prompt.as_deref(), Some("  exact\ninput  "));
         assert!(job.query.is_none());
+        assert_eq!(job.timeout_ms, CHATGPT_WEB_HARD_TIMEOUT_MS);
+        assert_eq!(job.idle_timeout_ms, Some(CHATGPT_WEB_IDLE_TIMEOUT_MS));
     }
 
     #[test]
