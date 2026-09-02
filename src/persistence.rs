@@ -17,6 +17,9 @@ pub struct Conversation {
     pub id: Uuid,
     pub title: String,
     pub messages: Vec<ChatMessage>,
+    /// User-authored titles must not be replaced by the first prompt.
+    #[serde(default)]
+    pub title_is_custom: bool,
     /// Web access is deliberately opt-in for each conversation.
     #[serde(default)]
     pub web_search_enabled: bool,
@@ -28,8 +31,19 @@ impl Default for Conversation {
             id: Uuid::new_v4(),
             title: "New chat".to_owned(),
             messages: Vec::new(),
+            title_is_custom: false,
             web_search_enabled: false,
         }
+    }
+}
+
+impl Conversation {
+    pub fn is_untitled(&self) -> bool {
+        self.messages.is_empty() && !self.title_is_custom
+    }
+
+    pub fn should_generate_title(&self) -> bool {
+        self.is_untitled()
     }
 }
 
@@ -117,6 +131,50 @@ impl PersistedAppState {
         self.draft.clear();
         self.pending_attachments.clear();
     }
+
+    pub fn rename_conversation(&mut self, id: Uuid, title: &str) -> bool {
+        let title = title.trim();
+        if title.is_empty() {
+            return false;
+        }
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == id)
+        else {
+            return false;
+        };
+        conversation.title = title.to_owned();
+        conversation.title_is_custom = true;
+        true
+    }
+
+    pub fn delete_conversation(&mut self, id: Uuid) -> bool {
+        let Some(index) = self
+            .conversations
+            .iter()
+            .position(|conversation| conversation.id == id)
+        else {
+            return false;
+        };
+        let deleted_active_conversation = id == self.active_conversation_id;
+        self.conversations.remove(index);
+
+        if self.conversations.is_empty() {
+            let conversation = Conversation::default();
+            self.active_conversation_id = conversation.id;
+            self.conversations.push(conversation);
+        } else if deleted_active_conversation {
+            let replacement_index = index.min(self.conversations.len() - 1);
+            self.active_conversation_id = self.conversations[replacement_index].id;
+        }
+
+        if deleted_active_conversation {
+            self.draft.clear();
+            self.pending_attachments.clear();
+        }
+        true
+    }
 }
 
 fn default_max_search_results() -> u8 {
@@ -174,6 +232,44 @@ mod tests {
             ProviderKind::Brave
         );
         assert_eq!(PersistedAppState::default().max_search_results, 5);
+    }
+
+    #[test]
+    fn renaming_an_empty_conversation_preserves_the_custom_title() {
+        let mut state = PersistedAppState::default();
+        let id = state.active_conversation_id;
+
+        assert!(state.rename_conversation(id, "  調査メモ  "));
+        assert_eq!(state.active_conversation().title, "調査メモ");
+        assert!(!state.active_conversation().should_generate_title());
+        assert!(!state.rename_conversation(id, "   "));
+        assert_eq!(state.active_conversation().title, "調査メモ");
+    }
+
+    #[test]
+    fn deleting_the_active_conversation_selects_a_valid_replacement() {
+        let mut state = PersistedAppState::default();
+        let deleted_id = state.active_conversation_id;
+        state.start_new_conversation();
+        let replacement_id = state.active_conversation_id;
+        state.active_conversation_id = deleted_id;
+        state.draft = "discard this draft".to_owned();
+
+        assert!(state.delete_conversation(deleted_id));
+        assert_eq!(state.active_conversation_id, replacement_id);
+        assert!(state.draft.is_empty());
+        assert_eq!(state.conversations.len(), 1);
+    }
+
+    #[test]
+    fn deleting_the_last_conversation_creates_a_fresh_chat() {
+        let mut state = PersistedAppState::default();
+        let deleted_id = state.active_conversation_id;
+
+        assert!(state.delete_conversation(deleted_id));
+        assert_eq!(state.conversations.len(), 1);
+        assert_ne!(state.active_conversation_id, deleted_id);
+        assert!(state.active_conversation().is_untitled());
     }
 
     #[test]
