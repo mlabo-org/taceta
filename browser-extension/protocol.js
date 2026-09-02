@@ -1,8 +1,8 @@
 export const SCHEMA_VERSION = 1;
 export const PRODUCT_VERSION = "0.1.0";
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const MESSAGE_TYPES = new Set(["request", "response", "event"]);
-export const OPERATIONS = new Set(["ping", "extension_ready", "poll_job", "job_result", "cancel", "cancel_ack", "health", "version_failure"]);
+export const OPERATIONS = new Set(["ping", "extension_ready", "poll_job", "job_progress", "job_result", "cancel", "cancel_ack", "health", "version_failure"]);
 export const MUTATION_STATES = new Set(["not_performed", "pending", "performed", "performed_or_unknown"]);
 export const WORKFLOWS = new Set(["default_search", "google_search", "page_fetch", "chatgpt_web"]);
 export function envelope(message_type, request_id, session_id, operation, payload = {}, mutation_state) {
@@ -39,5 +39,17 @@ export function jobResultPayload(job, status, data = {}) {
     workflow: job.workflow,
     status,
     mutation_state: status === "completed" ? "performed" : job.workflow === "chatgpt_web" ? "performed_or_unknown" : "not_performed",
+  };
+}
+export function jobProgressPayload(job, sequence, delta, replace = false) {
+  if (!job || typeof job.job_id !== "string" || job.workflow !== "chatgpt_web" || !Number.isInteger(sequence) || sequence <= 0 || typeof delta !== "string" || !delta || typeof replace !== "boolean") throw new Error("invalid job progress");
+  return {
+    job_id: job.job_id,
+    workflow: job.workflow,
+    sequence,
+    delta,
+    replace,
+    status: "streaming",
+    mutation_state: "performed",
   };
 }

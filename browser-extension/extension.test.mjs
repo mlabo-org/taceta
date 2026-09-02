@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { envelope, jobResultPayload, validateEnvelope, validateJob } from "./protocol.js";
+import { envelope, jobProgressPayload, jobResultPayload, validateEnvelope, validateJob } from "./protocol.js";
 import { effectFor, requiresConfirmation, mutationTransition, isAuthorizedWebWorkflow } from "./safety.js";
 import { googleResultsFromNodes, workflowSpec, chatgptPromptContract, runDefaultSearch } from "./workflows.js";
 import { safeUrl } from "./selectors.js";
@@ -24,6 +24,12 @@ test("job results preserve the owning workflow on success and failure",()=>{
   assert.deepEqual(jobResultPayload(job,"completed",{results:[]}),{results:[],job_id:"j1",workflow:"google_search",status:"completed",mutation_state:"performed"});
   assert.deepEqual(jobResultPayload(job,"failed",{error:{code:"search_timeout"}}),{error:{code:"search_timeout"},job_id:"j1",workflow:"google_search",status:"failed",mutation_state:"not_performed"});
 });
+test("ChatGPT progress is ordered incremental output",()=>{
+  const job={job_id:"j2",workflow:"chatgpt_web"};
+  assert.deepEqual(jobProgressPayload(job,2,"続き",false),{job_id:"j2",workflow:"chatgpt_web",sequence:2,delta:"続き",replace:false,status:"streaming",mutation_state:"performed"});
+  assert.throws(()=>jobProgressPayload(job,0,"bad",false));
+  assert.throws(()=>jobProgressPayload({...job,workflow:"google_search"},1,"bad",false));
+});
 test("page fetch is a separately authorized browser job",()=>{
   const job={job_id:"j1",workflow:"page_fetch",query:null,prompt:null,url:"https://example.com/article",limit:1,timeout_ms:30000,authorization:{kind:"web_request",request_id:"r1",session_id:"s1",once:true}};
   assert.equal(validateJob(job,{request_id:"r1",session_id:"s1"}),job);
@@ -35,7 +41,7 @@ test("ChatGPT Web accepts a bounded sliding idle timeout",()=>{
   assert.throws(()=>validateJob({...job,idle_timeout_ms:1200001},{request_id:"r2",session_id:"s2"}));
 });
 test("workflow allowlist and exact ChatGPT passthrough",()=>{ assert.throws(()=>workflowSpec("shell","x")); assert.equal(workflowSpec("page_fetch","https://example.com").workflow,"page_fetch"); assert.deepEqual(chatgptPromptContract("  exact?  ").text,"  exact?  "); });
-test("confirmation and unknown mutation are fail closed",()=>{assert.equal(effectFor("job_result"),"external_submit"); assert.equal(requiresConfirmation("external_submit",false),true); assert.equal(mutationTransition("pending",true,false),"performed_or_unknown");});
+test("confirmation and unknown mutation are fail closed",()=>{assert.equal(effectFor("job_progress"),"external_submit"); assert.equal(effectFor("job_result"),"external_submit"); assert.equal(requiresConfirmation("external_submit",false),true); assert.equal(mutationTransition("pending",true,false),"performed_or_unknown");});
 test("web authorization is exact request/session scoped and cannot authorize mutations",()=>{
   const message={request_id:"r1",session_id:"s1",payload:{workflow:"google_search",authorization:{kind:"web_request",request_id:"r1",session_id:"s1",once:true}}};
   assert.equal(isAuthorizedWebWorkflow(message),true); assert.equal(requiresConfirmation("external_submit",isAuthorizedWebWorkflow(message)),false);

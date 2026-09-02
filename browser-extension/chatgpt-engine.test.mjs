@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chatGPTWebSelectors, readChatGPTWebState, citationsFromAssistant, chatGPTWebActivityFingerprint } from "./engines/chatgpt-web.js";
+import { chatGPTWebSelectors, readChatGPTWebState, citationsFromAssistant, chatGPTWebActivityFingerprint, chatGPTWebProgressChunk } from "./engines/chatgpt-web.js";
 
 test("ChatGPT Web engine exposes current stable selectors", () => {
   assert.deepEqual(chatGPTWebSelectors(), {
@@ -39,4 +39,11 @@ test("activity fingerprint changes while ChatGPT generation progresses", () => {
   assert.equal(chatGPTWebActivityFingerprint(base), chatGPTWebActivityFingerprint({ ...base }));
   assert.notEqual(chatGPTWebActivityFingerprint(base), chatGPTWebActivityFingerprint({ ...base, assistants: [{ id: "a1", text: "検索結果を確認中" }] }));
   assert.notEqual(chatGPTWebActivityFingerprint(base), chatGPTWebActivityFingerprint({ ...base, stop: false, send: true, sendDisabled: false }));
+});
+
+test("progress chunks stream append-only text and replace rewritten DOM text", () => {
+  assert.deepEqual(chatGPTWebProgressChunk("", "回答", 1), {sequence: 1, delta: "回答", replace: false});
+  assert.deepEqual(chatGPTWebProgressChunk("回答", "回答です", 2), {sequence: 2, delta: "です", replace: false});
+  assert.deepEqual(chatGPTWebProgressChunk("回答です", "修正版です", 3), {sequence: 3, delta: "修正版です", replace: true});
+  assert.equal(chatGPTWebProgressChunk("回答", "回答", 4), null);
 });

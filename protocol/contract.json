@@ -6,10 +6,10 @@
   "required": ["schema_version", "product_version", "protocol_version", "message_type", "request_id", "session_id", "operation", "payload"],
   "additionalProperties": false,
   "properties": {
-    "schema_version": {"const": 1}, "product_version": {"const": "0.1.0"}, "protocol_version": {"const": 1},
+    "schema_version": {"const": 1}, "product_version": {"const": "0.1.0"}, "protocol_version": {"const": 2},
     "message_type": {"enum": ["request", "response", "event"]},
     "request_id": {"type": "string", "format": "uuid"}, "session_id": {"type": "string", "format": "uuid"},
-    "operation": {"enum": ["ping", "extension_ready", "poll_job", "job_result", "cancel", "cancel_ack", "health", "version_failure"]},
+    "operation": {"enum": ["ping", "extension_ready", "poll_job", "job_progress", "job_result", "cancel", "cancel_ack", "health", "version_failure"]},
     "payload": {"type": "object"},
     "mutation_state": {"enum": ["not_performed", "pending", "performed", "performed_or_unknown"]}
   }

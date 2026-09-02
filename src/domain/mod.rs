@@ -165,6 +165,7 @@ pub struct GenerationStats {
 pub enum GenerationEvent {
     ThinkingDelta(String),
     ContentDelta(String),
+    ExternalContentDelta { delta: String, replace: bool },
     ToolCall(serde_json::Value),
     SearchProgress(String),
     Citation(String),

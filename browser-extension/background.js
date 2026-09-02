@@ -1,6 +1,6 @@
 import { OwnedScope } from "./scope.js";
 import { CdpExecutor } from "./cdp.js";
-import { envelope, jobResultPayload, validateEnvelope, validateJob } from "./protocol.js";
+import { envelope, jobProgressPayload, jobResultPayload, validateEnvelope, validateJob } from "./protocol.js";
 import { runDefaultSearch } from "./workflows.js";
 import { fetchPage } from "./engines/fetch.js";
 import { searchGoogle, searchDefault } from "./engines/search.js";
@@ -30,7 +30,15 @@ async function execute(message) {
       if (job.workflow === "google_search") result = await searchGoogle({tab:page, query:job.query, limit:job.limit, timeoutMs:job.timeout_ms});
       else if (job.workflow === "default_search") result = await searchDefault({chrome, tab:page, tabId:scope.ledger.tabId, query:job.query, limit:job.limit, timeoutMs:job.timeout_ms});
       else if (job.workflow === "page_fetch") result = await fetchPage({tab:page, url:job.url, timeoutMs:job.timeout_ms});
-      else result = await runChatGPTWeb({page, prompt:job.prompt, timeoutMs:job.timeout_ms, idleTimeoutMs:job.idle_timeout_ms});
+      else result = await runChatGPTWeb({
+        page,
+        prompt:job.prompt,
+        timeoutMs:job.timeout_ms,
+        idleTimeoutMs:job.idle_timeout_ms,
+        onProgress: ({sequence, delta, replace}) => {
+          if (port === jobPort) reply(request("job_progress", jobProgressPayload(job, sequence, delta, replace)));
+        },
+      });
       if (port === jobPort) reply(request("job_result", jobResultPayload(job, "completed", {results:result, answer:result.answer, citations:result.citations||[]})));
     } catch (error) { if (port === jobPort) reply(request("job_result", jobResultPayload(job, "failed", {error:{code:error.code||"workflow_failed",message:String(error.message||error)}}))); }
     finally { try { await cdp.detach(); } catch (_) {} try { await scope.close(); } catch (_) {} }

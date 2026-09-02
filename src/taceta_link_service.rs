@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +125,15 @@ pub struct LinkResult {
     pub lifecycle: Option<LifecycleState>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkProgress {
+    pub job_id: Uuid,
+    pub workflow: WebWorkflow,
+    pub sequence: u64,
+    pub delta: String,
+    pub replace: bool,
+}
+
 impl LinkResult {
     /// Browser output is context for local synthesis, never Taceta's final answer.
     pub fn untrusted_context(&self) -> String {
@@ -160,6 +169,7 @@ pub enum LinkError {
 pub struct TacetaLinkService {
     queue: Arc<Mutex<VecDeque<LinkJob>>>,
     waiters: Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<LinkResult, LinkError>>>>>,
+    progress_waiters: Arc<Mutex<HashMap<Uuid, UnboundedSender<LinkProgress>>>>,
     used_authorizations: Arc<Mutex<HashSet<Uuid>>>,
     last_seen: Arc<Mutex<Option<Instant>>>,
 }
@@ -189,14 +199,38 @@ impl TacetaLinkService {
         Ok(())
     }
     pub async fn enqueue_and_wait(&self, job: LinkJob) -> Result<LinkResult, LinkError> {
+        self.enqueue_and_wait_inner(job, None).await
+    }
+    pub async fn enqueue_and_wait_with_progress(
+        &self,
+        job: LinkJob,
+        progress: UnboundedSender<LinkProgress>,
+    ) -> Result<LinkResult, LinkError> {
+        self.enqueue_and_wait_inner(job, Some(progress)).await
+    }
+    async fn enqueue_and_wait_inner(
+        &self,
+        job: LinkJob,
+        progress: Option<UnboundedSender<LinkProgress>>,
+    ) -> Result<LinkResult, LinkError> {
         let job_id = job.job_id;
         let (sender, receiver) = oneshot::channel();
         self.waiters
             .lock()
             .expect("link waiters")
             .insert(job_id, sender);
+        if let Some(progress) = progress {
+            self.progress_waiters
+                .lock()
+                .expect("link progress waiters")
+                .insert(job_id, progress);
+        }
         if let Err(error) = self.enqueue(job) {
             self.waiters.lock().expect("link waiters").remove(&job_id);
+            self.progress_waiters
+                .lock()
+                .expect("link progress waiters")
+                .remove(&job_id);
             return Err(error);
         }
         receiver.await.map_err(|_| LinkError::Unavailable)?
@@ -237,6 +271,21 @@ impl TacetaLinkService {
                 };
                 Envelope::response_for(&request, Operation::PollJob, payload)
             }
+            Operation::JobProgress => {
+                let progress = normalize_progress(request.payload.clone());
+                let accepted = progress.is_ok_and(|progress| {
+                    self.progress_waiters
+                        .lock()
+                        .expect("link progress waiters")
+                        .get(&progress.job_id)
+                        .is_some_and(|waiter| waiter.send(progress).is_ok())
+                });
+                Envelope::response_for(
+                    &request,
+                    Operation::JobProgress,
+                    serde_json::json!({"accepted":accepted}),
+                )
+            }
             Operation::JobResult => {
                 let result = normalize_result(request.payload.clone());
                 if let Some(id) = request
@@ -245,6 +294,10 @@ impl TacetaLinkService {
                     .and_then(Value::as_str)
                     .and_then(|s| Uuid::parse_str(s).ok())
                 {
+                    self.progress_waiters
+                        .lock()
+                        .expect("link progress waiters")
+                        .remove(&id);
                     if let Some(waiter) = self.waiters.lock().expect("link waiters").remove(&id) {
                         let _ = waiter.send(result);
                     }
@@ -350,6 +403,50 @@ fn normalize_result(payload: Value) -> Result<LinkResult, LinkError> {
         data: payload,
         mutation_state,
         lifecycle: Some(LifecycleState::Completed),
+    })
+}
+
+fn normalize_progress(payload: Value) -> Result<LinkProgress, LinkError> {
+    let job_id = payload
+        .get("job_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| LinkError::Protocol("missing progress job ID".into()))?;
+    let workflow = match payload.get("workflow").and_then(Value::as_str) {
+        Some("chatgpt_web") => WebWorkflow::ChatGptWeb,
+        Some(other) => {
+            return Err(LinkError::Protocol(format!(
+                "progress is not supported for {other}"
+            )));
+        }
+        None => return Err(LinkError::Protocol("missing progress workflow".into())),
+    };
+    let sequence = payload
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .filter(|sequence| *sequence > 0)
+        .ok_or_else(|| LinkError::Protocol("invalid progress sequence".into()))?;
+    let delta = payload
+        .get("delta")
+        .and_then(Value::as_str)
+        .filter(|delta| !delta.is_empty())
+        .ok_or_else(|| LinkError::Protocol("empty progress delta".into()))?
+        .to_owned();
+    let replace = payload
+        .get("replace")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| LinkError::Protocol("missing progress replacement state".into()))?;
+    if payload.get("status").and_then(Value::as_str) != Some("streaming")
+        || payload.get("mutation_state").and_then(Value::as_str) != Some("performed")
+    {
+        return Err(LinkError::Protocol("invalid progress state".into()));
+    }
+    Ok(LinkProgress {
+        job_id,
+        workflow,
+        sequence,
+        delta,
+        replace,
     })
 }
 
@@ -594,6 +691,70 @@ mod tests {
             Err(LinkError::Protocol(message))
                 if message == "Taceta Link google_search request timed out"
         ));
+    }
+
+    #[test]
+    fn chatgpt_progress_carries_ordered_text_delta() {
+        let job_id = Uuid::new_v4();
+        let progress = normalize_progress(serde_json::json!({
+            "job_id": job_id,
+            "workflow": "chatgpt_web",
+            "sequence": 2,
+            "delta": "続き",
+            "replace": false,
+            "status": "streaming",
+            "mutation_state": "performed"
+        }))
+        .unwrap();
+        assert_eq!(progress.job_id, job_id);
+        assert_eq!(progress.sequence, 2);
+        assert_eq!(progress.delta, "続き");
+        assert!(!progress.replace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_forwards_chatgpt_progress_before_final_result() {
+        let path = default_socket_path()
+            .unwrap()
+            .with_file_name("service-progress.sock");
+        let server = crate::browser_harness::SocketServer::bind(&path).unwrap();
+        let service = TacetaLinkService::default();
+        let job_id = Uuid::new_v4();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        service
+            .progress_waiters
+            .lock()
+            .unwrap()
+            .insert(job_id, progress_tx);
+        let service_for_worker = service.clone();
+        let worker = std::thread::spawn(move || {
+            let stream = server.accept().unwrap();
+            service_for_worker.serve_connection(stream).unwrap();
+        });
+        let session = Uuid::new_v4();
+        let mut client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let request = Envelope::new(
+            "0.1.0",
+            session,
+            Operation::JobProgress,
+            serde_json::json!({
+                "job_id": job_id,
+                "workflow": "chatgpt_web",
+                "sequence": 1,
+                "delta": "回答",
+                "replace": false,
+                "status": "streaming",
+                "mutation_state": "performed"
+            }),
+        );
+        client.send(&request).unwrap();
+        let ack: Envelope<Value> = client.receive().unwrap();
+        assert_eq!(ack.operation, Operation::JobProgress);
+        assert_eq!(ack.payload["accepted"], true);
+        let progress = progress_rx.try_recv().unwrap();
+        assert_eq!(progress.delta, "回答");
+        worker.join().unwrap();
     }
 
     #[cfg(unix)]

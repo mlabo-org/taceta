@@ -128,6 +128,7 @@ pub struct TacetaApp {
     connection: ConnectionState,
     model_storage_path: PathBuf,
     generation: Option<ActiveGeneration>,
+    external_preview_ids: HashSet<Uuid>,
     notice: Option<Notice>,
     conversation_title_editor: Option<ConversationTitleEditor>,
     conversation_delete_confirmation: Option<ConversationDeleteConfirmation>,
@@ -237,6 +238,7 @@ impl TacetaApp {
             connection: ConnectionState::Connecting,
             model_storage_path: resolve_model_storage_path(),
             generation: None,
+            external_preview_ids: HashSet::new(),
             notice: None,
             conversation_title_editor: None,
             conversation_delete_confirmation: None,
@@ -614,6 +616,7 @@ impl TacetaApp {
                 self.apply_generation_event(conversation_id, assistant_id, event);
             }
             if let Some(generation_result) = result {
+                self.external_preview_ids.remove(&assistant_id);
                 match generation_result {
                     Ok(()) => {
                         self.connection = ConnectionState::Ready;
@@ -662,7 +665,20 @@ impl TacetaApp {
                 });
             }
             GenerationEvent::ContentDelta(delta) => {
+                let replace_external_preview = self.external_preview_ids.remove(&assistant_id);
                 self.update_assistant(conversation_id, assistant_id, |message| {
+                    if replace_external_preview {
+                        message.content.clear();
+                    }
+                    message.content.push_str(&delta);
+                });
+            }
+            GenerationEvent::ExternalContentDelta { delta, replace } => {
+                self.external_preview_ids.insert(assistant_id);
+                self.update_assistant(conversation_id, assistant_id, |message| {
+                    if replace {
+                        message.content.clear();
+                    }
                     message.content.push_str(&delta);
                 });
             }
@@ -1017,6 +1033,7 @@ impl TacetaApp {
         let Some(active) = self.generation.take() else {
             return;
         };
+        self.external_preview_ids.remove(&active.assistant_id);
         active.task.abort();
         let language = self.language();
         self.update_assistant(active.conversation_id, active.assistant_id, |message| {
@@ -1777,9 +1794,7 @@ impl TacetaApp {
 
     fn show_settings(&mut self, root_ui: &mut Ui) {
         let language = self.language();
-        let selected_model_context = self
-            .selected_model()
-            .and_then(|model| model.context_length);
+        let selected_model_context = self.selected_model().and_then(|model| model.context_length);
         CentralPanel::default().show_inside(root_ui, |ui| {
             ScrollArea::vertical().show(ui, |ui| {
                 let width = ui.available_width().min(680.0);
