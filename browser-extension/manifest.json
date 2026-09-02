@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Taceta Link",
+  "version": "0.1.0",
+  "description": "A local browser harness for Taceta-owned tabs.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAync9a9a72JAmTQ+kdK4fTj6BzFcVlBkUzn7jT+xCCvl+ukwrb1k8CGzBDgbT8k5dpFrR0XRwLMENtBI8fwGAhqedFHaj01LdcEu4qEKSEfBxpeNkyqd59MA+HC+xTBhkbXidBvDGAyBJJ6PlsXVlLwXP0gp7nUvlaT35dx5EL2BKznbkRVgGsOs5pvxxZf8nHDng1DjOvHR2vKO/5+ox4HNdZ+TffoCCltHL1R8LFaMWCirR9nC4usdudSsi5O3iHP/tDbCpdvWbUskH61WCMqnDl4IIXCpspiQlZR911EQItUJlG+MfVC7PqZuqA3tzOYkEPM+rZIV6nlyrhu5dMQIDAQAB",
+  "permissions": ["debugger", "tabGroups", "storage", "nativeMessaging", "search", "alarms", "scripting", "webNavigation", "tabs"],
+  "host_permissions": ["https://*/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Taceta Link", "default_popup": "popup.html" },
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'self'" }
+}

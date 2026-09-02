@@ -165,4 +165,23 @@ mod tests {
         );
         assert_eq!(PersistedAppState::default().max_search_results, 5);
     }
+
+    #[test]
+    fn unknown_persisted_executor_stays_unconfigured() {
+        let state = PersistedAppState {
+            web_search_provider: ProviderKind::Unknown,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(state.web_search_provider, ProviderKind::Unknown);
+        assert_eq!(state.web_search_provider.wire_value(), "unknown");
+        assert!(state.web_search_provider.account_name().is_none());
+    }
+
+    #[test]
+    fn removed_executor_values_fail_closed_during_deserialization() {
+        let value = serde_json::json!({"web_search_provider":"chatgpt_browser"});
+        let state: PersistedAppState = serde_json::from_value(value).unwrap();
+        assert_eq!(state.web_search_provider, ProviderKind::Unknown);
+    }
 }

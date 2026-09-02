@@ -1,127 +1,118 @@
 # Taceta
 
-静かに考え、手元で答える。Taceta は macOS 専用の、ローカル推論向けネイティブチャットクライアントです。Rust と `eframe` / `egui` で構築し、会話と推論の表示を一つの落ち着いた画面にまとめます。
+静かに考え、手元で答える。Taceta は macOS 専用のローカル推論向けネイティブチャットクライアントです。Rust と `eframe` / `egui` で構築します。
 
 ## できること
 
-- ローカルのモデルへ接続してストリーミング回答を表示
-- 専用のモデル管理画面から、Ollamaモデルの一覧確認・取得・削除
-- Thinking の「生成」と「経過表示」を独立して切り替え
-- Thinking を動かしたまま、trace は画面に出さない設定
-- 対応モデルの能力に応じた Thinking ON/OFF または強度選択
-- UTF-8 テキストファイルの添付
-- vision 能力を持つモデルへの画像添付（能力がないモデルへは送信しない）
-- 日本語 / 英語、System / Light / Dark、文字サイズ 10–32 の設定保存
-- 生成中の表示切り替えと停止
-- 会話ごとのWeb Search（既定OFF）。Brave Searchを標準プロバイダーとし、Ollama Web SearchもAPIキーをKeychainへ保存して選択可能
-- 検索結果数、本文取得、参照元URLの会話保存・復元
+- ローカルモデルのストリーミング回答、Thinking の生成と trace 表示の独立制御
+- UTF-8 テキスト添付、vision 能力を確認できたモデルへの画像添付
+- 日本語 / 英語、System / Light / Dark、文字サイズ 10–32 の保存
+- 会話単位の Web Search（既定 OFF）
+- Brave Search / Ollama Web Search API、または Taceta Link 経由のブラウザー既定検索・Google 検索・ChatGPT Web
 
-Web SearchをONにした会話では検索語と取得先が外部へ送信されます。OFFの場合は従来どおりローカル推論だけを使用します。
+Web OFF は完全にローカルです。Web ON は設定された executor を自動適用します。外部結果は untrusted context として扱い、最終回答はローカル Ollama が生成します。Web ON + Send は一回の Web request だけを許可します。ChatGPT Web へは現在の入力欄の prompt だけを正確に渡し、履歴、system message、添付、Thinking trace は渡しません。アカウント操作や破壊的操作は、Web ON でも確認を要求します。
 
-Thinking のtraceは会話入力へ混ぜません。表示を隠しても推論自体は止まらず、表示設定と実行設定は別々に扱います。モデルによって制御できる範囲は異なるため、能力を確認できない選択肢はUIに制御可能とは表示しません。
+## 製品構成
 
-## 必要環境とセットアップ
+Taceta は単一 Git repo / version の中で、Rust アプリ `src/` と独立 component `browser-extension/` を物理的に分離しています。Taceta Link は Manifest V3、Native Messaging Host (`org.mlabo.taceta.link`)、user-only Unix socket のローカル経路です。Codex、外部 browser plugin、Node companion、Cookie / token のエクスポートには依存しません。
 
-- macOS 13.0 以降（Apple Siliconでの利用を主対象）
+拡張は既存の normal window（focused を優先）を作業コンテナとして再利用し、その中に非アクティブな agent tab と group を作成します。normal window がない場合だけ非フォーカスの window を作成します。window は所有・削除せず、Taceta が作成した exact tab/group だけを追跡し、終了時は ungroup と agent tab の削除を行います。product version と protocol version が一致しない場合は fail-closed します。固定 extension ID は `hefhkgbiiajifedgjlbiklclooifkidg` です。
+
+## 必要環境
+
+- macOS 13.0 以降（Apple Silicon を主対象）
 - Rust 1.92 以降（開発・ビルド時）
-- ローカル推論バックエンドとして [Ollama](https://ollama.com/) を別途インストールし、既定の loopback エンドポイント `http://127.0.0.1:11434` で起動
+- [Ollama](https://ollama.com/) を別途インストールし、`http://127.0.0.1:11434` で起動
+- Taceta Link を使う場合は Brave または Chrome
 
-Taceta は Ollama 本体やモデルを同梱・再配布しません。モデルの取得・削除は「モデルを管理」画面で利用者が明示的に実行します。各モデルのライセンスはモデルごとに異なるため、利用するモデルの配布元の条件を確認してください。Web Searchは会話単位で明示的にONにした場合だけ外部通信を行います。Brave SearchとOllama Web SearchはmacOS Keychainに保存したキーを使います。
+Taceta は Ollama 本体やモデルを同梱・再配布しません。モデルの取得・削除は利用者が Model Manager 画面で明示的に実行します。API key は必要な provider ごとに macOS Keychain へ保存します。
+
+## Taceta Link の初回セットアップ
+
+Taceta は macOS のデフォルトブラウザーを検出します。初期対応は Brave と Chrome です。起動時に拡張を Taceta の Application Support（`~/Library/Application Support/Taceta/browser-extension`）へ materialize し、選択されたブラウザー用の Native Messaging Host を登録し、version と extension ID を検証します。その後、拡張管理ページを開いて次を案内します。
+
+1. Brave は `brave://extensions`、Chrome は `chrome://extensions` を開く。
+2. Developer mode（デベロッパーモード）を ON にする。
+3. **Load unpacked（パッケージ化されていない拡張機能を読み込む）** / **Add（追加）** を押し、表示された Application Support 内の `browser-extension` フォルダーを選ぶ。
+4. ID `hefhkgbiiajifedgjlbiklclooifkidg` と Taceta Link の version が一致することを確認する。
+
+この最終的なブラウザー確認だけは利用者が行います。Taceta は拡張承認を無断で完了したり、サイレントインストールしたりしません。更新時は拡張管理ページで **Reload（再読み込み）** を押すよう案内します。デフォルトブラウザーが Safari など未対応の場合は、Brave または Chrome をインストールしてデフォルトにするよう案内し、未対応ブラウザーへ登録しません。
 
 ## ビルドと起動
-
-ソースから開発実行する場合:
 
 ```bash
 cargo run
 ```
 
-通常利用向けの prebuilt native app bundle は、リポジトリのルートで次を実行して生成します。
+通常利用向け app bundle は次で生成します。
 
 ```bash
 ./scripts/build-macos-app.sh
 open ./dist/Taceta.app
 ```
 
-このスクリプトは release binary を `dist/Taceta.app/Contents/MacOS/Taceta` に配置し、`Info.plist` を生成します。`target/` と `dist/` は生成物であり、ソース成果物ではありません。署名・公証・インストーラー作成はこのスクリプトの範囲外です。
+署名、公証、インストーラー作成はこのスクリプトの範囲外です。
 
-## 公開範囲と免責
+## 公開範囲とライセンス
 
-Taceta は Ollama または OpenAI / Codex と公式に提携・承認・後援された製品ではありません。Ollama は交換可能なローカルバックエンドとして利用しています。名称・商標の権利はそれぞれの権利者に帰属します。Taceta 自体のコードは MIT License で提供しますが、接続先のモデル、依存ソフトウェア、macOS はそれぞれ固有のライセンスまたは利用条件に従います。
+Taceta は Ollama と公式に提携・承認・後援された製品ではありません。将来、GUI 完成後に typed agent-harness 境界を追加する余地はありますが、現在の Taceta Link や通常起動経路の依存ではありません。
 
-## Web Searchの境界
-
-Web SearchはTaceta内のハーネスとして実装しています。ブラウザや外部アプリは起動しません。検索プロバイダーは自動で切り替えず、選択したプロバイダーが利用できない場合はエラーを表示します。検索経過は既定で会話へ保存せず、回答末尾に参照元URLを表示します。
-
-## 将来の拡張境界
-
-v0.1の実装範囲は local chat / Thinking / attachments / context length です。将来のCodex harness統合は未実装であり、現在の機能として扱いません。詳細な責務分離と段階的なロードマップは [`docs/architecture.md`](docs/architecture.md) を参照してください。
-
-## 謝辞
-
-ローカル推論接続の実装では Ollama の公開 API 仕様を参照しています。Ollama プロジェクトとモデル作者の皆さまに感謝します。
-
-## ライセンス
-
-Copyright (c) 2026 Makoto Suzuki。Taceta のコードは [MIT License](LICENSE) で公開します。
+Taceta 自体のコードは [MIT License](LICENSE) で提供します。Copyright (c) 2026 Makoto Suzuki。
 
 ---
 
 # Taceta (English)
 
-Think quietly, answer locally. Taceta is a macOS-only native chat client for local inference. Built with Rust and `eframe` / `egui`, it keeps conversation and inference controls in one calm workspace.
+Think quietly, answer locally. Taceta is a macOS-only native chat client for local inference, built with Rust and `eframe` / `egui`.
 
 ## Features
 
-- Stream responses from a local model
-- Control Thinking generation separately from Thinking trace visibility
-- Keep Thinking active while keeping its trace off screen
-- Offer Thinking on/off or levels according to the selected model's capabilities
-- Attach UTF-8 text files
-- Attach images only to models with vision capability
-- Persist Japanese / English, System / Light / Dark, and font size 10–32 settings
-- Change visibility while generating and stop generation
-- v0.1 focuses on local chat, Thinking, attachments, and a 32k context length
+- Stream local-model answers with independent Thinking generation and trace visibility
+- Attach UTF-8 text and images only to models with confirmed vision capability
+- Persist Japanese / English, System / Light / Dark, and font size 10–32
+- Per-conversation Web Search, off by default: Brave Search or Ollama Web Search APIs, or Taceta Link browser-default search, Google Search, and ChatGPT Web
 
-Thinking traces are never added to the next conversation input. Hiding a trace does not stop generation; execution and presentation are separate settings. Available controls are capability-driven and are not advertised for models whose behavior has not been confirmed.
+Web OFF is completely local. Web ON automatically applies the configured executor. Browser and search output is untrusted external context; local Ollama always generates the final answer. Web ON + Send authorizes one web request. ChatGPT Web receives exactly the current prompt, never history, system messages, attachments, or Thinking traces. Account and destructive actions still require confirmation.
 
-## Requirements and setup
+## Product layout
+
+One Git repository and product version contain two physically separate components: the Rust app in `src/` and the independent extension in `browser-extension/`. Taceta Link is a local Manifest V3 + Native Messaging Host (`org.mlabo.taceta.link`) + user-only Unix socket path. Taceta has no runtime dependency on Codex, external browser plugins, Node companions, or cookie/token export.
+
+The extension prefers an existing focused normal window as its route container and creates an inactive agent tab and group there; it creates a non-focused normal window only when none exists. The window is never owned or closed. Taceta tracks only its exact agent tab/group, then ungroups and removes that agent tab at the end of the session. Mismatched product or protocol versions fail closed. The fixed extension ID is `hefhkgbiiajifedgjlbiklclooifkidg`.
+
+## Requirements
 
 - macOS 13.0 or later (Apple Silicon is the primary target)
 - Rust 1.92 or later for development builds
-- Install [Ollama](https://ollama.com/) separately as the local inference backend and run it at the default loopback endpoint, `http://127.0.0.1:11434`
+- [Ollama](https://ollama.com/) installed separately at `http://127.0.0.1:11434`
+- Brave or Chrome for Taceta Link
 
-Taceta does not bundle or redistribute the Ollama application or any model. Retrieve and remove models explicitly from the Manage models screen. Model licenses differ by model; review the terms from each model's distributor before use.
+Taceta does not bundle or redistribute Ollama or models. Model retrieval and removal are explicit user actions in Model Manager. Provider API keys, where required, are stored in the macOS Keychain.
+
+## First-time Taceta Link setup
+
+Taceta detects the macOS default browser. Initial support is Brave and Chrome. It materializes the extension under Taceta Application Support (`~/Library/Application Support/Taceta/browser-extension`), registers the browser-specific Native Messaging Host, and verifies the version and extension ID. It then opens the extension-management page and guides the only manual browser approval:
+
+1. Open `brave://extensions` or `chrome://extensions`.
+2. Turn on Developer mode.
+3. Choose **Load unpacked** / **Add**, then select the `browser-extension` folder in the Taceta Application Support directory shown by Taceta.
+4. Confirm extension ID `hefhkgbiiajifedgjlbiklclooifkidg` and the Taceta Link version.
+
+The final browser approval is manual by design. Taceta cannot silently approve or install an unpacked extension. On updates, it guides the user to press **Reload**. Safari and other unsupported default browsers are directed to install Brave or Chrome and make one the default; Taceta does not register against an unsupported browser.
 
 ## Build and launch
-
-For development:
 
 ```bash
 cargo run
 ```
-
-To materialize the prebuilt native app bundle for normal use, run this from the repository root:
 
 ```bash
 ./scripts/build-macos-app.sh
 open ./dist/Taceta.app
 ```
 
-The script places the release binary at `dist/Taceta.app/Contents/MacOS/Taceta` and creates `Info.plist`. `target/` and `dist/` are generated artifacts, not source. Signing, notarization, and installer creation are outside this script's scope.
+Signing, notarization, and installer creation are outside this script.
 
-## Public-use boundary and disclaimer
+## Scope and license
 
-Taceta is not officially affiliated with, endorsed by, or sponsored by Ollama or OpenAI / Codex. Ollama is used as a replaceable local backend. Names and trademarks remain the property of their respective owners. Taceta's code is released under the MIT License; connected models, dependencies, and macOS remain subject to their own licenses and terms.
-
-## Future extension boundary
-
-Web Search is an explicit per-conversation feature. Brave Search is the default provider and Ollama Web Search is optional; both use keys stored in the macOS Keychain. Future Codex harness integration is not implemented and must not be read as a current feature. See [`docs/architecture.md`](docs/architecture.md) for the responsibility boundary and staged roadmap.
-
-## Acknowledgements
-
-The local inference connection refers to Ollama's public API specification. Thanks to the Ollama project and the authors of the models used with Taceta.
-
-## License
-
-Copyright (c) 2026 Makoto Suzuki. Taceta's code is released under the [MIT License](LICENSE).
+Taceta is not officially affiliated with, endorsed by, or sponsored by Ollama. A future typed agent-harness boundary may be added after the GUI is complete, but it is not a current dependency or launch route. Taceta's code is released under the [MIT License](LICENSE). Copyright (c) 2026 Makoto Suzuki.

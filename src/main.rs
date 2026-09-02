@@ -1,6 +1,7 @@
 mod app;
 mod app_shell_foundation;
 mod localization;
+mod markdown;
 mod persistence;
 mod ui;
 

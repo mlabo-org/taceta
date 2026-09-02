@@ -35,6 +35,11 @@ use crate::{
     ui::theme::{self, TacetaPalette},
 };
 use taceta::web_search::{self, ProviderKind};
+use taceta::{
+    domain::WebAuthorization,
+    taceta_link_installer::{self, BrowserDetection, InstallStatus, Installer},
+    taceta_link_service::TacetaLinkService,
+};
 
 const APP_SHELL_STORAGE_KEY: &str = "taceta.app-shell-preferences.v1";
 const LOCAL_ENGINE_URL: &str = "http://127.0.0.1:11434";
@@ -108,9 +113,20 @@ pub struct TacetaApp {
     delete_confirmation: Option<String>,
     delete_result_rx: std_mpsc::Receiver<Result<String, String>>,
     delete_result_tx: std_mpsc::Sender<Result<String, String>>,
+    link_service: Arc<TacetaLinkService>,
+    link_installer: Installer,
+    link_status: Option<InstallStatus>,
+    link_setup_open: bool,
 }
 
 impl TacetaApp {
+    fn prepare_startup_link_setup(
+        installer: &Installer,
+        detected: BrowserDetection,
+    ) -> Result<InstallStatus, String> {
+        installer.setup(detected).map_err(|error| error.to_string())
+    }
+
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         install_macos_system_fonts(&creation_context.egui_ctx)
             .expect("Taceta could not install its managed macOS UI fonts");
@@ -127,13 +143,49 @@ impl TacetaApp {
         let (model_result_tx, model_result_rx) = std_mpsc::channel();
         let (model_manager_result_tx, model_manager_result_rx) = std_mpsc::channel();
         let (delete_result_tx, delete_result_rx) = std_mpsc::channel();
+        let link_service = Arc::new(TacetaLinkService::default());
+        #[cfg(unix)]
+        {
+            if let Ok(path) = taceta::browser_harness::default_socket_path() {
+                if let Ok(server) = taceta::browser_harness::SocketServer::bind(&path) {
+                    let service = Arc::clone(&link_service);
+                    std::thread::Builder::new()
+                        .name("taceta-link-socket".into())
+                        .spawn(move || {
+                            loop {
+                                match server.accept() {
+                                    Ok(stream) => {
+                                        let service = Arc::clone(&service);
+                                        let _ = std::thread::spawn(move || {
+                                            let _ = service.serve_connection(stream);
+                                        });
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        })
+                        .ok();
+                }
+            }
+        }
+        let app_bundle = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(PathBuf::from))
+            .and_then(|path| path.parent().map(PathBuf::from))
+            .and_then(|path| path.parent().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("/Applications/Taceta.app"));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
 
         let mut app = Self {
             shell_preferences,
             system_language: system_language(),
             state: load_app_state(creation_context.storage),
             screen: Screen::Chat,
-            backend: Arc::new(OllamaClient::new(LOCAL_ENGINE_URL)),
+            backend: Arc::new(
+                OllamaClient::new(LOCAL_ENGINE_URL).with_link_service(Arc::clone(&link_service)),
+            ),
             model_manager: Arc::new(OllamaModelManager::new(LOCAL_ENGINE_URL)),
             runtime,
             model_result_tx,
@@ -154,7 +206,42 @@ impl TacetaApp {
             delete_confirmation: None,
             delete_result_rx,
             delete_result_tx,
+            link_service,
+            link_installer: Installer::new(home, app_bundle),
+            link_status: None,
+            link_setup_open: false,
         };
+        // Startup owns local materialization and Native Messaging registration.
+        // Browser activation and internal-page navigation remain explicit user steps.
+        match taceta_link_installer::detect_default_browser() {
+            Ok(detected @ BrowserDetection::Supported(_)) => {
+                match Self::prepare_startup_link_setup(&app.link_installer, detected) {
+                    Ok(status) => {
+                        app.link_setup_open = status.needs_load_unpacked || status.needs_reload;
+                        app.notice = Some(Notice {
+                            kind: NoticeKind::Info,
+                            text: text(app.language(), "Taceta Linkを準備しました。ブラウザー側でLoad unpacked／追加を一度だけ完了してください。", "Taceta Link is prepared. Complete Load unpacked / Add in the browser once.").to_owned(),
+                        });
+                        app.link_status = Some(status);
+                    }
+                    Err(error) => {
+                        app.notice = Some(Notice {
+                            kind: NoticeKind::Error,
+                            text: error,
+                        });
+                    }
+                }
+            }
+            Ok(BrowserDetection::Unsupported { .. }) => {
+                app.notice = Some(Notice { kind: NoticeKind::Warning, text: text(app.language(), "既定ブラウザーはTaceta Link未対応です。BraveまたはChromeを選択してください。", "The default browser is unsupported by Taceta Link. Choose Brave or Chrome.").to_owned() });
+            }
+            Err(error) => {
+                app.notice = Some(Notice {
+                    kind: NoticeKind::Error,
+                    text: error.to_string(),
+                });
+            }
+        }
         app.refresh_models();
         app
     }
@@ -787,6 +874,10 @@ impl TacetaApp {
             ),
             max_search_results: self.state.max_search_results,
             fetch_search_pages: self.state.fetch_search_pages,
+            web_authorization: web_search_enabled.then(|| WebAuthorization {
+                request_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+            }),
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (result_tx, result_rx) = std_mpsc::channel();
@@ -1044,6 +1135,135 @@ impl TacetaApp {
         }
     }
 
+    fn show_link_settings(&mut self, ui: &mut Ui, language: AppShellLanguage) {
+        let extension_connected = self.link_service.is_extension_connected();
+        if self.link_status.is_some() {
+            if let Some(status) = self.link_status.as_mut() {
+                status.extension_connection = extension_connected;
+            }
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(15));
+        }
+        let status_text = self
+            .link_status
+            .as_ref()
+            .map(|status| {
+                let browser = status
+                    .browser
+                    .as_ref()
+                    .map(|browser| browser.display_name())
+                    .unwrap_or("Unsupported");
+                format!(
+                    "{} · {} · {}",
+                    browser,
+                    if status.extension_connection {
+                        text(language, "接続済み", "Connected")
+                    } else {
+                        text(language, "未接続", "Not connected")
+                    },
+                    if status.version_match {
+                        text(language, "version一致", "Version match")
+                    } else {
+                        text(language, "要確認", "Needs attention")
+                    }
+                )
+            })
+            .unwrap_or_else(|| text(language, "未セットアップ", "Not set up").to_owned());
+        ui.label(RichText::new(status_text).weak());
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(text(language, "Taceta Linkをセットアップ", "Set up Taceta Link")).clicked() {
+                match taceta_link_installer::detect_default_browser() {
+                    Ok(BrowserDetection::Supported(browser)) => {
+                        match self
+                            .link_installer
+                            .setup(BrowserDetection::Supported(browser.clone()))
+                        {
+                            Ok(status) => {
+                                let url = browser.management_url();
+                                let browser_opened = Command::new("open")
+                                    .args(["-b", browser.bundle_id()])
+                                    .status()
+                                    .map(|status| status.success())
+                                    .unwrap_or(false);
+                                self.link_status = Some(status);
+                                self.link_setup_open = true;
+                                self.notice = Some(Notice {
+                                    kind: if browser_opened { NoticeKind::Info } else { NoticeKind::Warning },
+                                    text: if browser_opened {
+                                        format!("{} {} {}", text(language, "セットアップ準備ができました。", "Setup is ready."), text(language, "ブラウザーのアドレスバーに次のURLを入力してください:", "Type this URL in the browser address bar:"), url)
+                                    } else {
+                                        format!("{} {}", text(language, "セットアップ準備はできました。ブラウザーを起動できなかったため、手動で起動して次のURLを入力してください:", "Setup is ready. The browser could not be activated; open it manually and type:"), url)
+                                    },
+                                });
+                            }
+                            Err(error) => self.notice = Some(Notice { kind: NoticeKind::Error, text: error.to_string() }),
+                        }
+                    }
+                    Ok(BrowserDetection::Unsupported { .. }) => {
+                        self.notice = Some(Notice { kind: NoticeKind::Warning, text: text(language, "既定ブラウザーを利用できません。BraveまたはChromeを選択してください。", "The default browser is unsupported. Choose Brave or Chrome.").to_owned() });
+                    }
+                    Err(error) => {
+                        self.notice = Some(Notice { kind: NoticeKind::Error, text: error.to_string() });
+                    }
+                }
+            }
+            if let Some(status) = self.link_status.as_ref() {
+                if ui.button(text(language, "接続を再確認", "Recheck connection")).clicked() {
+                    self.notice = Some(Notice { kind: if extension_connected { NoticeKind::Info } else { NoticeKind::Warning }, text: if extension_connected { text(language, "Taceta Linkに接続しています。", "Taceta Link is connected.") } else { text(language, "Taceta Linkは未接続です。拡張機能を起動してから再確認してください。", "Taceta Link is not connected. Start the extension, then recheck.") }.to_owned() });
+                    let _ = status;
+                }
+                if ui.button(text(language, "ブラウザーを起動", "Activate browser")).clicked() {
+                    if let Some(browser) = status.browser.as_ref() {
+                        let command = "open";
+                        if Command::new(command)
+                            .args(["-b", browser.bundle_id()])
+                            .status()
+                            .map(|status| !status.success())
+                            .unwrap_or(true)
+                        {
+                            self.notice = Some(Notice { kind: NoticeKind::Warning, text: text(language, "ブラウザーを起動できませんでした。管理URLを手動で入力してください。", "Could not activate the browser. Enter the management URL manually.").to_owned() });
+                        }
+                    }
+                }
+                if ui.button(text(language, "管理URLをコピー", "Copy management URL")).clicked() {
+                    if let Some(browser) = status.browser.as_ref() {
+                        ui.ctx().copy_text(browser.management_url().to_owned());
+                        self.notice = Some(Notice { kind: NoticeKind::Info, text: text(language, "管理URLをコピーしました。ブラウザーのアドレスバーに貼り付けてください。", "Management URL copied. Paste it into the browser address bar.").to_owned() });
+                    }
+                }
+                if ui.button(text(language, "フォルダを表示", "Reveal folder")).clicked() {
+                    let (command, path) = self.link_installer.reveal_materialized_command();
+                    let _ = Command::new(command).arg(path).status();
+                }
+                if ui.button(text(language, "パスをコピー", "Copy path")).clicked() {
+                    ui.ctx().copy_text(status.materialized_path.display().to_string());
+                }
+            }
+        });
+        if self.link_setup_open {
+            egui::Window::new(text(language, "Taceta Linkの初回セットアップ", "First-time Taceta Link setup"))
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(text(language, "ブラウザー側で次の手順を一度だけ行います。", "Complete these browser steps once."));
+                    ui.label(text(language, "1. ブラウザーを起動する", "1. Activate the browser"));
+                    ui.label(text(language, "2. アドレスバーに管理URLを入力する", "2. Type the management URL in the address bar"));
+                    ui.label(text(language, "3. Developer mode をONにする", "3. Turn on Developer mode"));
+                    ui.label(text(language, "4. Load unpacked／追加を選び、表示されたフォルダを選ぶ", "4. Choose Load unpacked / Add, then select the revealed folder"));
+                    if let Some(status) = self.link_status.as_ref() {
+                        if let Some(browser) = status.browser.as_ref() {
+                            ui.label(format!("URL: {}", browser.management_url()));
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(text(language, "Safariは未対応です。BraveまたはChromeを使用してください。更新後は拡張機能のReloadが必要です。", "Safari is unsupported. Use Brave or Chrome. After an update, reload the extension.")).weak());
+                    if ui.button(text(language, "閉じる", "Close")).clicked() {
+                        self.link_setup_open = false;
+                    }
+                });
+        }
+    }
+
     fn show_settings(&mut self, root_ui: &mut Ui) {
         let language = self.language();
         CentralPanel::default().show_inside(root_ui, |ui| {
@@ -1053,6 +1273,7 @@ impl TacetaApp {
                     ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
                     ui.vertical(|ui| {
                         ui.set_width(width);
+                        self.show_notice(ui);
                         ui.add_space(28.0);
                         ui.heading(text(language, "設定", "Settings"));
                         ui.add_space(6.0);
@@ -1113,8 +1334,25 @@ impl TacetaApp {
                             )).weak());
                             ui.add_space(10.0);
                             ui.horizontal(|ui| {
-                                ui.label(text(language, "検索プロバイダー", "Search provider"));
-                                for provider in [ProviderKind::Brave, ProviderKind::Ollama] {
+                                ui.label(text(language, "Web実行方式", "Web executor"));
+                                let api_selected = matches!(self.state.web_search_provider, ProviderKind::Brave | ProviderKind::Ollama);
+                                if ui.selectable_label(api_selected, "API").clicked() && !api_selected {
+                                    self.state.web_search_provider = ProviderKind::Brave;
+                                }
+                                let link_selected = matches!(self.state.web_search_provider, ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb);
+                                if ui.selectable_label(link_selected, "Taceta Link").clicked() && !link_selected {
+                                    self.state.web_search_provider = ProviderKind::DefaultSearch;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let api_selected = matches!(self.state.web_search_provider, ProviderKind::Brave | ProviderKind::Ollama);
+                                ui.label(text(language, if api_selected { "APIプロバイダー" } else { "ブラウザーワークフロー" }, if api_selected { "API provider" } else { "Browser workflow" }));
+                                let providers = if api_selected {
+                                    [ProviderKind::Brave, ProviderKind::Ollama, ProviderKind::Unknown, ProviderKind::Unknown, ProviderKind::Unknown]
+                                } else {
+                                    [ProviderKind::DefaultSearch, ProviderKind::GoogleSearch, ProviderKind::ChatGptWeb, ProviderKind::Unknown, ProviderKind::Unknown]
+                                };
+                                for provider in providers.into_iter().filter(|p| *p != ProviderKind::Unknown) {
                                     if ui.selectable_label(self.state.web_search_provider == provider, provider.label()).clicked() {
                                         self.state.web_search_provider = provider;
                                     }
@@ -1151,6 +1389,19 @@ impl TacetaApp {
                                     let status = if web_search::has_keychain_secret(account) { text(language, "設定済み", "Configured") } else { text(language, "未設定", "Not configured") };
                                     ui.label(RichText::new(status).weak());
                                 });
+                            } else if matches!(
+                                self.state.web_search_provider,
+                                ProviderKind::DefaultSearch
+                                    | ProviderKind::GoogleSearch
+                                    | ProviderKind::ChatGptWeb
+                            ) {
+                                ui.add_space(8.0);
+                                ui.label(RichText::new(text(
+                                    language,
+                                    "Taceta Link経由で、選択したブラウザー操作を実行します。APIキーは不要です。",
+                                    "Runs the selected browser workflow through Taceta Link. No API key is required.",
+                                )).weak());
+                                self.show_link_settings(ui, language);
                             } else {
                             }
                         });
@@ -1592,7 +1843,7 @@ impl TacetaApp {
                             ui.add_space(10.0);
                         }
                         if !message.content.is_empty() {
-                            ui.label(&message.content);
+                            crate::markdown::show(ui, &message.content);
                         } else if generating {
                             ui.horizontal(|ui| {
                                 ui.add(Spinner::new().size(14.0));
@@ -2202,6 +2453,7 @@ fn is_web_search_error(error: &str) -> bool {
         "tool support",
         "tool call",
         "keychain credential",
+        "taceta link",
     ]
     .iter()
     .any(|marker| error.contains(marker))
@@ -2219,6 +2471,45 @@ fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
     }
     if lower.contains("keychain credential") && lower.contains("ollama") {
         return text(language, "Ollama Web Search APIキーが未設定です。設定でAPIキーを保存してから再試行してください。", "The Ollama Web Search API key is not configured. Save it in Settings, then try again.").to_owned();
+    }
+    if lower.contains("authentication is required") {
+        return text(
+            language,
+            "ChatGPT Webのログインが必要です。ログイン済みブラウザーを確認してから再試行してください。",
+            "ChatGPT Web requires login. Check the logged-in browser, then try again.",
+        )
+        .to_owned();
+    }
+    if lower.contains("taceta link") && lower.contains("unavailable") {
+        return text(
+            language,
+            "Taceta Linkに接続できません。拡張機能を確認してから再試行してください。",
+            "Taceta Link is unavailable. Check the extension, then try again.",
+        )
+        .to_owned();
+    }
+    if lower.contains("timed out") {
+        let browser_label = if lower.contains("google_search") {
+            text(language, "Google検索", "Google Search")
+        } else if lower.contains("default_search") {
+            text(language, "ブラウザー検索", "Browser Search")
+        } else if lower.contains("chatgpt_web") {
+            text(language, "ChatGPT Web", "ChatGPT Web")
+        } else {
+            text(language, "ブラウザーワークフロー", "Browser workflow")
+        };
+        return text(
+            language,
+            &format!("{browser_label}がタイムアウトしました。再試行してください。"),
+            &format!("{browser_label} timed out. Try again."),
+        )
+        .to_owned();
+    }
+    if lower.contains("ambiguous") {
+        return text(language, "ChatGPT Webの送信結果を確認できませんでした。自動再送はしていません。明示的に再試行してください。", "The ChatGPT Web submission outcome is unknown. It was not retried automatically; retry explicitly.").to_owned();
+    }
+    if lower.contains("does not support fetching") {
+        return text(language, "ChatGPT Webは個別ページ取得に対応していません。検索結果だけで再試行してください。", "ChatGPT Web does not support individual page fetching. Retry with search results only.").to_owned();
     }
     text(
         language,
@@ -2253,6 +2544,19 @@ mod model_manager_tests {
         pulls: Arc<AtomicUsize>,
         deletes: Arc<AtomicUsize>,
         listed: Vec<ModelDescriptor>,
+    }
+
+    #[test]
+    fn startup_link_setup_routes_unsupported_browser_to_user_error() {
+        let installer = Installer::new("/tmp/taceta-test-home", "/tmp/Taceta.app");
+        let result = TacetaApp::prepare_startup_link_setup(
+            &installer,
+            BrowserDetection::Unsupported {
+                bundle_id: Some("com.apple.Safari".to_owned()),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unsupported default browser"));
     }
 
     impl FakeModelManager {
@@ -2403,5 +2707,22 @@ mod web_search_request_tests {
                 .contains("Ollama Web Search APIキーが未設定です")
         );
         assert!(!is_web_search_error("Ollama endpoint is unavailable"));
+    }
+
+    #[test]
+    fn browser_timeout_message_keeps_the_selected_workflow() {
+        let language = AppShellLanguage::Japanese;
+        assert!(
+            web_search_error_message("Taceta Link google_search request timed out", language)
+                .contains("Google検索")
+        );
+        assert!(
+            !web_search_error_message("Taceta Link google_search request timed out", language)
+                .contains("ChatGPT Web")
+        );
+        assert!(
+            web_search_error_message("Taceta Link chatgpt_web request timed out", language)
+                .contains("ChatGPT Web")
+        );
     }
 }

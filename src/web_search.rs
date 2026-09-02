@@ -23,6 +23,9 @@ pub const KEYCHAIN_SERVICE: &str = "org.mlabo.taceta.web-search";
 pub enum ProviderKind {
     Brave,
     Ollama,
+    DefaultSearch,
+    GoogleSearch,
+    ChatGptWeb,
     #[serde(other)]
     Unknown,
 }
@@ -38,7 +41,10 @@ impl ProviderKind {
         match self {
             Self::Brave => "Brave Search",
             Self::Ollama => "Ollama Web Search",
-            Self::Unknown => "Brave Search",
+            Self::DefaultSearch => "Default Browser Search",
+            Self::GoogleSearch => "Google Search",
+            Self::ChatGptWeb => "ChatGPT Web",
+            Self::Unknown => "Unconfigured Web Executor",
         }
     }
 
@@ -47,7 +53,10 @@ impl ProviderKind {
         match self {
             Self::Brave => "brave",
             Self::Ollama => "ollama",
-            Self::Unknown => "brave",
+            Self::DefaultSearch => "default_search",
+            Self::GoogleSearch => "google_search",
+            Self::ChatGptWeb => "chatgpt_web",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -55,7 +64,8 @@ impl ProviderKind {
         match self {
             Self::Brave => Some("brave"),
             Self::Ollama => Some("ollama"),
-            Self::Unknown => Some("brave"),
+            Self::DefaultSearch | Self::GoogleSearch | Self::ChatGptWeb => None,
+            Self::Unknown => None,
         }
     }
 }
@@ -78,8 +88,8 @@ pub struct FetchedPage {
 /// search is explicitly enabled for a conversation.
 pub fn tool_definitions() -> serde_json::Value {
     serde_json::json!([
-        {"type":"function","function":{"name":"web_search","description":"Search the web and return up to five sources.","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":5}},"required":["query"]}}},
-        {"type":"function","function":{"name":"web_fetch","description":"Fetch readable text from one public web URL.","parameters":{"type":"object","properties":{"url":{"type":"string","maxLength":2048}},"required":["url"]}}}
+        {"type":"function","function":{"name":"web_search","description":"Search the web and return up to five sources. For factual answers, inspect one to five relevant returned sources with web_fetch before synthesizing the answer.","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":5}},"required":["query"]}}},
+        {"type":"function","function":{"name":"web_fetch","description":"Fetch readable text from one public HTTPS URL. After web_search, fetch one to five relevant independent sources before synthesizing a factual answer.","parameters":{"type":"object","properties":{"url":{"type":"string","maxLength":2048}},"required":["url"]}}}
     ])
 }
 
@@ -137,6 +147,14 @@ pub enum WebError {
     MissingCredential(&'static str),
     #[error("Keychain access failed")]
     Keychain,
+    #[error("Taceta Link is unavailable")]
+    LinkUnavailable,
+    #[error("browser authentication is required")]
+    AuthRequired,
+    #[error("browser request timed out")]
+    Timeout,
+    #[error("browser request outcome is ambiguous; retry explicitly")]
+    Ambiguous,
 }
 
 #[derive(Clone)]
@@ -154,33 +172,46 @@ impl WebSearchProvider {
     pub fn ollama() -> Result<Self, WebError> {
         Self::new(ProviderKind::Ollama, keychain_secret("ollama"))
     }
-
     pub fn from_kind(kind: ProviderKind) -> Result<Self, WebError> {
         match kind {
             ProviderKind::Brave => Self::brave(),
             ProviderKind::Ollama => Self::ollama(),
-            ProviderKind::Unknown => Self::brave(),
+            ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
+                Err(WebError::LinkUnavailable)
+            }
+            ProviderKind::Unknown => Err(WebError::Protocol("unknown web provider".into())),
         }
     }
 
     fn new(kind: ProviderKind, bearer: Option<String>) -> Result<Self, WebError> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("Taceta/0.1 (+local web search)")
-            .build()?;
         let endpoint = match kind {
             ProviderKind::Brave => "https://api.search.brave.com/res/v1/web/search".into(),
             ProviderKind::Ollama => "https://ollama.com/api/web_search".into(),
-            ProviderKind::Unknown => "https://api.search.brave.com/res/v1/web/search".into(),
+            ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
+                return Err(WebError::LinkUnavailable);
+            }
+            ProviderKind::Unknown => return Err(WebError::Protocol("unknown web provider".into())),
         };
-        if bearer.is_none() {
+        Self::new_with_endpoint(kind, endpoint, bearer)
+    }
+
+    fn new_with_endpoint(
+        kind: ProviderKind,
+        endpoint: String,
+        bearer: Option<String>,
+    ) -> Result<Self, WebError> {
+        if bearer.as_deref().is_none_or(str::is_empty) {
             return Err(WebError::MissingCredential(match kind {
                 ProviderKind::Brave => "Brave",
                 _ => "Ollama",
             }));
         }
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(45))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("Taceta/0.1 (+local web search)")
+            .build()?;
         Ok(Self {
             kind,
             client,
@@ -220,6 +251,9 @@ impl WebSearchProvider {
                 .send()
                 .await
                 .map_err(|error| transport_error("search", &error))?,
+            ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
+                return Err(WebError::LinkUnavailable);
+            }
         };
         let response = response
             .error_for_status()
@@ -250,13 +284,22 @@ impl WebSearchProvider {
                     snippet: r.content,
                 })
                 .collect()),
+            ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
+                Err(WebError::LinkUnavailable)
+            }
         }
     }
 
     /// Fetches one page with manual redirect validation so every hop receives
     /// the same SSRF checks. Only http(s), public IPs and text-like content are allowed.
     pub async fn fetch(&self, url: &str) -> Result<FetchedPage, WebError> {
-        let validated = validate_url(url)?;
+        let validated = validate_public_url(url)?;
+        if matches!(
+            self.kind,
+            ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb
+        ) {
+            return Err(WebError::LinkUnavailable);
+        }
         if self.kind == ProviderKind::Ollama {
             let response = self
                 .client
@@ -290,7 +333,7 @@ impl WebSearchProvider {
                     .get(header::LOCATION)
                     .and_then(|v| v.to_str().ok())
                     .ok_or_else(|| WebError::Protocol("redirect without Location".into()))?;
-                current = validate_url(
+                current = validate_public_url(
                     current
                         .join(location)
                         .map_err(|_| WebError::UnsafeUrl(location.into()))?
@@ -396,7 +439,10 @@ pub fn has_keychain_secret(account: &str) -> bool {
     keychain_secret(account).is_some()
 }
 
-fn validate_url(raw: &str) -> Result<Url, WebError> {
+/// Validates a URL before it is handed to a network-capable web provider or
+/// browser workflow.  It rejects non-web schemes, embedded credentials, and
+/// addresses that resolve to local or private networks.
+pub fn validate_public_url(raw: &str) -> Result<Url, WebError> {
     if raw.len() > MAX_URL {
         return Err(WebError::UnsafeUrl("URL too long".into()));
     }
@@ -526,10 +572,10 @@ mod tests {
     use super::*;
     #[test]
     fn rejects_ssrf_targets() {
-        assert!(validate_url("http://127.0.0.1/").is_err());
-        assert!(validate_url("http://localhost/").is_err());
-        assert!(validate_url("file:///tmp/a").is_err());
-        assert!(validate_url("http://user:pass@example.com/").is_err());
+        assert!(validate_public_url("http://127.0.0.1/").is_err());
+        assert!(validate_public_url("http://localhost/").is_err());
+        assert!(validate_public_url("file:///tmp/a").is_err());
+        assert!(validate_public_url("http://user:pass@example.com/").is_err());
     }
     #[test]
     fn clamps_result_limit() {
@@ -542,6 +588,21 @@ mod tests {
         assert_eq!(tools.as_array().unwrap().len(), 2);
         assert_eq!(tools[0]["function"]["name"], "web_search");
         assert_eq!(tools[1]["function"]["name"], "web_fetch");
+    }
+
+    #[test]
+    fn browser_workflows_never_open_a_direct_provider() {
+        for kind in [
+            ProviderKind::DefaultSearch,
+            ProviderKind::GoogleSearch,
+            ProviderKind::ChatGptWeb,
+            ProviderKind::Unknown,
+        ] {
+            assert!(matches!(
+                WebSearchProvider::from_kind(kind),
+                Err(WebError::LinkUnavailable | WebError::Protocol(_))
+            ));
+        }
     }
 
     #[test]
