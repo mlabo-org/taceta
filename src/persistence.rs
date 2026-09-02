@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use taceta::backend::OllamaEndpointMode;
 use taceta::domain::{Attachment, ChatMessage, ThinkingMode};
 use taceta::web_search::ProviderKind;
 use uuid::Uuid;
@@ -64,6 +65,12 @@ pub struct PersistedAppState {
     pub max_search_results: u8,
     #[serde(default)]
     pub fetch_search_pages: bool,
+    /// Automatic mode follows Ollama's macOS OLLAMA_HOST configuration.
+    #[serde(default)]
+    pub ollama_endpoint_mode: OllamaEndpointMode,
+    /// Retained while automatic mode is active so switching modes is reversible.
+    #[serde(default)]
+    pub ollama_custom_endpoint: String,
     /// Whether the one-time Taceta Link browser setup guide was acknowledged.
     /// Missing fields are treated as acknowledged so upgrades do not repeat
     /// the guide for existing users.
@@ -86,6 +93,8 @@ impl Default for PersistedAppState {
             web_search_provider: ProviderKind::Brave,
             max_search_results: 5,
             fetch_search_pages: true,
+            ollama_endpoint_mode: OllamaEndpointMode::Auto,
+            ollama_custom_endpoint: String::new(),
             taceta_link_setup_acknowledged: false,
         }
     }
@@ -384,5 +393,27 @@ mod tests {
         .unwrap();
         let restored: PersistedAppState = serde_json::from_value(value).unwrap();
         assert!(restored.taceta_link_setup_acknowledged);
+    }
+
+    #[test]
+    fn legacy_state_uses_automatic_ollama_endpoint_resolution() {
+        let state: PersistedAppState = serde_json::from_value(serde_json::json!({})).unwrap();
+
+        assert_eq!(state.ollama_endpoint_mode, OllamaEndpointMode::Auto);
+        assert!(state.ollama_custom_endpoint.is_empty());
+    }
+
+    #[test]
+    fn custom_ollama_endpoint_round_trips() {
+        let state = PersistedAppState {
+            ollama_endpoint_mode: OllamaEndpointMode::Custom,
+            ollama_custom_endpoint: "http://127.0.0.1:23456".to_owned(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(state).unwrap();
+        let restored: PersistedAppState = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.ollama_endpoint_mode, OllamaEndpointMode::Custom);
+        assert_eq!(restored.ollama_custom_endpoint, "http://127.0.0.1:23456");
     }
 }

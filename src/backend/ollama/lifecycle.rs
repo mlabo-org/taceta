@@ -1,3 +1,4 @@
+use super::endpoint::OllamaEndpoint;
 use crate::backend::BackendError;
 use std::{
     collections::HashMap,
@@ -11,18 +12,18 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
 const READY_DEADLINE: Duration = Duration::from_secs(10);
 static START_LOCKS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
 
 pub(super) async fn ensure_ready(
     http: &reqwest::Client,
-    base_url: &str,
+    endpoint: &OllamaEndpoint,
 ) -> Result<(), BackendError> {
+    let base_url = endpoint.base_url();
     if is_reachable(http, base_url).await? {
         return Ok(());
     }
-    if base_url != DEFAULT_BASE_URL {
+    if !endpoint.allows_auto_start() {
         return Err(BackendError::OllamaUnavailable);
     }
     let lock = {
