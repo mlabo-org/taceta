@@ -1,4 +1,7 @@
-use eframe::egui::{Grid, Label, RichText, ScrollArea, TextStyle, Ui};
+use eframe::egui::{
+    Grid, Label, RichText, ScrollArea, TextStyle, Ui, containers::scroll_area::ScrollBarVisibility,
+    style::ScrollStyle,
+};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
 const MIN_TABLE_COLUMN_WIDTH: f32 = 120.0;
@@ -434,11 +437,21 @@ fn render_table(ui: &mut Ui, children: &[Node], list_depth: usize, next_table_id
 
     ui.group(|ui| {
         ui.take_available_width();
-        let layout = responsive_table_layout(ui.available_width(), column_count);
+        let available_width = ui.available_width();
+        let layout = responsive_table_layout(available_width, column_count);
+
+        let scroll_bar_visibility = if layout.needs_horizontal_scroll {
+            ui.style_mut().spacing.scroll = ScrollStyle::solid();
+            ScrollBarVisibility::AlwaysVisible
+        } else {
+            ScrollBarVisibility::VisibleWhenNeeded
+        };
 
         ScrollArea::horizontal()
             .id_salt(id.with("horizontal-scroll"))
+            .max_width(available_width)
             .auto_shrink([false, true])
+            .scroll_bar_visibility(scroll_bar_visibility)
             .show(ui, |ui| {
                 ui.set_width(layout.table_width);
                 Grid::new(id)
@@ -478,6 +491,7 @@ fn render_table(ui: &mut Ui, children: &[Node], list_depth: usize, next_table_id
 struct ResponsiveTableLayout {
     column_width: f32,
     table_width: f32,
+    needs_horizontal_scroll: bool,
 }
 
 fn responsive_table_layout(available_width: f32, column_count: usize) -> ResponsiveTableLayout {
@@ -487,9 +501,12 @@ fn responsive_table_layout(available_width: f32, column_count: usize) -> Respons
         / column_count as f32)
         .max(MIN_TABLE_COLUMN_WIDTH);
 
+    let table_width = responsive_column_width * column_count as f32 + spacing_width;
+
     ResponsiveTableLayout {
         column_width: responsive_column_width,
-        table_width: responsive_column_width * column_count as f32 + spacing_width,
+        table_width,
+        needs_horizontal_scroll: table_width > available_width.max(0.0),
     }
 }
 
@@ -595,13 +612,16 @@ mod tests {
         let wide = responsive_table_layout(900.0, 3);
         assert_eq!(wide.table_width, 900.0);
         assert!(wide.column_width > 290.0);
+        assert!(!wide.needs_horizontal_scroll);
 
         let wider = responsive_table_layout(1_200.0, 3);
         assert!(wider.column_width > wide.column_width);
         assert_eq!(wider.table_width, 1_200.0);
+        assert!(!wider.needs_horizontal_scroll);
 
         let narrow = responsive_table_layout(240.0, 3);
         assert_eq!(narrow.column_width, MIN_TABLE_COLUMN_WIDTH);
         assert!(narrow.table_width > 240.0);
+        assert!(narrow.needs_horizontal_scroll);
     }
 }
