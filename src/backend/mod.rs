@@ -1,7 +1,8 @@
 mod ollama;
 
 use crate::domain::{
-    ChatRequest, GenerationEvent, ModelDescriptor, ModelManagerEvent, ModelPullRequest,
+    ChatRequest, GenerationEvent, ModelCandidate, ModelDescriptor, ModelManagerEvent,
+    ModelPullRequest,
 };
 use std::{future::Future, pin::Pin};
 use tokio::sync::mpsc::UnboundedSender;
@@ -39,6 +40,7 @@ pub trait InferenceBackend: Send + Sync {
 /// returned future cancels an in-flight pull by closing its HTTP stream.
 pub trait ModelManager: Send + Sync {
     fn list_installed(&self) -> BackendFuture<Vec<ModelDescriptor>>;
+    fn list_available(&self, model: String) -> BackendFuture<Vec<ModelCandidate>>;
     fn pull(
         &self,
         request: ModelPullRequest,

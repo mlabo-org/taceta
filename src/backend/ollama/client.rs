@@ -5,8 +5,8 @@ use super::{
 use crate::{
     backend::{BackendError, BackendFuture, InferenceBackend, ModelManager},
     domain::{
-        AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelDescriptor,
-        ModelManagerEvent, ModelPullRequest, Role, ThinkingMode,
+        AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelCandidate,
+        ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingMode,
     },
     taceta_link_service::{self, TacetaLinkService},
     web_search::{self, ProviderKind, ToolCall, WebSearchProvider},
@@ -624,12 +624,45 @@ impl OllamaModelManager {
         }
         Ok(result)
     }
+
+    async fn available(&self, model: &str) -> Result<Vec<ModelCandidate>, BackendError> {
+        let base = catalog_model_base(model)?;
+        let model_url = format!("https://ollama.com/library/{base}");
+        let tags_url = format!("{model_url}/tags");
+        let (model_response, tags_response) = tokio::join!(
+            self.http.get(model_url).send(),
+            self.http.get(tags_url).send()
+        );
+        let model_response = model_response?;
+        let tags_response = tags_response?;
+        if model_response.status() == reqwest::StatusCode::NOT_FOUND
+            || tags_response.status() == reqwest::StatusCode::NOT_FOUND
+        {
+            return Err(BackendError::Protocol(format!(
+                "model not found in Ollama Library: {base}"
+            )));
+        }
+        let model_html = model_response.error_for_status()?.text().await?;
+        let tags_html = tags_response.error_for_status()?.text().await?;
+        let preferred = parse_library_recommendation(&model_html, &base);
+        let candidates = parse_library_candidates(&tags_html, &base, preferred.as_deref());
+        if candidates.is_empty() {
+            return Err(BackendError::Protocol(format!(
+                "no downloadable tags found in Ollama Library for {base}"
+            )));
+        }
+        Ok(candidates)
+    }
 }
 
 impl ModelManager for OllamaModelManager {
     fn list_installed(&self) -> BackendFuture<Vec<ModelDescriptor>> {
         let manager = self.clone_for_task();
         Box::pin(async move { manager.installed().await })
+    }
+    fn list_available(&self, model: String) -> BackendFuture<Vec<ModelCandidate>> {
+        let manager = self.clone_for_task();
+        Box::pin(async move { manager.available(&model).await })
     }
     fn pull(
         &self,
@@ -697,6 +730,87 @@ impl ModelManager for OllamaModelManager {
             Ok(())
         })
     }
+}
+
+fn catalog_model_base(model: &str) -> Result<String, BackendError> {
+    let base = model
+        .trim()
+        .split_once(':')
+        .map_or(model.trim(), |(base, _)| base);
+    if base.is_empty()
+        || !base.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+    {
+        return Err(BackendError::Protocol(
+            "model name contains unsupported catalog characters".into(),
+        ));
+    }
+    Ok(base.to_owned())
+}
+
+fn parse_library_recommendation(html: &str, base: &str) -> Option<String> {
+    let marker = "ollama run ";
+    let start = html.find(marker)? + marker.len();
+    let model = html[start..]
+        .split(|character: char| character == '<' || character.is_whitespace())
+        .next()?
+        .trim();
+    if model == base {
+        Some(format!("{base}:latest"))
+    } else if model.starts_with(&format!("{base}:")) {
+        Some(model.to_owned())
+    } else {
+        None
+    }
+}
+
+fn parse_library_candidates(
+    html: &str,
+    base: &str,
+    preferred: Option<&str>,
+) -> Vec<ModelCandidate> {
+    const INPUT_MARKER: &str = "<input class=\"command hidden\" value=\"";
+    const SIZE_PREFIX: &str = ">";
+    const SIZE_SUFFIX: &str = "</p>";
+    let prefix = format!("{base}:");
+    let mut candidates = Vec::new();
+    for section in html.split(INPUT_MARKER).skip(1) {
+        let Some(end) = section.find('"') else {
+            continue;
+        };
+        let model = &section[..end];
+        if !model.starts_with(&prefix)
+            || candidates
+                .iter()
+                .any(|entry: &ModelCandidate| entry.model == model)
+        {
+            continue;
+        }
+        let estimated_size = section[end..]
+            .find("<p class=\"col-span-2 text-neutral-500 text-[13px]\"")
+            .and_then(|start| {
+                section[end + start..]
+                    .find(SIZE_PREFIX)
+                    .map(|offset| end + start + offset + 1)
+            })
+            .and_then(|start| {
+                section[start..]
+                    .find(SIZE_SUFFIX)
+                    .map(|offset| &section[start..start + offset])
+            })
+            .map(str::trim)
+            .filter(|size| !size.is_empty())
+            .map(ToOwned::to_owned);
+        candidates.push(ModelCandidate {
+            model: model.to_owned(),
+            estimated_size,
+            recommended: preferred.is_some_and(|preferred| preferred == model)
+                || (preferred.is_none() && model == format!("{base}:latest")),
+        });
+    }
+    candidates.sort_by_key(|candidate| !candidate.recommended);
+    candidates
 }
 
 fn parse_pull_line(line: &[u8], model: &str) -> Result<Option<ModelManagerEvent>, BackendError> {
@@ -855,5 +969,37 @@ mod tests {
         );
         assert!(parse_pull_line(br#"{"error":"not found"}"#, "qwen3:8b").is_err());
         assert!(parse_pull_line(br#"{"status":"downloading"}"#, "qwen3:8b").is_ok());
+    }
+
+    #[test]
+    fn library_catalog_parses_sizes_and_prioritizes_the_recommended_tag() {
+        let model_html = "<pre>ollama run qwen3.8:27b-mlx</pre>";
+        let tags_html = r#"
+            <input class="command hidden" value="qwen3.8:latest" />
+            <p class="col-span-2 text-neutral-500 text-[13px]">18GB</p>
+            <input class="command hidden" value="qwen3.8:27b-mlx" />
+            <p class="col-span-2 text-neutral-500 text-[13px]">18GB</p>
+        "#;
+        let preferred = parse_library_recommendation(model_html, "qwen3.8");
+        let candidates = parse_library_candidates(tags_html, "qwen3.8", preferred.as_deref());
+        assert_eq!(preferred.as_deref(), Some("qwen3.8:27b-mlx"));
+        assert_eq!(candidates[0].model, "qwen3.8:27b-mlx");
+        assert_eq!(candidates[0].estimated_size.as_deref(), Some("18GB"));
+        assert!(candidates[0].recommended);
+        assert!(!candidates[1].recommended);
+    }
+
+    #[test]
+    fn library_base_command_recommends_latest_when_that_tag_exists() {
+        let model_html = "<pre>ollama run qwen3.8</pre>";
+        let tags_html = r#"
+            <input class="command hidden" value="qwen3.8:latest" />
+            <p class="col-span-2 text-neutral-500 text-[13px]">18GB</p>
+        "#;
+        let preferred = parse_library_recommendation(model_html, "qwen3.8");
+        let candidates = parse_library_candidates(tags_html, "qwen3.8", preferred.as_deref());
+        assert_eq!(preferred.as_deref(), Some("qwen3.8:latest"));
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].recommended);
     }
 }

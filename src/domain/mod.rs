@@ -88,6 +88,13 @@ pub struct ModelDescriptor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelCandidate {
+    pub model: String,
+    pub estimated_size: Option<String>,
+    pub recommended: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPullRequest {
     pub model: String,
 }
