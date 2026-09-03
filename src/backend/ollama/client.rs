@@ -151,6 +151,7 @@ impl InferenceBackend for OllamaClient {
             let current_input = request.messages.iter().rev().find(|m| m.role == Role::User);
             let mandatory_call = mandatory_initial_web_search_call(&request)?;
             let mut forced_search_exhausted_chatgpt_budget = false;
+            let mut web_tool_phase_started = false;
             if let Some(call) = mandatory_call {
                 forced_search_exhausted_chatgpt_budget = perform_forced_web_search(
                     &client,
@@ -167,9 +168,15 @@ impl InferenceBackend for OllamaClient {
                     ForcedSearchTrigger::CurrentUserInput,
                 )
                 .await?;
+                web_tool_phase_started = true;
             }
             let mut assistant_search_fallback_used = false;
             for round in 0..4 {
+                if web_tool_phase_started {
+                    let _ = events.send(GenerationEvent::SearchProgress(
+                        "ローカルモデルで検索結果を確認・要約しています".into(),
+                    ));
+                }
                 let body = ChatBody {
                     model: request.model.clone(),
                     messages: messages.clone(),
@@ -191,9 +198,12 @@ impl InferenceBackend for OllamaClient {
                     .send()
                     .await?
                     .error_for_status()?;
-                let probe_assistant_search_intent = tools.is_some()
-                    && !forced_search_exhausted_chatgpt_budget
-                    && !assistant_search_fallback_used;
+                let probe_assistant_search_intent = should_probe_assistant_search_intent(
+                    tools.is_some(),
+                    web_tool_phase_started,
+                    forced_search_exhausted_chatgpt_budget,
+                    assistant_search_fallback_used,
+                );
                 let streamed = if probe_assistant_search_intent {
                     stream::consume_buffering_content(response.bytes_stream(), events.clone())
                         .await?
@@ -221,6 +231,7 @@ impl InferenceBackend for OllamaClient {
                             ForcedSearchTrigger::AssistantIntent,
                         )
                         .await?;
+                        web_tool_phase_started = true;
                         continue;
                     }
                     if probe_assistant_search_intent && !streamed.content.is_empty() {
@@ -315,6 +326,7 @@ impl InferenceBackend for OllamaClient {
                         }
                     }
                 }
+                web_tool_phase_started = true;
                 if round == 3 || round_budget_exhausted || chatgpt_web_budget_exhausted {
                     messages.push(WireMessage {
                         role: "system".into(),
@@ -456,6 +468,18 @@ fn current_input_web_search_call(request: &ChatRequest) -> Result<ToolCall, Back
             "limit": request.max_search_results.clamp(1, 5),
         }),
     })
+}
+
+fn should_probe_assistant_search_intent(
+    tools_enabled: bool,
+    web_tool_phase_started: bool,
+    web_request_budget_exhausted: bool,
+    assistant_search_fallback_used: bool,
+) -> bool {
+    tools_enabled
+        && !web_tool_phase_started
+        && !web_request_budget_exhausted
+        && !assistant_search_fallback_used
 }
 
 fn wire_tool_call(call: &ToolCall) -> serde_json::Value {
@@ -1435,6 +1459,25 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn assistant_search_intent_probe_stops_after_web_tool_phase_starts() {
+        assert!(should_probe_assistant_search_intent(
+            true, false, false, false
+        ));
+        assert!(!should_probe_assistant_search_intent(
+            true, true, false, false
+        ));
+        assert!(!should_probe_assistant_search_intent(
+            false, false, false, false
+        ));
+        assert!(!should_probe_assistant_search_intent(
+            true, false, true, false
+        ));
+        assert!(!should_probe_assistant_search_intent(
+            true, false, false, true
+        ));
     }
 
     #[test]
