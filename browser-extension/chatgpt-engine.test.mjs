@@ -34,6 +34,41 @@ test("citation extraction keeps HTTPS links and rejects unsafe links", () => {
   assert.deepEqual(citationsFromAssistant({ location: { href: "https://chatgpt.com/" } }, assistant), [{ title: "Example", url: "https://example.com/a" }]);
 });
 
+test("citation extraction includes only links in the assistant's conversation turn", () => {
+  const link = (href, title) => ({ href, innerText: title, textContent: title });
+  const answerLink = link("https://example.com/answer", "Answer source");
+  const turnSource = link("https://example.com/turn", "Turn source");
+  const duplicate = link("https://example.com/answer", "Duplicate");
+  const otherTurn = link("https://example.com/other", "Other turn");
+  const pageLink = link("https://example.com/page", "Page navigation");
+  const turn = { querySelectorAll: (selector) => selector === "a[href]" ? [answerLink, turnSource, duplicate] : [], closest: () => null };
+  const assistant = {
+    querySelectorAll: (selector) => selector === "a[href]" ? [answerLink] : [],
+    closest: (selector) => selector === 'section[data-testid^="conversation-turn-"]' ? turn : null,
+  };
+  const other = { querySelectorAll: () => [otherTurn] };
+  const documentLike = {
+    location: { href: "https://chatgpt.com/" },
+    querySelectorAll: (selector) => selector === "a[href]" ? [pageLink] : [other],
+  };
+  assert.deepEqual(citationsFromAssistant(documentLike, assistant), [
+    { title: "Answer source", url: "https://example.com/answer" },
+    { title: "Turn source", url: "https://example.com/turn" },
+  ]);
+});
+
+test("citation extraction rejects credential-bearing HTTPS URLs and deduplicates canonical URLs", () => {
+  const links = [
+    { href: "https://user:pass@example.com/private", innerText: "private", textContent: "private" },
+    { href: "https://example.com/a#one", innerText: "one", textContent: "one" },
+    { href: "https://example.com/a#one", innerText: "duplicate", textContent: "duplicate" },
+  ];
+  const assistant = { querySelectorAll: () => links };
+  assert.deepEqual(citationsFromAssistant({ location: { href: "https://chatgpt.com/" } }, assistant), [
+    { title: "one", url: "https://example.com/a#one" },
+  ]);
+});
+
 test("activity fingerprint changes while ChatGPT generation progresses", () => {
   const base = { composer: true, send: false, sendDisabled: true, stop: true, assistants: [{ id: "a1", text: "検索中" }] };
   assert.equal(chatGPTWebActivityFingerprint(base), chatGPTWebActivityFingerprint({ ...base }));
