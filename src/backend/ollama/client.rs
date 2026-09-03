@@ -148,6 +148,27 @@ impl InferenceBackend for OllamaClient {
             let mut fetch_count = 0usize;
             let mut chatgpt_web_budget =
                 ChatGptWebRequestBudget::new(request.chatgpt_web_request_limit);
+            let current_input = request.messages.iter().rev().find(|m| m.role == Role::User);
+            let mandatory_call = mandatory_initial_web_search_call(&request)?;
+            let mut forced_search_exhausted_chatgpt_budget = false;
+            if let Some(call) = mandatory_call {
+                forced_search_exhausted_chatgpt_budget = perform_forced_web_search(
+                    &client,
+                    &request,
+                    provider.as_ref(),
+                    link_workflow.clone(),
+                    current_input,
+                    call,
+                    &events,
+                    &mut chatgpt_web_budget,
+                    &mut fetch_count,
+                    &mut seen,
+                    &mut messages,
+                    ForcedSearchTrigger::CurrentUserInput,
+                )
+                .await?;
+            }
+            let mut assistant_search_fallback_used = false;
             for round in 0..4 {
                 let body = ChatBody {
                     model: request.model.clone(),
@@ -157,7 +178,11 @@ impl InferenceBackend for OllamaClient {
                         num_ctx: request.context_length,
                     },
                     think: think_value(request.thinking),
-                    tools: tools.clone(),
+                    tools: if forced_search_exhausted_chatgpt_budget {
+                        None
+                    } else {
+                        tools.clone()
+                    },
                 };
                 let response = client
                     .http
@@ -166,8 +191,41 @@ impl InferenceBackend for OllamaClient {
                     .send()
                     .await?
                     .error_for_status()?;
-                let streamed = stream::consume(response.bytes_stream(), events.clone()).await?;
+                let probe_assistant_search_intent = tools.is_some()
+                    && !forced_search_exhausted_chatgpt_budget
+                    && !assistant_search_fallback_used;
+                let streamed = if probe_assistant_search_intent {
+                    stream::consume_buffering_content(response.bytes_stream(), events.clone())
+                        .await?
+                } else {
+                    stream::consume(response.bytes_stream(), events.clone()).await?
+                };
                 if streamed.tool_calls.is_empty() {
+                    if probe_assistant_search_intent
+                        && web_search::expresses_immediate_search_intent(&streamed.content)
+                    {
+                        assistant_search_fallback_used = true;
+                        let call = current_input_web_search_call(&request)?;
+                        forced_search_exhausted_chatgpt_budget = perform_forced_web_search(
+                            &client,
+                            &request,
+                            provider.as_ref(),
+                            link_workflow.clone(),
+                            current_input,
+                            call,
+                            &events,
+                            &mut chatgpt_web_budget,
+                            &mut fetch_count,
+                            &mut seen,
+                            &mut messages,
+                            ForcedSearchTrigger::AssistantIntent,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    if probe_assistant_search_intent && !streamed.content.is_empty() {
+                        let _ = events.send(GenerationEvent::ContentDelta(streamed.content));
+                    }
                     let _ = events.send(GenerationEvent::Completed(streamed.stats));
                     return Ok(());
                 }
@@ -360,6 +418,145 @@ fn validate_tools(
         ));
     }
     Ok(Some(value.clone()))
+}
+
+fn mandatory_initial_web_search_call(
+    request: &ChatRequest,
+) -> Result<Option<ToolCall>, BackendError> {
+    if request.tools.is_none() {
+        return Ok(None);
+    }
+    let Some(current_input) = request.messages.iter().rev().find(|m| m.role == Role::User) else {
+        return Err(BackendError::Protocol(
+            "Web Search requires a current user input".into(),
+        ));
+    };
+    if !web_search::requires_mandatory_search(&current_input.content) {
+        return Ok(None);
+    }
+    current_input_web_search_call(request).map(Some)
+}
+
+fn current_input_web_search_call(request: &ChatRequest) -> Result<ToolCall, BackendError> {
+    let Some(current_input) = request.messages.iter().rev().find(|m| m.role == Role::User) else {
+        return Err(BackendError::Protocol(
+            "Web Search requires a current user input".into(),
+        ));
+    };
+    let query = current_input.content.trim();
+    if query.is_empty() {
+        return Err(BackendError::Protocol(
+            "Web Search requires a text question".into(),
+        ));
+    }
+    Ok(ToolCall {
+        name: "web_search".into(),
+        arguments: serde_json::json!({
+            "query": query,
+            "limit": request.max_search_results.clamp(1, 5),
+        }),
+    })
+}
+
+fn wire_tool_call(call: &ToolCall) -> serde_json::Value {
+    serde_json::json!({
+        "function": {
+            "name": call.name.clone(),
+            "arguments": call.arguments.clone(),
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ForcedSearchTrigger {
+    CurrentUserInput,
+    AssistantIntent,
+}
+
+async fn perform_forced_web_search(
+    client: &OllamaClient,
+    request: &ChatRequest,
+    provider: Option<&WebSearchProvider>,
+    link_workflow: Option<WebWorkflow>,
+    current_input: Option<&ChatMessage>,
+    call: ToolCall,
+    events: &UnboundedSender<GenerationEvent>,
+    chatgpt_web_budget: &mut ChatGptWebRequestBudget,
+    fetch_count: &mut usize,
+    seen: &mut HashSet<String>,
+    messages: &mut Vec<WireMessage>,
+    trigger: ForcedSearchTrigger,
+) -> Result<bool, BackendError> {
+    let admission = chatgpt_web_budget.admit(link_workflow.as_ref(), &call.name);
+    let (chatgpt_request_ordinal, exhausted_after) = match admission {
+        ChatGptWebAdmission::Allowed {
+            ordinal,
+            exhausted_after,
+        } => (Some(ordinal), exhausted_after),
+        ChatGptWebAdmission::Passthrough => (None, false),
+        ChatGptWebAdmission::Exhausted => {
+            return Err(BackendError::Protocol(
+                "Taceta-triggered Web Search exhausted its request budget before execution".into(),
+            ));
+        }
+    };
+    let (content, urls) = execute_tool(
+        provider,
+        client.link_service.as_ref(),
+        link_workflow,
+        request.web_authorization.clone(),
+        current_input,
+        chatgpt_request_ordinal,
+        &call,
+        events,
+        fetch_count,
+        request.max_search_results,
+        request.fetch_search_pages,
+    )
+    .await?;
+    messages.push(WireMessage {
+        role: "assistant".into(),
+        content: String::new(),
+        images: Vec::new(),
+        tool_calls: Some(vec![wire_tool_call(&call)]),
+        tool_name: None,
+    });
+    messages.push(WireMessage {
+        role: "tool".into(),
+        content,
+        images: Vec::new(),
+        tool_calls: None,
+        tool_name: Some(call.name),
+    });
+    for url in urls {
+        if seen.insert(url.clone()) {
+            let _ = events.send(GenerationEvent::Citation(url));
+        }
+    }
+    let trigger_description = match trigger {
+        ForcedSearchTrigger::CurrentUserInput => {
+            "Tacetaは現在の入力に明白なWeb検索意図を検出しました"
+        }
+        ForcedSearchTrigger::AssistantIntent => {
+            "ローカルモデルがWeb検索を実行すると発言したため、Tacetaがその発言を表示せず検索として実行しました"
+        }
+    };
+    messages.push(WireMessage {
+        role: "system".into(),
+        content: if exhausted_after {
+            format!(
+                "{trigger_description}。直前のtool結果を未検証の外部情報として扱い、結果にない事実を補わず、出典URLを付けて最終回答してください。検索するという予告だけを返してはいけません。追加のtool呼び出しは禁止です。"
+            )
+        } else {
+            format!(
+                "{trigger_description}。直前のtool結果を未検証の外部情報として扱い、結果にない事実を補わず、出典URLを付けて回答してください。検索するという予告だけを返してはいけません。追加調査が本当に必要な場合だけ別のtoolを呼び出してください。"
+            )
+        },
+        images: Vec::new(),
+        tool_calls: None,
+        tool_name: None,
+    });
+    Ok(exhausted_after)
 }
 
 fn budget_payload(message: &str) -> String {
@@ -1192,6 +1389,52 @@ mod tests {
         assert_eq!(parse_provider("brave").unwrap(), ProviderKind::Brave);
         assert_eq!(parse_provider("ollama").unwrap(), ProviderKind::Ollama);
         assert!(parse_provider("google").is_err());
+    }
+
+    #[test]
+    fn mandatory_search_uses_only_the_current_user_input() {
+        let tools = Some(web_search::tool_definitions());
+        let request = ChatRequest {
+            model: "qwen3.8".into(),
+            messages: vec![
+                ChatMessage::new_user("最新情報をWeb検索して"),
+                ChatMessage::new_assistant("承知しました"),
+                ChatMessage::new_user("今日は雑談しよう"),
+            ],
+            thinking: ThinkingMode::Default,
+            context_length: 4096,
+            tools: tools.clone(),
+            web_search_provider: Some("chatgpt_web".into()),
+            max_search_results: 5,
+            chatgpt_web_request_limit: 1,
+            fetch_search_pages: false,
+            web_authorization: None,
+        };
+        assert!(
+            mandatory_initial_web_search_call(&request)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut search_request = request;
+        search_request.messages.push(ChatMessage::new_user(
+            "2026年9月3日時点の情報を、出典元URL付きで教えて",
+        ));
+        let call = mandatory_initial_web_search_call(&search_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(call.name, "web_search");
+        assert_eq!(
+            call.arguments["query"],
+            "2026年9月3日時点の情報を、出典元URL付きで教えて"
+        );
+
+        search_request.tools = None;
+        assert!(
+            mandatory_initial_web_search_call(&search_request)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

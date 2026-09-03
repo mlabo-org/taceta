@@ -8,11 +8,38 @@ use tokio::sync::mpsc::UnboundedSender;
 pub(super) struct StreamResult {
     pub stats: GenerationStats,
     pub tool_calls: Vec<serde_json::Value>,
+    pub content: String,
 }
 
 pub(super) async fn consume<S, E>(
+    stream: S,
+    events: UnboundedSender<GenerationEvent>,
+) -> Result<StreamResult, BackendError>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    consume_inner(stream, events, true).await
+}
+
+/// Consumes one Ollama response while retaining assistant content until the
+/// caller decides whether it is an answer or merely a promise to search.
+/// Thinking and real tool calls remain observable while generation runs.
+pub(super) async fn consume_buffering_content<S, E>(
+    stream: S,
+    events: UnboundedSender<GenerationEvent>,
+) -> Result<StreamResult, BackendError>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    consume_inner(stream, events, false).await
+}
+
+async fn consume_inner<S, E>(
     mut stream: S,
     events: UnboundedSender<GenerationEvent>,
+    emit_content: bool,
 ) -> Result<StreamResult, BackendError>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
@@ -26,6 +53,7 @@ where
             total_duration_ns: None,
         },
         tool_calls: Vec::new(),
+        content: String::new(),
     };
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| BackendError::Protocol(e.to_string()))?;
@@ -48,7 +76,10 @@ where
                     let _ = events.send(GenerationEvent::ThinkingDelta(message.thinking));
                 }
                 if !message.content.is_empty() {
-                    let _ = events.send(GenerationEvent::ContentDelta(message.content));
+                    result.content.push_str(&message.content);
+                    if emit_content {
+                        let _ = events.send(GenerationEvent::ContentDelta(message.content));
+                    }
                 }
                 for call in message.tool_calls {
                     let _ = events.send(GenerationEvent::ToolCall(call.clone()));
@@ -74,7 +105,10 @@ where
                 let _ = events.send(GenerationEvent::ThinkingDelta(message.thinking));
             }
             if !message.content.is_empty() {
-                let _ = events.send(GenerationEvent::ContentDelta(message.content));
+                result.content.push_str(&message.content);
+                if emit_content {
+                    let _ = events.send(GenerationEvent::ContentDelta(message.content));
+                }
             }
             for call in message.tool_calls {
                 let _ = events.send(GenerationEvent::ToolCall(call.clone()));
@@ -114,6 +148,22 @@ mod tests {
             rx.recv().await,
             Some(GenerationEvent::ContentDelta("answer".into()))
         );
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn assistant_search_intent_content_can_be_buffered() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let input = r#"{"message":{"thinking":"","content":"Webで検索します。"},"done":true,"eval_count":4}"#;
+        let result = consume_buffering_content(
+            stream::iter([Ok::<_, std::convert::Infallible>(
+                bytes::Bytes::copy_from_slice(input.as_bytes()),
+            )]),
+            tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.content, "Webで検索します。");
         assert!(rx.recv().await.is_none());
     }
 }

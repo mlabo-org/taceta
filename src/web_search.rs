@@ -93,6 +93,207 @@ pub fn tool_definitions() -> serde_json::Value {
     ])
 }
 
+/// Returns true only when the current user input itself carries a clear Web
+/// research intent. Conversation history is deliberately excluded by the
+/// caller so an earlier research turn cannot make later ordinary chat leave
+/// the Mac.
+pub fn requires_mandatory_search(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+
+    const DIRECT_JA: &[&str] = &[
+        "web検索して",
+        "web検索しろ",
+        "web検索せよ",
+        "web検索を実行",
+        "web検索を起動",
+        "web検索を使って",
+        "webサーチして",
+        "webサーチしろ",
+        "webサーチせよ",
+        "webサーチを実行",
+        "webサーチを起動",
+        "webサーチを使って",
+        "ウェブ検索して",
+        "ウェブ検索しろ",
+        "ウェブ検索せよ",
+        "ウェブ検索を実行",
+        "ウェブ検索を起動",
+        "ウェブで調べて",
+        "インターネットで調べて",
+        "インターネットで検索して",
+        "ネットで調べて",
+        "ネットで検索して",
+    ];
+    const DIRECT_EN: &[&str] = &[
+        "search the web",
+        "search online",
+        "browse the web",
+        "use web search",
+        "run a web search",
+        "look it up online",
+    ];
+    if DIRECT_JA.iter().any(|marker| compact.contains(marker))
+        || DIRECT_EN.iter().any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+
+    const CURRENT_JA: &[&str] = &[
+        "最新",
+        "直近",
+        "現時点",
+        "時点",
+        "今日現在",
+        "最新情報",
+        "最新ニュース",
+        "現在の価格",
+        "現在のバージョン",
+        "最新バージョン",
+        "最新リリース",
+        "最新モデル",
+    ];
+    const SOURCE_JA: &[&str] = &[
+        "出典url",
+        "出典元url",
+        "引用元url",
+        "参照元url",
+        "公式url",
+        "ソースurl",
+    ];
+    const REQUEST_JA: &[&str] = &[
+        "教えて",
+        "選んで",
+        "選び",
+        "どれ",
+        "どの",
+        "何",
+        "示して",
+        "挙げて",
+        "確認して",
+        "比較して",
+        "まとめて",
+        "探して",
+    ];
+    const CURRENT_EN: &[&str] = &[
+        "latest",
+        "as of",
+        "current version",
+        "current price",
+        "recent news",
+        "today's",
+    ];
+    const SOURCE_EN: &[&str] = &["source url", "citation url", "official url"];
+    const REQUEST_EN: &[&str] = &[
+        "tell me", "which", "what", "show me", "find", "compare", "list",
+    ];
+
+    let asks_for_information = compact.contains('?')
+        || compact.contains('？')
+        || REQUEST_JA.iter().any(|marker| compact.contains(marker))
+        || REQUEST_EN.iter().any(|marker| lower.contains(marker));
+    let current_information = CURRENT_JA.iter().any(|marker| compact.contains(marker))
+        || CURRENT_EN.iter().any(|marker| lower.contains(marker));
+    let source_requested = SOURCE_JA.iter().any(|marker| compact.contains(marker))
+        || SOURCE_EN.iter().any(|marker| lower.contains(marker));
+
+    asks_for_information && (current_information || source_requested)
+}
+
+/// Detects a model response that promises an immediate Web search instead of
+/// issuing the declared tool call. This intentionally accepts only explicit
+/// action phrases; discussion about search, past searches, inability, and
+/// questions are excluded so ordinary chat is not sent outside the Mac.
+pub fn expresses_immediate_search_intent(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+
+    const NEGATIVE_JA: &[&str] = &[
+        "検索しません",
+        "検索できません",
+        "検索はできません",
+        "検索を実行できません",
+        "検索する必要はありません",
+        "検索は不要",
+        "検索しました",
+        "検索済み",
+        "検索しますか",
+        "検索しましょうか",
+        "検索してください",
+        "検索について",
+        "検索という",
+        "調べません",
+        "調べられません",
+        "調べました",
+        "調べますか",
+        "調べましょうか",
+        "調べてください",
+    ];
+    const NEGATIVE_EN: &[&str] = &[
+        "won't search",
+        "will not search",
+        "can't search",
+        "cannot search",
+        "already searched",
+        "searched the web",
+        "should i search",
+        "would you like me to search",
+        "how to search",
+        "about web search",
+    ];
+    if NEGATIVE_JA.iter().any(|marker| compact.contains(marker))
+        || NEGATIVE_EN.iter().any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+
+    const INTENT_JA: &[&str] = &[
+        "webサーチします",
+        "webサーチを実行します",
+        "ウェブサーチします",
+        "ウェブサーチを実行します",
+        "検索します",
+        "検索してみます",
+        "検索を実行します",
+        "検索を開始します",
+        "検索に移ります",
+        "webで調べます",
+        "ウェブで調べます",
+        "インターネットで調べます",
+        "ネットで調べます",
+        "オンラインで調べます",
+    ];
+    const INTENT_EN: &[&str] = &[
+        "i'll search the web",
+        "i’ll search the web",
+        "i will search the web",
+        "let me search the web",
+        "i'm going to search the web",
+        "i am going to search the web",
+        "i'll search online",
+        "i’ll search online",
+        "i will search online",
+        "let me search online",
+        "i'll browse the web",
+        "i’ll browse the web",
+        "i will browse the web",
+        "let me browse the web",
+        "i'll look it up online",
+        "i’ll look it up online",
+        "i will look it up online",
+        "let me look it up online",
+    ];
+
+    INTENT_JA.iter().any(|marker| compact.contains(marker))
+        || INTENT_EN.iter().any(|marker| lower.contains(marker))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolCall {
     pub name: String,
@@ -588,6 +789,60 @@ mod tests {
         assert_eq!(tools.as_array().unwrap().len(), 2);
         assert_eq!(tools[0]["function"]["name"], "web_search");
         assert_eq!(tools[1]["function"]["name"], "web_fetch");
+    }
+
+    #[test]
+    fn mandatory_search_intent_covers_explicit_current_and_sourced_requests() {
+        assert!(requires_mandatory_search(
+            "喋らずに WEBサーチを起動しろ。WEBサーチを実行してください。"
+        ));
+        assert!(requires_mandatory_search(
+            "2026年9月3日時点で最も注目されているモデルを選び、出典元URLを教えてください。"
+        ));
+        assert!(requires_mandatory_search(
+            "最新のQwenモデルを教えてください"
+        ));
+        assert!(requires_mandatory_search(
+            "Please search the web and show me the official URL."
+        ));
+    }
+
+    #[test]
+    fn mandatory_search_intent_does_not_capture_ordinary_web_discussion() {
+        assert!(!requires_mandatory_search(
+            "WEBサーチのトリガーってどうなっていたっけか"
+        ));
+        assert!(!requires_mandatory_search(
+            "通常会話とWEBサーチ意図のある会話くらいは切り分けろよ"
+        ));
+        assert!(!requires_mandatory_search(
+            "会話をすべてWEBサーチに送ったら収拾がつかなくなる"
+        ));
+        assert!(!requires_mandatory_search("今日は雑談しよう"));
+        assert!(!requires_mandatory_search("このコードを説明して"));
+    }
+
+    #[test]
+    fn assistant_search_intent_requires_an_immediate_action_statement() {
+        assert!(expresses_immediate_search_intent(
+            "承知しました。WEBサーチを実行します。"
+        ));
+        assert!(expresses_immediate_search_intent(
+            "では、インターネットで調べます。"
+        ));
+        assert!(expresses_immediate_search_intent(
+            "I'll search the web now."
+        ));
+        assert!(!expresses_immediate_search_intent(
+            "WEBサーチの仕組みを説明します。"
+        ));
+        assert!(!expresses_immediate_search_intent(
+            "必要なら検索しましょうか？"
+        ));
+        assert!(!expresses_immediate_search_intent("先ほど検索しました。"));
+        assert!(!expresses_immediate_search_intent(
+            "WEB検索は実行しません。"
+        ));
     }
 
     #[test]

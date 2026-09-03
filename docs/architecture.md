@@ -6,7 +6,7 @@
 
 `InferenceBackend` は local chat の境界です。モデル、会話入力、添付、Thinking 設定、Web Search 設定を受け取り、Thinking delta、content delta、検索進捗、参照元、完了、失敗を返します。Thinking trace は次の入力へ混ぜません。
 
-Web Search OFF では外部 request を作りません。ON では設定された executor を適用します。Brave Search / Ollama Web Search は API 経路、Taceta Link はブラウザー経路です。外部結果は untrusted context としてローカル Ollama の最終回答に渡します。provider は暗黙に切り替えません。
+Web Search OFF では外部 request を作りません。ON でも全会話を検索へ送ることはありません。現在の入力に明示的な検索命令、現在性・最新性または特定日時点の確認、出典 URL の要求など明白な検索意図がある場合だけ、Taceta は LLM が発話する前に最低1回の検索を完了させます。過去の会話履歴は意図判定に使いません。通常会話や曖昧な入力では検索を強制せず、LLM が必要と判断したときだけ従来どおり tool call を許可します。さらに、LLM が tool call を返さず、現在の入力に対して直ちに検索する意思だけを通常テキストで明言した場合は、その予告文を最終回答として表示せず、同じ入力を1ターンにつき1回だけ検索へ回します。検索についての説明、過去形、否定、質問、通常会話はこのフォールバックの対象外です。検索時は設定された executor だけを適用します。Brave Search / Ollama Web Search は API 経路、Taceta Link はブラウザー経路です。外部結果は untrusted context としてローカル Ollama の最終回答に渡します。provider は暗黙に切り替えません。
 
 Taceta Link は同じ version を持つ MV3 拡張、Native Messaging Host `org.mlabo.taceta.link`、user-only Unix socket で構成します。アプリが job を socket へ置き、拡張が poll して実行結果を返します。product version / protocol version / extension ID の不一致は fail-closed です。Cookie、token、profile、local storage を読み出したり輸出したりしません。
 
@@ -14,7 +14,7 @@ Taceta Link は同じ version を持つ MV3 拡張、Native Messaging Host `org.
 
 ## Web ON の承認と安全境界
 
-Web ON + Send は一つの Web turn を許可します。その turn で ChatGPT Web に作成できる request は設定上限の1〜3件までで、各 job は再利用できない個別の authorization を持ちます。結果不明状態の同一 job は再試行しません。検索結果は最終回答そのものではなく、ローカル Ollama が生成する回答の untrusted context です。ログイン、アカウント変更、購入、削除などの destructive/account action は別途利用者の確認が必要です。
+明白な検索意図を含む入力での Web ON + Send は、回答前に最低1回の検索を完了させたうえで一つの Web turn を許可します。通常会話や曖昧な入力では検索を強制しません。ChatGPT Web の turn で作成できる request は設定上限の1〜3件までで、各 job は再利用できない個別の authorization を持ちます。結果不明状態の同一 job は再試行しません。検索結果は最終回答そのものではなく、ローカル Ollama が生成する回答の untrusted context です。ログイン、アカウント変更、購入、削除などの destructive/account action は別途利用者の確認が必要です。
 
 ## インストール責務
 
@@ -34,7 +34,7 @@ This document defines the responsibilities of Taceta's Rust app and Taceta Link,
 
 `InferenceBackend` owns local chat. It accepts model, conversation input, attachments, Thinking settings, and Web Search settings, then emits Thinking deltas, content deltas, search progress, citations, completion, and failure. Thinking traces never enter the next input.
 
-With Web Search OFF, no external request is created. With it ON, the configured executor is applied: Brave Search / Ollama Web Search through their APIs, or Taceta Link through the browser. Returned external data is untrusted context for a final answer generated locally by Ollama. Providers never silently fall back.
+With Web Search OFF, no external request is created. ON does not send every conversation to the web. Only a clear search intent in the current input—such as an explicit search command, a request to verify current/latest or date-specific information, or a request for source URLs—requires Taceta to complete at least one search before the LLM speaks. Conversation history is not used to detect intent. Normal conversation and ambiguous input are not forced to search; the LLM may still call the tool when it determines that search is needed, as before. In addition, if the LLM returns no tool call but plainly states in ordinary text that it will search immediately for the current input, Taceta suppresses that announcement instead of displaying it as the final answer and routes the same input to search once per turn. Explanations, past-tense statements, negations, questions about searching, and normal conversation do not trigger this fallback. When searching, the configured executor is applied: Brave Search / Ollama Web Search through their APIs, or Taceta Link through the browser. Returned external data is untrusted context for a final answer generated locally by Ollama. Providers never silently fall back.
 
 Taceta Link consists of a same-version MV3 extension, Native Messaging Host `org.mlabo.taceta.link`, and a user-only Unix socket. The app places jobs on the socket; the extension polls and returns results. Product version, protocol version, or extension-ID mismatch fails closed. Cookies, tokens, profiles, and local storage are never read or exported.
 
@@ -42,7 +42,7 @@ The browser executor prefers an existing focused normal window as its route cont
 
 ## Web ON authorization and safety
 
-Web ON + Send authorizes one web turn. That turn may create from one to three ChatGPT Web requests up to the configured limit, and each job receives a distinct, non-reusable authorization. An unknown outcome is not retried for the same job. Search output is untrusted context, not the final answer; local Ollama generates that answer. Login, account changes, purchases, deletions, and other destructive/account actions still require separate user confirmation.
+For an input with clear search intent, Web ON + Send completes at least one search before allowing one web turn. Normal and ambiguous conversation is not forced to search. That turn may create from one to three ChatGPT Web requests up to the configured limit, and each job receives a distinct, non-reusable authorization. An unknown outcome is not retried for the same job. Search output is untrusted context, not the final answer; local Ollama generates that answer. Login, account changes, purchases, deletions, and other destructive/account actions still require separate user confirmation.
 
 ## Installation responsibility
 

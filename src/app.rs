@@ -2176,8 +2176,8 @@ impl TacetaApp {
                             ui.add_space(4.0);
                             ui.label(RichText::new(text(
                                 language,
-                                "会話ごとにONにできます。ONにした会話では検索語と取得先が外部へ送信されます。",
-                                "Enable per conversation. When enabled, queries and fetched pages are sent to the selected provider.",
+                                "会話ごとにONにできます。通常会話は検索せず、現在の入力に明白な検索意図があるときだけ、回答前に最低1回検索します。LLMがtool callを返さず、直ちに検索する意思だけを通常テキストで明言した場合は、その予告文を表示せず同じ入力を1ターン1回だけ検索へ回します。検索の説明・過去形・否定・質問・通常会話は対象外です。過去の履歴は意図判定に使いません。",
+                                "Enable per conversation. Normal conversation is not forced to search; only a clear search intent in the current input requires at least one search before answering. If the LLM returns no tool call but plainly states in ordinary text that it will search immediately, Taceta suppresses that announcement and routes the same input to search once per turn. Explanations, past-tense statements, negations, questions about searching, and normal conversation are excluded. Conversation history is not used to detect intent.",
                             )).weak());
                             ui.add_space(10.0);
                             ui.horizontal(|ui| {
@@ -3080,8 +3080,8 @@ impl TacetaApp {
                                         )
                                         .on_hover_text(text(
                                             language,
-                                            "この会話だけWeb検索を許可します。検索語と取得先が外部へ送信されます。",
-                                            "Allow Web Search for this conversation. Queries and fetched URLs leave this Mac.",
+                                            "この会話だけWeb検索を許可します。通常会話は検索せず、現在の入力に明白な検索意図がある場合だけ回答前に最低1回検索します。LLMがtool callを返さず、直ちに検索する意思だけを通常テキストで明言した場合は、その予告文を表示せず同じ入力を1ターン1回だけ検索へ回します。検索の説明・過去形・否定・質問・通常会話は対象外です。検索時は検索語と取得先が外部へ送信されます。",
+                                            "Allow Web Search for this conversation. Normal conversation is not forced to search; a clear search intent in the current input requires at least one search before answering. If the LLM returns no tool call but plainly states in ordinary text that it will search immediately, Taceta suppresses that announcement and routes the same input to search once per turn. Explanations, past-tense statements, negations, questions about searching, and normal conversation are excluded. When searching, queries and fetched URLs leave this Mac.",
                                         ))
                                         .clicked()
                                     {
@@ -3092,8 +3092,8 @@ impl TacetaApp {
                                                 kind: NoticeKind::Info,
                                                 text: text(
                                                     language,
-                                                    "Web検索をONにしました。外部通信が発生します。",
-                                                    "Web Search is ON. External requests will be made.",
+                                                    "Web検索をONにしました。通常会話は検索しません。現在の入力に明白な検索意図がある場合だけ、回答前に最低1回検索します。LLMがtool callを返さず直ちに検索する意思だけを明言した場合も、予告文を表示せず1ターン1回だけ検索へ回します。",
+                                                    "Web Search is ON. Normal conversation is not forced to search. A clear search intent in the current input requires at least one search before answering. If the LLM states only an immediate intent to search without returning a tool call, Taceta suppresses the announcement and routes the input to search once per turn.",
                                                 )
                                                 .to_owned(),
                                             });
