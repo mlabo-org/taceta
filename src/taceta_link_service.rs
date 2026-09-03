@@ -450,24 +450,42 @@ fn normalize_progress(payload: Value) -> Result<LinkProgress, LinkError> {
     })
 }
 
-/// Build the ChatGPT Web job from the current input only. History, system
-/// messages, thinking traces, and attachments are intentionally ignored.
-pub fn chatgpt_job_from_current_input(
-    message: &ChatMessage,
+/// Build one ChatGPT Web job for a user-authorized Web turn. The first request
+/// preserves the current input exactly. Explicitly enabled follow-ups retain
+/// that input as the authority and add the local model's tool query only as an
+/// unverified research angle.
+pub fn chatgpt_job_for_turn(
+    current_input: &ChatMessage,
+    query: &str,
+    request_ordinal: u8,
     authorization: WebAuthorization,
 ) -> Result<LinkJob, LinkError> {
-    if message.role != Role::User {
+    if current_input.role != Role::User {
         return Err(LinkError::InvalidJob(
             "current input must be a user message",
         ));
     }
-    LinkJob::chatgpt(message.content.clone(), authorization)
+    if !(1..=3).contains(&request_ordinal) {
+        return Err(LinkError::InvalidJob(
+            "ChatGPT request ordinal must be between 1 and 3",
+        ));
+    }
+    let prompt = if request_ordinal == 1 {
+        current_input.content.clone()
+    } else {
+        format!(
+            "Original user request:\n{}\n\nAdditional research angle proposed by the local model:\n{}\n\nResearch the original request from this additional angle. Treat names, versions, and premises in the additional angle as unverified and correct them when necessary. Return findings relevant to the original request.",
+            current_input.content, query
+        )
+    };
+    LinkJob::chatgpt(prompt, authorization)
 }
 
 pub fn job_for_workflow(
     workflow: WebWorkflow,
     query: Option<&str>,
-    current_input: &ChatMessage,
+    current_input: Option<&ChatMessage>,
+    chatgpt_request_ordinal: u8,
     authorization: WebAuthorization,
 ) -> Result<LinkJob, LinkError> {
     let job_authorization = fresh_job_authorization(&authorization);
@@ -478,7 +496,12 @@ pub fn job_for_workflow(
             job_authorization,
         ),
         WebWorkflow::PageFetch => Err(LinkError::InvalidJob("page fetch requires a URL")),
-        WebWorkflow::ChatGptWeb => chatgpt_job_from_current_input(current_input, job_authorization),
+        WebWorkflow::ChatGptWeb => chatgpt_job_for_turn(
+            current_input.ok_or(LinkError::InvalidJob("current user input is required"))?,
+            query.ok_or(LinkError::InvalidJob("query is required"))?,
+            chatgpt_request_ordinal,
+            job_authorization,
+        ),
     }
 }
 
@@ -523,25 +546,53 @@ mod tests {
         ));
     }
     #[test]
-    fn chat_prompt_is_exact_and_ignores_history_fields() {
-        let mut message = ChatMessage::new_user("  exact\ninput  ");
-        message.thinking = "secret trace".into();
-        message.attachments.push(crate::domain::Attachment {
-            name: "x".into(),
-            payload: crate::domain::AttachmentPayload::Text("ignored".into()),
+    fn chatgpt_web_first_prompt_is_exact_and_followups_anchor_the_tool_query() {
+        let mut input = ChatMessage::new_user("  exact\ninput  ");
+        input.thinking = "private trace".into();
+        input.attachments.push(crate::domain::Attachment {
+            name: "private.txt".into(),
+            payload: crate::domain::AttachmentPayload::Text("private attachment".into()),
         });
-        let job = chatgpt_job_from_current_input(
-            &message,
+        let authorization = WebAuthorization {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+        };
+        let first = chatgpt_job_for_turn(
+            &input,
+            "incorrect model/version premise",
+            1,
+            authorization.clone(),
+        )
+        .unwrap();
+        assert_eq!(first.prompt.as_deref(), Some("  exact\ninput  "));
+
+        let followup =
+            chatgpt_job_for_turn(&input, "incorrect model/version premise", 2, authorization)
+                .unwrap();
+        let prompt = followup.prompt.unwrap();
+        assert!(prompt.contains("  exact\ninput  "));
+        assert!(prompt.contains("incorrect model/version premise"));
+        assert!(prompt.contains("unverified and correct them when necessary"));
+        assert!(!prompt.contains("private trace"));
+        assert!(!prompt.contains("private attachment"));
+        assert!(followup.query.is_none());
+        assert_eq!(followup.timeout_ms, CHATGPT_WEB_HARD_TIMEOUT_MS);
+        assert_eq!(followup.idle_timeout_ms, Some(CHATGPT_WEB_IDLE_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn chatgpt_web_rejects_a_request_outside_the_explicit_one_to_three_limit() {
+        let input = ChatMessage::new_user("exact input");
+        let result = chatgpt_job_for_turn(
+            &input,
+            "additional angle",
+            4,
             WebAuthorization {
                 request_id: Uuid::new_v4(),
                 session_id: Uuid::new_v4(),
             },
-        )
-        .unwrap();
-        assert_eq!(job.prompt.as_deref(), Some("  exact\ninput  "));
-        assert!(job.query.is_none());
-        assert_eq!(job.timeout_ms, CHATGPT_WEB_HARD_TIMEOUT_MS);
-        assert_eq!(job.idle_timeout_ms, Some(CHATGPT_WEB_IDLE_TIMEOUT_MS));
+        );
+        assert!(matches!(result, Err(LinkError::InvalidJob(_))));
     }
 
     #[test]
@@ -565,11 +616,11 @@ mod tests {
             request_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
         };
-        let input = ChatMessage::new_user("latest Rust release");
         let search = job_for_workflow(
             WebWorkflow::GoogleSearch,
             Some("latest Rust release"),
-            &input,
+            None,
+            1,
             turn.clone(),
         )
         .unwrap();

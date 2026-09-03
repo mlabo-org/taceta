@@ -129,6 +129,8 @@ pub struct ChatRequest {
     pub web_search_provider: Option<String>,
     #[serde(default = "default_max_search_results")]
     pub max_search_results: u8,
+    #[serde(default = "default_chatgpt_web_request_limit")]
+    pub chatgpt_web_request_limit: u8,
     #[serde(default)]
     pub fetch_search_pages: bool,
     /// The one-shot authorization granted by the Web: ON control for this request.
@@ -152,6 +154,18 @@ pub enum WebWorkflow {
 
 fn default_max_search_results() -> u8 {
     5
+}
+
+pub const MIN_CHATGPT_WEB_REQUEST_LIMIT: u8 = 1;
+pub const MAX_CHATGPT_WEB_REQUEST_LIMIT: u8 = 3;
+pub const DEFAULT_CHATGPT_WEB_REQUEST_LIMIT: u8 = 1;
+
+fn default_chatgpt_web_request_limit() -> u8 {
+    DEFAULT_CHATGPT_WEB_REQUEST_LIMIT
+}
+
+pub fn normalize_chatgpt_web_request_limit(value: u8) -> u8 {
+    value.clamp(MIN_CHATGPT_WEB_REQUEST_LIMIT, MAX_CHATGPT_WEB_REQUEST_LIMIT)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

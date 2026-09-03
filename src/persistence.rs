@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use taceta::backend::OllamaEndpointMode;
-use taceta::domain::{Attachment, ChatMessage, ThinkingMode};
+use taceta::domain::{
+    Attachment, ChatMessage, DEFAULT_CHATGPT_WEB_REQUEST_LIMIT, ThinkingMode,
+    normalize_chatgpt_web_request_limit,
+};
 use taceta::web_search::ProviderKind;
 use uuid::Uuid;
 
@@ -63,6 +66,8 @@ pub struct PersistedAppState {
     pub web_search_provider: ProviderKind,
     #[serde(default = "default_max_search_results")]
     pub max_search_results: u8,
+    #[serde(default = "default_chatgpt_web_request_limit")]
+    pub chatgpt_web_request_limit: u8,
     #[serde(default)]
     pub fetch_search_pages: bool,
     /// Automatic mode follows Ollama's macOS OLLAMA_HOST configuration.
@@ -92,6 +97,7 @@ impl Default for PersistedAppState {
             pending_attachments: Vec::new(),
             web_search_provider: ProviderKind::Brave,
             max_search_results: 5,
+            chatgpt_web_request_limit: DEFAULT_CHATGPT_WEB_REQUEST_LIMIT,
             fetch_search_pages: true,
             ollama_endpoint_mode: OllamaEndpointMode::Auto,
             ollama_custom_endpoint: String::new(),
@@ -114,6 +120,8 @@ impl PersistedAppState {
         }
         self.context_length = normalize_context_length(self.context_length);
         self.max_search_results = self.max_search_results.clamp(1, 5);
+        self.chatgpt_web_request_limit =
+            normalize_chatgpt_web_request_limit(self.chatgpt_web_request_limit);
         self
     }
 
@@ -218,6 +226,10 @@ fn default_max_search_results() -> u8 {
     5
 }
 
+fn default_chatgpt_web_request_limit() -> u8 {
+    DEFAULT_CHATGPT_WEB_REQUEST_LIMIT
+}
+
 fn default_link_setup_acknowledged() -> bool {
     true
 }
@@ -269,6 +281,33 @@ mod tests {
             ProviderKind::Brave
         );
         assert_eq!(PersistedAppState::default().max_search_results, 5);
+        assert_eq!(
+            PersistedAppState::default().chatgpt_web_request_limit,
+            DEFAULT_CHATGPT_WEB_REQUEST_LIMIT
+        );
+    }
+
+    #[test]
+    fn chatgpt_web_request_limit_defaults_to_one_and_stays_within_one_to_three() {
+        let legacy: PersistedAppState = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            legacy.chatgpt_web_request_limit,
+            DEFAULT_CHATGPT_WEB_REQUEST_LIMIT
+        );
+
+        let below_minimum = PersistedAppState {
+            chatgpt_web_request_limit: 0,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(below_minimum.chatgpt_web_request_limit, 1);
+
+        let above_maximum = PersistedAppState {
+            chatgpt_web_request_limit: 4,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(above_maximum.chatgpt_web_request_limit, 3);
     }
 
     #[test]

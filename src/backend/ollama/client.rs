@@ -8,7 +8,8 @@ use crate::{
     backend::{BackendError, BackendFuture, InferenceBackend, ModelManager},
     domain::{
         AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelCandidate,
-        ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingMode,
+        ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingMode, WebWorkflow,
+        normalize_chatgpt_web_request_limit,
     },
     taceta_link_service::{self, LinkProgress, LinkResult, TacetaLinkService},
     web_search::{self, ProviderKind, ToolCall, WebSearchProvider},
@@ -145,6 +146,8 @@ impl InferenceBackend for OllamaClient {
             }
             let mut seen = HashSet::new();
             let mut fetch_count = 0usize;
+            let mut chatgpt_web_budget =
+                ChatGptWebRequestBudget::new(request.chatgpt_web_request_limit);
             for round in 0..4 {
                 let body = ChatBody {
                     model: request.model.clone(),
@@ -181,6 +184,7 @@ impl InferenceBackend for OllamaClient {
                     tool_calls: Some(streamed.tool_calls.clone()),
                     tool_name: None,
                 });
+                let mut chatgpt_web_budget_exhausted = false;
                 for (index, raw) in streamed.tool_calls.into_iter().enumerate() {
                     let call = web_search::parse_tool_call(&raw)
                         .map_err(|e| BackendError::Protocol(e.to_string()))?;
@@ -193,19 +197,49 @@ impl InferenceBackend for OllamaClient {
                             Vec::new(),
                         )
                     } else {
-                        execute_tool(
-                            provider.as_ref(),
-                            client.link_service.as_ref(),
-                            link_workflow.clone(),
-                            request.web_authorization.clone(),
-                            request.messages.iter().rev().find(|m| m.role == Role::User),
-                            &call,
-                            &events,
-                            &mut fetch_count,
-                            request.max_search_results,
-                            request.fetch_search_pages,
-                        )
-                        .await?
+                        match chatgpt_web_budget.admit(link_workflow.as_ref(), &call.name) {
+                            ChatGptWebAdmission::Exhausted => {
+                                chatgpt_web_budget_exhausted = true;
+                                let _ = events.send(GenerationEvent::SearchProgress(
+                                    "ChatGPT Webへの質問回数上限に達しました".into(),
+                                ));
+                                (
+                                    budget_payload("ChatGPT Webへの質問回数上限に達しました"),
+                                    Vec::new(),
+                                )
+                            }
+                            admission => {
+                                let chatgpt_request_ordinal = match admission {
+                                    ChatGptWebAdmission::Allowed { ordinal, .. } => Some(ordinal),
+                                    ChatGptWebAdmission::Passthrough => None,
+                                    ChatGptWebAdmission::Exhausted => unreachable!(),
+                                };
+                                let result = execute_tool(
+                                    provider.as_ref(),
+                                    client.link_service.as_ref(),
+                                    link_workflow.clone(),
+                                    request.web_authorization.clone(),
+                                    request.messages.iter().rev().find(|m| m.role == Role::User),
+                                    chatgpt_request_ordinal,
+                                    &call,
+                                    &events,
+                                    &mut fetch_count,
+                                    request.max_search_results,
+                                    request.fetch_search_pages,
+                                )
+                                .await?;
+                                if matches!(
+                                    admission,
+                                    ChatGptWebAdmission::Allowed {
+                                        ordinal: _,
+                                        exhausted_after: true
+                                    }
+                                ) {
+                                    chatgpt_web_budget_exhausted = true;
+                                }
+                                result
+                            }
+                        }
                     };
                     messages.push(WireMessage {
                         role: "tool".into(),
@@ -220,7 +254,7 @@ impl InferenceBackend for OllamaClient {
                         }
                     }
                 }
-                if round == 3 || round_budget_exhausted {
+                if round == 3 || round_budget_exhausted || chatgpt_web_budget_exhausted {
                     messages.push(WireMessage {
                         role: "system".into(),
                         content: "調査上限に達しました。ここまでに取得できた検索結果と本文だけを根拠に、出典URLを付けて最終回答してください。追加のtool呼び出しは禁止です。".into(),
@@ -333,6 +367,46 @@ fn budget_payload(message: &str) -> String {
     .unwrap()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChatGptWebAdmission {
+    Passthrough,
+    Allowed { ordinal: u8, exhausted_after: bool },
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChatGptWebRequestBudget {
+    limit: u8,
+    used: u8,
+}
+
+impl ChatGptWebRequestBudget {
+    fn new(configured_limit: u8) -> Self {
+        Self {
+            limit: normalize_chatgpt_web_request_limit(configured_limit),
+            used: 0,
+        }
+    }
+
+    fn admit(&mut self, workflow: Option<&WebWorkflow>, tool_name: &str) -> ChatGptWebAdmission {
+        if !matches!(workflow, Some(WebWorkflow::ChatGptWeb)) {
+            return ChatGptWebAdmission::Passthrough;
+        }
+        if self.used >= self.limit {
+            return ChatGptWebAdmission::Exhausted;
+        }
+        if tool_name != "web_search" {
+            return ChatGptWebAdmission::Passthrough;
+        }
+
+        self.used += 1;
+        ChatGptWebAdmission::Allowed {
+            ordinal: self.used,
+            exhausted_after: self.used >= self.limit,
+        }
+    }
+}
+
 fn parse_provider(value: &str) -> Result<ProviderKind, BackendError> {
     match value {
         "Brave" | "brave" => Ok(ProviderKind::Brave),
@@ -361,6 +435,7 @@ async fn execute_tool(
     link_workflow: Option<crate::domain::WebWorkflow>,
     authorization: Option<crate::domain::WebAuthorization>,
     current_input: Option<&ChatMessage>,
+    chatgpt_request_ordinal: Option<u8>,
     call: &ToolCall,
     events: &UnboundedSender<GenerationEvent>,
     fetch_count: &mut usize,
@@ -379,20 +454,30 @@ async fn execute_tool(
                 .as_u64()
                 .unwrap_or(max_results.max(1) as u64)
                 .clamp(1, max_results.clamp(1, 5) as u64) as usize;
-            let _ = events.send(GenerationEvent::SearchProgress(format!("検索中: {query}")));
             if let Some(workflow) = link_workflow {
                 let service = link_service
                     .ok_or_else(|| BackendError::Protocol("Taceta Link is unavailable".into()))?;
                 let auth = authorization.ok_or_else(|| {
                     BackendError::Protocol("Taceta Link authorization is missing".into())
                 })?;
-                let input = current_input.ok_or_else(|| {
-                    BackendError::Protocol("current user input is missing".into())
-                })?;
+                let ordinal = chatgpt_request_ordinal.unwrap_or(1);
+                let progress = if matches!(workflow, WebWorkflow::ChatGptWeb) {
+                    if ordinal == 1 {
+                        "ChatGPT Webで調査中 (1回目)".to_owned()
+                    } else {
+                        format!(
+                            "ChatGPT Webで追加調査中 ({ordinal}回目) — ローカルモデル案: {query}"
+                        )
+                    }
+                } else {
+                    format!("検索中: {query}")
+                };
+                let _ = events.send(GenerationEvent::SearchProgress(progress));
                 let job = taceta_link_service::job_for_workflow(
                     workflow.clone(),
                     Some(query),
-                    input,
+                    current_input,
+                    ordinal,
                     auth,
                 )
                 .map_err(|e| BackendError::Protocol(e.to_string()))?;
@@ -456,6 +541,7 @@ async fn execute_tool(
                     .unwrap_or_default();
                 return Ok((result.untrusted_context(), urls));
             }
+            let _ = events.send(GenerationEvent::SearchProgress(format!("検索中: {query}")));
             let provider = provider
                 .ok_or_else(|| BackendError::Protocol("web provider is unavailable".into()))?;
             let results = provider
@@ -1122,6 +1208,49 @@ mod tests {
         assert_eq!(parse_provider("brave").unwrap(), ProviderKind::Brave);
         assert_eq!(parse_provider("ollama").unwrap(), ProviderKind::Ollama);
         assert!(parse_provider("google").is_err());
+    }
+
+    #[test]
+    fn chatgpt_web_budget_defaults_to_one_and_caps_requests_at_three() {
+        let mut default_budget = ChatGptWebRequestBudget::new(0);
+        assert_eq!(
+            default_budget.admit(Some(&WebWorkflow::ChatGptWeb), "web_search"),
+            ChatGptWebAdmission::Allowed {
+                ordinal: 1,
+                exhausted_after: true
+            }
+        );
+        assert_eq!(
+            default_budget.admit(Some(&WebWorkflow::ChatGptWeb), "web_search"),
+            ChatGptWebAdmission::Exhausted
+        );
+
+        let mut maximum_budget = ChatGptWebRequestBudget::new(9);
+        for (ordinal, remaining) in [(1, false), (2, false), (3, true)] {
+            assert_eq!(
+                maximum_budget.admit(Some(&WebWorkflow::ChatGptWeb), "web_search"),
+                ChatGptWebAdmission::Allowed {
+                    ordinal,
+                    exhausted_after: remaining
+                }
+            );
+        }
+        assert_eq!(
+            maximum_budget.admit(Some(&WebWorkflow::ChatGptWeb), "web_search"),
+            ChatGptWebAdmission::Exhausted
+        );
+    }
+
+    #[test]
+    fn chatgpt_web_budget_does_not_limit_search_engine_workflows() {
+        let mut budget = ChatGptWebRequestBudget::new(1);
+        for _ in 0..4 {
+            assert_eq!(
+                budget.admit(Some(&WebWorkflow::GoogleSearch), "web_search"),
+                ChatGptWebAdmission::Passthrough
+            );
+        }
+        assert_eq!(budget.used, 0);
     }
 
     #[test]

@@ -15,7 +15,7 @@ Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT We
 - 会話ごとの Web Search（既定は OFF）
 - Brave Search / Ollama Web Search API、または Taceta Link 経由のブラウザー検索、Google 検索、ChatGPT Web
 
-Web Search が OFF のときは外部リクエストを作りません。ON のときは選択された executor だけを使い、検索結果やブラウザーの回答は untrusted context としてローカル Ollama の最終回答に渡します。Web ON + Send は、その送信に対して一回の Web request を明示的に許可します。
+Web Search が OFF のときは外部リクエストを作りません。ON のときは選択された executor だけを使い、検索結果やブラウザーの回答は untrusted context としてローカル Ollama の最終回答に渡します。ChatGPT Web への質問回数は既定1回、設定可能範囲は1〜3回です。Google等の最大検索結果とは独立しており、設定した上限を超える追加質問は行いません。上限到達後（最大設定なら4回目以降）の `web_search` 要求は ChatGPT Web へ送らず、それまでに取得した最大3回答をローカルモデルが最終回答へ統合します。
 
 ## 画面
 
@@ -45,7 +45,7 @@ Taceta (Rust/egui)
 
 Taceta Link は `browser-extension/` の MV3 拡張、Native Messaging Host `org.mlabo.taceta.link`、ユーザー専用 Unix socket で構成されます。拡張は既存の通常ブラウザーウィンドウを優先して作業用 tab / group を作り、Taceta が所有する exact tab / group だけを追跡します。ブラウザーのウィンドウ全体を閉じることはありません。製品 version、protocol version、固定 extension ID が一致しない場合は fail-closed します。
 
-ChatGPT Web 経路で送るのは現在の入力欄の prompt だけです。会話履歴、system message、添付ファイル、Thinking trace、Cookie、token、profile、localStorage は取得・送信・保存しません。ChatGPT Web の出力は逐次的に受信しますが、最終回答の生成はローカル Ollama が担当します。
+ChatGPT Web 経路の1回目は現在の入力欄のpromptを正確に送ります。設定で2〜3回を明示的に許可した場合だけ、追加分では選択中のローカルモデルが各 `web_search` tool call で生成した検索クエリを「未検証の追加調査案」として元のpromptに添えます。固有名詞、version、前提に誤りがあれば訂正するようChatGPTへ明記します。画面の「ローカルモデル案」はTacetaが追加質問の出所を示す一時的な進捗表示であり、ChatGPTの内部思考や会話履歴ではありません。Tacetaは会話履歴、system message、添付ファイル、Thinking trace、Cookie、token、profile、localStorage を直接送信・取得・保存しません。ChatGPT Web の出力は逐次的に受信しますが、最終回答の生成はローカル Ollama が担当します。
 
 ## セキュリティとプライバシー
 
@@ -163,7 +163,7 @@ Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly star
 - Per-conversation Web Search, off by default
 - Brave Search / Ollama Web Search APIs, or browser search, Google Search, and ChatGPT Web through Taceta Link
 
-When Web Search is OFF, Taceta creates no external request. When it is ON, only the selected executor is used, and search or browser output is passed to local Ollama as untrusted context for the final answer. Web ON + Send explicitly authorizes one web request for that send.
+When Web Search is OFF, Taceta creates no external request. When it is ON, only the selected executor is used, and search or browser output is passed to local Ollama as untrusted context for the final answer. ChatGPT Web defaults to one request and can be limited from one to three independently of the search-result limit used by Google and other search providers. After the configured limit is reached (the fourth request at the maximum setting), Taceta rejects further `web_search` requests instead of sending them to ChatGPT Web, and the local model synthesizes the final answer from the responses already collected, up to three.
 
 ## Screenshots
 
@@ -193,7 +193,7 @@ Taceta (Rust/egui)
 
 Taceta Link consists of the MV3 extension in `browser-extension/`, the Native Messaging Host `org.mlabo.taceta.link`, and a per-user Unix socket. The extension prefers an existing normal browser window, creates a working tab/group, and tracks only the exact tab/group created by Taceta. It never closes the browser window. A product-version, protocol-version, or fixed-extension-ID mismatch fails closed.
 
-The ChatGPT Web route sends only the prompt currently in the composer. It does not read, send, or store conversation history, system messages, attachments, Thinking traces, cookies, tokens, profiles, or local storage. ChatGPT Web output is received incrementally, while local Ollama remains responsible for the final answer. This experimental route can break when the web UI or service conditions change.
+The first ChatGPT Web request sends the current composer prompt exactly. Only when two or three requests are explicitly selected do later requests attach the selected local model's `web_search` query to the original prompt as an unverified additional research angle. ChatGPT is instructed to correct mistaken names, versions, and premises. The “local model angle” status shown in Taceta is a temporary progress label identifying the source of the follow-up query; it is not ChatGPT's internal reasoning or conversation history. Taceta does not directly read, send, or store conversation history, system messages, attachments, Thinking traces, cookies, tokens, profiles, or local storage. ChatGPT Web output is received incrementally, while local Ollama remains responsible for the final answer. This experimental route can break when the web UI or service conditions change.
 
 ## Security and privacy
 
