@@ -20,7 +20,8 @@ use taceta::{
         OllamaEndpointMode, OllamaEndpointSource, OllamaModelManager,
     },
     domain::{
-        Attachment, AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelCandidate,
+        Attachment, AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent,
+        MAX_CHATGPT_WEB_REQUEST_LIMIT, MIN_CHATGPT_WEB_REQUEST_LIMIT, ModelCandidate,
         ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingCapability,
         ThinkingLevel, ThinkingMode,
     },
@@ -1179,6 +1180,7 @@ impl TacetaApp {
                 self.state.web_search_provider,
             ),
             max_search_results: self.state.max_search_results,
+            chatgpt_web_request_limit: self.state.chatgpt_web_request_limit,
             fetch_search_pages: self.state.fetch_search_pages,
             web_authorization: web_search_enabled.then(|| WebAuthorization {
                 request_id: Uuid::new_v4(),
@@ -2203,14 +2205,47 @@ impl TacetaApp {
                                     }
                                 }
                             });
-                            ui.horizontal(|ui| {
-                                ui.label(text(language, "最大検索結果", "Max results"));
-                                let mut value = self.state.max_search_results as i32;
-                                if ui.add(egui::Slider::new(&mut value, 1..=5).integer().show_value(true)).changed() {
-                                    self.state.max_search_results = value as u8;
-                                }
-                            });
-                            ui.checkbox(&mut self.state.fetch_search_pages, text(language, "検索結果の本文も取得", "Fetch result pages"));
+                            if self.state.web_search_provider == ProviderKind::ChatGptWeb {
+                                ui.horizontal(|ui| {
+                                    ui.label(text(
+                                        language,
+                                        "ChatGPT最大質問回数",
+                                        "Max ChatGPT requests",
+                                    ));
+                                    let mut value = self.state.chatgpt_web_request_limit as i32;
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut value,
+                                                MIN_CHATGPT_WEB_REQUEST_LIMIT as i32
+                                                    ..=MAX_CHATGPT_WEB_REQUEST_LIMIT as i32,
+                                            )
+                                            .integer()
+                                            .show_value(true),
+                                        )
+                                        .changed()
+                                    {
+                                        self.state.chatgpt_web_request_limit = value as u8;
+                                    }
+                                });
+                                ui.label(
+                                    RichText::new(text(
+                                        language,
+                                        "通常は1回です。2〜3回を明示した場合だけ、ローカルモデルの追加調査案を元の質問に添えて送り、回答をまとめます。",
+                                        "The normal setting is 1. Only when 2–3 is explicitly selected are the local model's additional research angles sent with the original question and the answers combined.",
+                                    ))
+                                    .weak(),
+                                );
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.label(text(language, "最大検索結果", "Max results"));
+                                    let mut value = self.state.max_search_results as i32;
+                                    if ui.add(egui::Slider::new(&mut value, 1..=5).integer().show_value(true)).changed() {
+                                        self.state.max_search_results = value as u8;
+                                    }
+                                });
+                                ui.checkbox(&mut self.state.fetch_search_pages, text(language, "検索結果の本文も取得", "Fetch result pages"));
+                            }
                             if let Some(account) = self.state.web_search_provider.account_name() {
                                 ui.add_space(8.0);
                                 ui.label(text(language, "APIキー（macOS Keychainに保存）", "API key (saved in macOS Keychain)"));

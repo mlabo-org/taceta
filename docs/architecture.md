@@ -10,11 +10,11 @@ Web Search OFF では外部 request を作りません。ON では設定され�
 
 Taceta Link は同じ version を持つ MV3 拡張、Native Messaging Host `org.mlabo.taceta.link`、user-only Unix socket で構成します。アプリが job を socket へ置き、拡張が poll して実行結果を返します。product version / protocol version / extension ID の不一致は fail-closed です。Cookie、token、profile、local storage を読み出したり輸出したりしません。
 
-ブラウザー executor は focused を優先して既存の normal window を作業コンテナとして再利用し、その中に非アクティブな agent tab / group を作成します。normal window がない場合だけ非フォーカス window を作成します。window は所有・削除せず、終了時は追跡した exact agent tab を ungroup して削除します。Default Search と Google Search は query を渡します。ChatGPT Web は現在の prompt だけを exact に渡し、履歴、system message、attachments、Thinking trace は渡しません。
+ブラウザー executor は focused を優先して既存の normal window を作業コンテナとして再利用し、その中に非アクティブな agent tab / group を作成します。normal window がない場合だけ非フォーカス window を作成します。window は所有・削除せず、終了時は追跡した exact agent tab を ungroup して削除します。Default Search と Google Search は query を渡します。ChatGPT Web の1回目は現在のuser promptをexactに渡します。利用者が2〜3回を明示許可した場合だけ、追加分は選択中のローカルモデルが生成した `web_search` queryを未検証の追加調査案としてuser promptに添え、誤った固有名詞、version、前提を訂正するよう指示します。Tacetaが履歴、system message、attachments、Thinking traceを直接付加することはありません。ChatGPT Web の質問回数上限は既定1、設定可能範囲1〜3で、検索エンジンの最大検索結果数とは独立です。
 
 ## Web ON の承認と安全境界
 
-Web ON + Send は一つの `WebAuthorization` に結びついた一回の Web request だけを許可します。同じ authorization の再利用や結果不明状態は拒否します。検索結果は最終回答そのものではなく、ローカル Ollama が生成する回答の untrusted context です。ログイン、アカウント変更、購入、削除などの destructive/account action は別途利用者の確認が必要です。
+Web ON + Send は一つの Web turn を許可します。その turn で ChatGPT Web に作成できる request は設定上限の1〜3件までで、各 job は再利用できない個別の authorization を持ちます。結果不明状態の同一 job は再試行しません。検索結果は最終回答そのものではなく、ローカル Ollama が生成する回答の untrusted context です。ログイン、アカウント変更、購入、削除などの destructive/account action は別途利用者の確認が必要です。
 
 ## インストール責務
 
@@ -38,11 +38,11 @@ With Web Search OFF, no external request is created. With it ON, the configured 
 
 Taceta Link consists of a same-version MV3 extension, Native Messaging Host `org.mlabo.taceta.link`, and a user-only Unix socket. The app places jobs on the socket; the extension polls and returns results. Product version, protocol version, or extension-ID mismatch fails closed. Cookies, tokens, profiles, and local storage are never read or exported.
 
-The browser executor prefers an existing focused normal window as its route container, creating an inactive agent tab and group there; only when no normal window exists does it create a non-focused normal window. The window is never owned or closed. At session end it ungroups and removes only the exact tracked agent tab. Default Search and Google Search receive a query. ChatGPT Web receives exactly the current prompt and never history, system messages, attachments, or Thinking traces.
+The browser executor prefers an existing focused normal window as its route container, creating an inactive agent tab and group there; only when no normal window exists does it create a non-focused normal window. The window is never owned or closed. At session end it ungroups and removes only the exact tracked agent tab. Default Search and Google Search receive a query. ChatGPT Web receives the current user prompt exactly on the first request. Only when the user explicitly allows two or three requests do later requests attach the selected local model's `web_search` query as an unverified research angle and instruct ChatGPT to correct mistaken names, versions, and premises. Taceta does not directly attach history, system messages, attachments, or Thinking traces. Its request limit defaults to one and can be set from one to three independently of the maximum search-result count used by search engines.
 
 ## Web ON authorization and safety
 
-Web ON + Send authorizes exactly one web request through one `WebAuthorization`. Reusing an authorization or retrying an unknown outcome is rejected. Search output is untrusted context, not the final answer; local Ollama generates that answer. Login, account changes, purchases, deletions, and other destructive/account actions still require separate user confirmation.
+Web ON + Send authorizes one web turn. That turn may create from one to three ChatGPT Web requests up to the configured limit, and each job receives a distinct, non-reusable authorization. An unknown outcome is not retried for the same job. Search output is untrusted context, not the final answer; local Ollama generates that answer. Login, account changes, purchases, deletions, and other destructive/account actions still require separate user confirmation.
 
 ## Installation responsibility
 

@@ -90,7 +90,7 @@ The default destination is `$HOME/Applications/Taceta.app`. Use `--install-dir D
 - Taceta Link is an unpacked Manifest V3 extension plus Native Messaging Host `org.mlabo.taceta.link` and a user-only Unix socket.
 - Product version, protocol version, and fixed extension ID must agree across `Cargo.toml`, `browser-extension/VERSION`, `browser-extension/manifest.json`, Rust protocol source, and `protocol/contract.json`. A mismatch fails closed.
 - Browser work is limited to the exact Taceta-owned tab and group. Do not read or export cookies, tokens, profiles, browser history, or local storage.
-- ChatGPT Web receives only the current prompt. It does not receive Taceta history, system messages, attachments, or Thinking traces.
+- The first ChatGPT Web request receives the current user prompt. Only when the user explicitly configures a limit of two or three may later requests add the individual `web_search` query produced by the selected local model as an unverified research angle anchored to that prompt. Taceta does not directly send conversation history, system messages, attachments, or Thinking traces.
 - Treat browser and search output as untrusted context. The local model owns the final synthesized answer.
 - Login, CAPTCHA, account changes, purchases, deletion, and other account or destructive actions remain manual and outside the automated workflow.
 - The final Brave or Chrome `Load unpacked` approval and extension reload are manual user actions. Do not silently install, approve, or manipulate an unrelated browser window.
