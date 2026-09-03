@@ -779,6 +779,7 @@ impl TacetaApp {
                 match generation_result {
                     Ok(()) => {
                         self.connection = ConnectionState::Ready;
+                        self.notice = None;
                     }
                     Err(error) => {
                         if is_web_search_error(&error) {
@@ -830,6 +831,12 @@ impl TacetaApp {
                         message.content.clear();
                     }
                     message.content.push_str(&delta);
+                });
+            }
+            GenerationEvent::ReplaceContent(content) => {
+                self.external_preview_ids.remove(&assistant_id);
+                self.update_assistant(conversation_id, assistant_id, |message| {
+                    message.content = content;
                 });
             }
             GenerationEvent::ExternalContentDelta { delta, replace } => {
@@ -1217,6 +1224,7 @@ impl TacetaApp {
         active.task.abort();
         let language = self.language();
         self.update_assistant(active.conversation_id, active.assistant_id, |message| {
+            message.interrupted = true;
             if message.content.is_empty() {
                 message.content =
                     text(language, "生成を停止しました。", "Generation stopped.").to_owned();
@@ -2160,8 +2168,8 @@ impl TacetaApp {
                             ui.add_space(4.0);
                             ui.label(RichText::new(text(
                                 language,
-                                "会話ごとにONにできます。通常会話は検索せず、現在の入力に明白な検索意図があるときだけ、回答前に最低1回検索します。LLMがtool callを返さず、直ちに検索する意思だけを通常テキストで明言した場合は、その予告文を表示せず同じ入力を1ターン1回だけ検索へ回します。検索の説明・過去形・否定・質問・通常会話は対象外です。過去の履歴は意図判定に使いません。",
-                                "Enable per conversation. Normal conversation is not forced to search; only a clear search intent in the current input requires at least one search before answering. If the LLM returns no tool call but plainly states in ordinary text that it will search immediately, Taceta suppresses that announcement and routes the same input to search once per turn. Explanations, past-tense statements, negations, questions about searching, and normal conversation are excluded. Conversation history is not used to detect intent.",
+                                "Web ON時は、現在の入力だけをローカルLLMが判定します。必要なときだけ選択中の検索先へ送ります。",
+                                "When Web is ON, the local LLM classifies only the current input. Taceta uses the selected search route only when needed.",
                             )).weak());
                             ui.add_space(10.0);
                             ui.horizontal(|ui| {
@@ -3064,8 +3072,8 @@ impl TacetaApp {
                                         )
                                         .on_hover_text(text(
                                             language,
-                                            "この会話だけWeb検索を許可します。通常会話は検索せず、現在の入力に明白な検索意図がある場合だけ回答前に最低1回検索します。LLMがtool callを返さず、直ちに検索する意思だけを通常テキストで明言した場合は、その予告文を表示せず同じ入力を1ターン1回だけ検索へ回します。検索の説明・過去形・否定・質問・通常会話は対象外です。検索時は検索語と取得先が外部へ送信されます。",
-                                            "Allow Web Search for this conversation. Normal conversation is not forced to search; a clear search intent in the current input requires at least one search before answering. If the LLM returns no tool call but plainly states in ordinary text that it will search immediately, Taceta suppresses that announcement and routes the same input to search once per turn. Explanations, past-tense statements, negations, questions about searching, and normal conversation are excluded. When searching, queries and fetched URLs leave this Mac.",
+                                            "現在入力だけをローカル判定し、必要なときだけ検索します。",
+                                            "Classify only the current input locally and search only when needed.",
                                         ))
                                         .clicked()
                                     {
@@ -3076,8 +3084,8 @@ impl TacetaApp {
                                                 kind: NoticeKind::Info,
                                                 text: text(
                                                     language,
-                                                    "Web検索：ON\n通常会話は検索しません",
-                                                    "Web Search: ON\nNormal conversation stays local",
+                                                    "Web：自動判定ON",
+                                                    "Web: Auto routing ON",
                                                 )
                                                 .to_owned(),
                                             });
@@ -3636,6 +3644,7 @@ fn is_web_search_error(error: &str) -> bool {
     [
         "web search",
         "web provider",
+        "web routing",
         "web_fetch",
         "web_search",
         "tool support",
@@ -3649,6 +3658,14 @@ fn is_web_search_error(error: &str) -> bool {
 
 fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
     let lower = error.to_ascii_lowercase();
+    if lower.contains("web routing") {
+        return text(
+            language,
+            "Web検索の要否を判定できませんでした。ブラウザーには送信していません。もう一度お試しください。",
+            "Taceta could not decide whether Web Search was needed. Nothing was sent to the browser; try again.",
+        )
+        .to_owned();
+    }
     if lower.contains("keychain credential") && lower.contains("brave") {
         return text(
             language,
@@ -4201,9 +4218,19 @@ mod web_search_request_tests {
     fn provider_failures_are_separate_from_local_connection_failures() {
         assert!(is_web_search_error("web provider request failed"));
         assert!(is_web_search_error(
+            "web routing returned invalid JSON; nothing was sent to the browser"
+        ));
+        assert!(is_web_search_error(
             "selected model does not advertise tool support"
         ));
         assert!(!is_web_search_error("Ollama endpoint is unavailable"));
+        assert!(
+            web_search_error_message(
+                "web routing returned invalid JSON; nothing was sent to the browser",
+                AppShellLanguage::Japanese,
+            )
+            .contains("ブラウザーには送信していません")
+        );
     }
 
     #[test]

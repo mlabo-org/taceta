@@ -3,6 +3,7 @@ mod capability;
 mod client;
 mod endpoint;
 mod lifecycle;
+mod router;
 mod stream;
 
 pub use client::{OllamaClient, OllamaModelManager};

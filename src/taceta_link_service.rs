@@ -42,6 +42,12 @@ pub struct LinkJob {
 const CHATGPT_WEB_HARD_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const CHATGPT_WEB_IDLE_TIMEOUT_MS: u64 = 3 * 60 * 1_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatGptPromptSource {
+    CurrentUserInput,
+    LocalModelQuery,
+}
+
 impl LinkJob {
     pub fn search(
         workflow: WebWorkflow,
@@ -205,10 +211,42 @@ pub enum LinkError {
 #[derive(Clone, Default)]
 pub struct TacetaLinkService {
     queue: Arc<Mutex<VecDeque<LinkJob>>>,
+    /// Jobs inserted by `enqueue_and_wait*` must still have a live receiver
+    /// when the extension polls them. Directly enqueued jobs keep their
+    /// existing fire-and-forget behavior.
+    waiting_queue_jobs: Arc<Mutex<HashSet<Uuid>>>,
     waiters: Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<LinkResult, LinkError>>>>>,
     progress_waiters: Arc<Mutex<HashMap<Uuid, UnboundedSender<LinkProgress>>>>,
     used_authorizations: Arc<Mutex<HashSet<Uuid>>>,
     last_seen: Arc<Mutex<Option<Instant>>>,
+}
+
+struct PendingJobRegistration {
+    service: TacetaLinkService,
+    job_id: Uuid,
+    armed: bool,
+}
+
+impl PendingJobRegistration {
+    fn new(service: TacetaLinkService, job_id: Uuid) -> Self {
+        Self {
+            service,
+            job_id,
+            armed: true,
+        }
+    }
+
+    fn complete(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingJobRegistration {
+    fn drop(&mut self) {
+        if self.armed {
+            self.service.cancel_pending_job(self.job_id);
+        }
+    }
 }
 
 const EXTENSION_HEARTBEAT_TTL: Duration = Duration::from_secs(90);
@@ -262,7 +300,15 @@ impl TacetaLinkService {
                 .expect("link progress waiters")
                 .insert(job_id, progress);
         }
+        self.waiting_queue_jobs
+            .lock()
+            .expect("waiting link jobs")
+            .insert(job_id);
         if let Err(error) = self.enqueue(job) {
+            self.waiting_queue_jobs
+                .lock()
+                .expect("waiting link jobs")
+                .remove(&job_id);
             self.waiters.lock().expect("link waiters").remove(&job_id);
             self.progress_waiters
                 .lock()
@@ -270,7 +316,50 @@ impl TacetaLinkService {
                 .remove(&job_id);
             return Err(error);
         }
-        receiver.await.map_err(|_| LinkError::Unavailable)?
+        let registration = PendingJobRegistration::new(self.clone(), job_id);
+        let outcome = receiver.await.map_err(|_| LinkError::Unavailable)?;
+        registration.complete();
+        outcome
+    }
+
+    fn cancel_pending_job(&self, job_id: Uuid) {
+        self.queue
+            .lock()
+            .expect("link queue")
+            .retain(|job| job.job_id != job_id);
+        self.waiting_queue_jobs
+            .lock()
+            .expect("waiting link jobs")
+            .remove(&job_id);
+        self.waiters.lock().expect("link waiters").remove(&job_id);
+        self.progress_waiters
+            .lock()
+            .expect("link progress waiters")
+            .remove(&job_id);
+    }
+
+    fn pop_next_live_job(&self) -> Option<LinkJob> {
+        loop {
+            let job = self.queue.lock().expect("link queue").pop_front()?;
+            let requires_live_waiter = self
+                .waiting_queue_jobs
+                .lock()
+                .expect("waiting link jobs")
+                .remove(&job.job_id);
+            if !requires_live_waiter {
+                return Some(job);
+            }
+            let live = self
+                .waiters
+                .lock()
+                .expect("link waiters")
+                .get(&job.job_id)
+                .is_some_and(|waiter| !waiter.is_closed());
+            if live {
+                return Some(job);
+            }
+            self.cancel_pending_job(job.job_id);
+        }
     }
     #[cfg(unix)]
     pub fn serve_connection(
@@ -296,7 +385,7 @@ impl TacetaLinkService {
                 )
             }
             Operation::PollJob => {
-                let job = self.queue.lock().expect("link queue").pop_front();
+                let job = self.pop_next_live_job();
                 let payload = match job {
                     // The extension scopes a job authorization to the Native
                     // Messaging connection that polled it.  The app creates
@@ -331,6 +420,10 @@ impl TacetaLinkService {
                     .and_then(Value::as_str)
                     .and_then(|s| Uuid::parse_str(s).ok())
                 {
+                    self.waiting_queue_jobs
+                        .lock()
+                        .expect("waiting link jobs")
+                        .remove(&id);
                     self.progress_waiters
                         .lock()
                         .expect("link progress waiters")
@@ -487,14 +580,16 @@ fn normalize_progress(payload: Value) -> Result<LinkProgress, LinkError> {
     })
 }
 
-/// Build one ChatGPT Web job for a user-authorized Web turn. The first request
-/// preserves the current input exactly. Explicitly enabled follow-ups retain
-/// that input as the authority and add the local model's tool query only as an
-/// unverified research angle.
+/// Build one ChatGPT Web job for a user-authorized Web turn. A direct search
+/// preserves the current input exactly. When the local model first creates the
+/// concrete research question, the prompt keeps the current input as authority
+/// and also carries that model query. Explicitly enabled follow-ups use the
+/// same anchored envelope.
 pub fn chatgpt_job_for_turn(
     current_input: &ChatMessage,
     query: &str,
     request_ordinal: u8,
+    prompt_source: ChatGptPromptSource,
     authorization: WebAuthorization,
 ) -> Result<LinkJob, LinkError> {
     if current_input.role != Role::User {
@@ -507,13 +602,16 @@ pub fn chatgpt_job_for_turn(
             "ChatGPT request ordinal must be between 1 and 3",
         ));
     }
-    let prompt = if request_ordinal == 1 {
-        current_input.content.clone()
-    } else {
-        format!(
+    let prompt = match (request_ordinal, prompt_source) {
+        (1, ChatGptPromptSource::CurrentUserInput) => current_input.content.clone(),
+        (1, ChatGptPromptSource::LocalModelQuery) => format!(
+            "Original user request:\n{}\n\nConcrete research question proposed by the local model:\n{}\n\nResearch the concrete question. Treat names, versions, and premises in the local-model question as unverified and correct them when necessary. Return the findings needed to answer that question.",
+            current_input.content, query
+        ),
+        _ => format!(
             "Original user request:\n{}\n\nAdditional research angle proposed by the local model:\n{}\n\nResearch the original request from this additional angle. Treat names, versions, and premises in the additional angle as unverified and correct them when necessary. Return findings relevant to the original request.",
             current_input.content, query
-        )
+        ),
     };
     LinkJob::chatgpt(prompt, authorization)
 }
@@ -523,6 +621,7 @@ pub fn job_for_workflow(
     query: Option<&str>,
     current_input: Option<&ChatMessage>,
     chatgpt_request_ordinal: u8,
+    chatgpt_prompt_source: ChatGptPromptSource,
     authorization: WebAuthorization,
 ) -> Result<LinkJob, LinkError> {
     let job_authorization = fresh_job_authorization(&authorization);
@@ -537,6 +636,7 @@ pub fn job_for_workflow(
             current_input.ok_or(LinkError::InvalidJob("current user input is required"))?,
             query.ok_or(LinkError::InvalidJob("query is required"))?,
             chatgpt_request_ordinal,
+            chatgpt_prompt_source,
             job_authorization,
         ),
     }
@@ -583,7 +683,7 @@ mod tests {
         ));
     }
     #[test]
-    fn chatgpt_web_first_prompt_is_exact_and_followups_anchor_the_tool_query() {
+    fn chatgpt_web_first_prompt_preserves_direct_input_and_anchors_generated_question() {
         let mut input = ChatMessage::new_user("  exact\ninput  ");
         input.thinking = "private trace".into();
         input.attachments.push(crate::domain::Attachment {
@@ -598,14 +698,35 @@ mod tests {
             &input,
             "incorrect model/version premise",
             1,
+            ChatGptPromptSource::CurrentUserInput,
             authorization.clone(),
         )
         .unwrap();
         assert_eq!(first.prompt.as_deref(), Some("  exact\ninput  "));
 
-        let followup =
-            chatgpt_job_for_turn(&input, "incorrect model/version premise", 2, authorization)
-                .unwrap();
+        let planned = chatgpt_job_for_turn(
+            &input,
+            "Which new model should be researched?",
+            1,
+            ChatGptPromptSource::LocalModelQuery,
+            authorization.clone(),
+        )
+        .unwrap();
+        let planned_prompt = planned.prompt.unwrap();
+        assert!(planned_prompt.contains("  exact\ninput  "));
+        assert!(planned_prompt.contains("Which new model should be researched?"));
+        assert!(planned_prompt.contains("Research the concrete question"));
+        assert!(!planned_prompt.contains("private trace"));
+        assert!(!planned_prompt.contains("private attachment"));
+
+        let followup = chatgpt_job_for_turn(
+            &input,
+            "incorrect model/version premise",
+            2,
+            ChatGptPromptSource::LocalModelQuery,
+            authorization,
+        )
+        .unwrap();
         let prompt = followup.prompt.unwrap();
         assert!(prompt.contains("  exact\ninput  "));
         assert!(prompt.contains("incorrect model/version premise"));
@@ -624,6 +745,7 @@ mod tests {
             &input,
             "additional angle",
             4,
+            ChatGptPromptSource::CurrentUserInput,
             WebAuthorization {
                 request_id: Uuid::new_v4(),
                 session_id: Uuid::new_v4(),
@@ -647,6 +769,45 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn dropping_a_pending_wait_removes_its_job_and_receivers() {
+        let service = TacetaLinkService::default();
+        let authorization = WebAuthorization {
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+        };
+        let job = LinkJob::search(WebWorkflow::GoogleSearch, "stale", authorization).unwrap();
+        let job_id = job.job_id;
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        {
+            let pending = service.enqueue_and_wait_with_progress(job, progress_tx);
+            tokio::pin!(pending);
+            assert!(futures_util::poll!(&mut pending).is_pending());
+            assert_eq!(service.queue.lock().unwrap().len(), 1);
+            assert!(service.waiters.lock().unwrap().contains_key(&job_id));
+            assert!(
+                service
+                    .progress_waiters
+                    .lock()
+                    .unwrap()
+                    .contains_key(&job_id)
+            );
+        }
+
+        assert!(service.queue.lock().unwrap().is_empty());
+        assert!(service.waiting_queue_jobs.lock().unwrap().is_empty());
+        assert!(!service.waiters.lock().unwrap().contains_key(&job_id));
+        assert!(
+            !service
+                .progress_waiters
+                .lock()
+                .unwrap()
+                .contains_key(&job_id)
+        );
+        assert!(service.pop_next_live_job().is_none());
+    }
+
     #[test]
     fn each_job_in_one_web_turn_has_a_fresh_replay_nonce() {
         let turn = WebAuthorization {
@@ -658,6 +819,7 @@ mod tests {
             Some("latest Rust release"),
             None,
             1,
+            ChatGptPromptSource::CurrentUserInput,
             turn.clone(),
         )
         .unwrap();

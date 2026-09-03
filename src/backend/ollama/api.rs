@@ -54,10 +54,34 @@ pub(super) struct ChatBody {
     pub think: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<serde_json::Value>,
 }
 #[derive(Debug, Serialize)]
 pub(super) struct ChatOptions {
     pub num_ctx: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_predict: Option<u32>,
+}
+
+impl ChatOptions {
+    pub(super) fn generation(num_ctx: u32) -> Self {
+        Self {
+            num_ctx,
+            temperature: None,
+            num_predict: None,
+        }
+    }
+
+    pub(super) fn web_routing(num_ctx: u32) -> Self {
+        Self {
+            num_ctx: num_ctx.clamp(4_096, 8_192),
+            temperature: Some(0.0),
+            num_predict: Some(160),
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct WireMessage {

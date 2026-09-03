@@ -2,7 +2,7 @@ use super::{
     api::{ChatBody, ChatOptions, PullBody, PullChunk, ShowResponse, TagsResponse, WireMessage},
     capability,
     endpoint::OllamaEndpoint,
-    lifecycle, stream,
+    lifecycle, router, stream,
 };
 use crate::{
     backend::{BackendError, BackendFuture, InferenceBackend, ModelManager},
@@ -11,7 +11,7 @@ use crate::{
         ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingMode, WebWorkflow,
         normalize_chatgpt_web_request_limit,
     },
-    taceta_link_service::{self, LinkProgress, LinkResult, TacetaLinkService},
+    taceta_link_service::{self, ChatGptPromptSource, LinkProgress, LinkResult, TacetaLinkService},
     web_search::{self, ProviderKind, ToolCall, WebSearchProvider},
 };
 use futures_util::StreamExt;
@@ -127,8 +127,20 @@ impl InferenceBackend for OllamaClient {
             if link_workflow.is_some() && client.link_service.is_none() {
                 return Err(BackendError::Protocol("Taceta Link is unavailable".into()));
             }
-            let mut messages: Vec<WireMessage> =
-                request.messages.iter().map(wire_message).collect();
+            let current_input = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::User)
+                .ok_or_else(|| {
+                    BackendError::Protocol("Web routing requires a current user input".into())
+                })?;
+            let route = if tools.is_some() {
+                determine_web_route(&client, &request, current_input, &events).await?
+            } else {
+                router::WebRouteDecision::Local
+            };
+            let mut messages = wire_conversation_messages(&request.messages);
             if request.fetch_search_pages
                 && matches!(
                     &link_workflow,
@@ -148,29 +160,38 @@ impl InferenceBackend for OllamaClient {
             let mut fetch_count = 0usize;
             let mut chatgpt_web_budget =
                 ChatGptWebRequestBudget::new(request.chatgpt_web_request_limit);
-            let current_input = request.messages.iter().rev().find(|m| m.role == Role::User);
-            let mandatory_call = mandatory_initial_web_search_call(&request)?;
+            let initial_search = initial_web_search_call(&request, &route)?;
             let mut forced_search_exhausted_chatgpt_budget = false;
             let mut web_tool_phase_started = false;
-            if let Some(call) = mandatory_call {
+            if let Some((call, trigger)) = initial_search {
                 forced_search_exhausted_chatgpt_budget = perform_forced_web_search(
                     &client,
                     &request,
                     provider.as_ref(),
                     link_workflow.clone(),
-                    current_input,
+                    Some(current_input),
                     call,
                     &events,
                     &mut chatgpt_web_budget,
                     &mut fetch_count,
                     &mut seen,
                     &mut messages,
-                    ForcedSearchTrigger::CurrentUserInput,
+                    trigger,
                 )
                 .await?;
                 web_tool_phase_started = true;
             }
             let mut assistant_search_fallback_used = false;
+            let local_route = matches!(route, router::WebRouteDecision::Local);
+            if tools.is_some() && local_route {
+                messages.push(WireMessage {
+                    role: "system".into(),
+                    content: "このターンは外部検索なしで回答します。検索すると予告せず、利用可能な会話内容から直接回答してください。現在の事実が不確かな場合は推測で補わず、その限界を明示してください。".into(),
+                    images: Vec::new(),
+                    tool_calls: None,
+                    tool_name: None,
+                });
+            }
             for round in 0..4 {
                 if web_tool_phase_started {
                     let _ = events.send(GenerationEvent::SearchProgress(
@@ -181,15 +202,14 @@ impl InferenceBackend for OllamaClient {
                     model: request.model.clone(),
                     messages: messages.clone(),
                     stream: true,
-                    options: ChatOptions {
-                        num_ctx: request.context_length,
-                    },
+                    options: ChatOptions::generation(request.context_length),
                     think: think_value(request.thinking),
-                    tools: if forced_search_exhausted_chatgpt_budget {
+                    tools: if forced_search_exhausted_chatgpt_budget || local_route {
                         None
                     } else {
                         tools.clone()
                     },
+                    format: None,
                 };
                 let response = client
                     .http
@@ -198,30 +218,22 @@ impl InferenceBackend for OllamaClient {
                     .send()
                     .await?
                     .error_for_status()?;
-                let probe_assistant_search_intent = should_probe_assistant_search_intent(
-                    tools.is_some(),
-                    web_tool_phase_started,
-                    forced_search_exhausted_chatgpt_budget,
-                    assistant_search_fallback_used,
-                );
-                let streamed = if probe_assistant_search_intent {
-                    stream::consume_buffering_content(response.bytes_stream(), events.clone())
-                        .await?
-                } else {
-                    stream::consume(response.bytes_stream(), events.clone()).await?
-                };
+                let streamed = stream::consume(response.bytes_stream(), events.clone()).await?;
                 if streamed.tool_calls.is_empty() {
-                    if probe_assistant_search_intent
+                    if tools.is_some()
+                        && !web_tool_phase_started
+                        && !assistant_search_fallback_used
                         && web_search::expresses_immediate_search_intent(&streamed.content)
                     {
                         assistant_search_fallback_used = true;
-                        let call = current_input_web_search_call(&request)?;
+                        let _ = events.send(GenerationEvent::ReplaceContent(String::new()));
+                        let call = assistant_intent_web_search_call(&request, &streamed.content)?;
                         forced_search_exhausted_chatgpt_budget = perform_forced_web_search(
                             &client,
                             &request,
                             provider.as_ref(),
                             link_workflow.clone(),
-                            current_input,
+                            Some(current_input),
                             call,
                             &events,
                             &mut chatgpt_web_budget,
@@ -234,11 +246,13 @@ impl InferenceBackend for OllamaClient {
                         web_tool_phase_started = true;
                         continue;
                     }
-                    if probe_assistant_search_intent && !streamed.content.is_empty() {
-                        let _ = events.send(GenerationEvent::ContentDelta(streamed.content));
-                    }
                     let _ = events.send(GenerationEvent::Completed(streamed.stats));
                     return Ok(());
+                }
+                if local_route {
+                    return Err(BackendError::Protocol(
+                        "local web routing produced an undeclared tool call".into(),
+                    ));
                 }
                 if provider.is_none() && link_workflow.is_none() {
                     return Err(BackendError::Protocol(
@@ -293,6 +307,7 @@ impl InferenceBackend for OllamaClient {
                                     request.web_authorization.clone(),
                                     request.messages.iter().rev().find(|m| m.role == Role::User),
                                     chatgpt_request_ordinal,
+                                    ChatGptPromptSource::LocalModelQuery,
                                     &call,
                                     &events,
                                     &mut fetch_count,
@@ -339,11 +354,10 @@ impl InferenceBackend for OllamaClient {
                         model: request.model.clone(),
                         messages,
                         stream: true,
-                        options: ChatOptions {
-                            num_ctx: request.context_length,
-                        },
+                        options: ChatOptions::generation(request.context_length),
                         think: think_value(request.thinking),
                         tools: None,
+                        format: None,
                     };
                     let response = client
                         .http
@@ -408,6 +422,30 @@ fn wire_message(message: &ChatMessage) -> WireMessage {
     }
 }
 
+fn wire_conversation_messages(messages: &[ChatMessage]) -> Vec<WireMessage> {
+    messages
+        .iter()
+        .filter(|message| message_is_model_context(message))
+        .map(wire_message)
+        .collect()
+}
+
+fn message_is_model_context(message: &ChatMessage) -> bool {
+    if message.interrupted {
+        return false;
+    }
+    if message.role != Role::Assistant {
+        return true;
+    }
+    !matches!(
+        message.content.trim(),
+        "生成を停止しました"
+            | "生成を停止しました。"
+            | "Generation stopped"
+            | "Generation stopped."
+    )
+}
+
 fn validate_tools(
     tools: Option<&serde_json::Value>,
 ) -> Result<Option<serde_json::Value>, BackendError> {
@@ -432,21 +470,56 @@ fn validate_tools(
     Ok(Some(value.clone()))
 }
 
-fn mandatory_initial_web_search_call(
+async fn determine_web_route(
+    client: &OllamaClient,
     request: &ChatRequest,
-) -> Result<Option<ToolCall>, BackendError> {
+    current_input: &ChatMessage,
+    events: &UnboundedSender<GenerationEvent>,
+) -> Result<router::WebRouteDecision, BackendError> {
+    if web_search::requires_mandatory_search(&current_input.content) {
+        return Ok(router::WebRouteDecision::SearchCurrent {
+            query: current_input.content.trim().to_owned(),
+        });
+    }
+    let _ = events.send(GenerationEvent::SearchProgress(
+        "Web検索の要否を判定中".into(),
+    ));
+    router::classify(
+        &client.http,
+        client.url("/api/chat"),
+        &request.model,
+        &current_input.content,
+        request.context_length,
+    )
+    .await
+}
+
+fn initial_web_search_call(
+    request: &ChatRequest,
+    route: &router::WebRouteDecision,
+) -> Result<Option<(ToolCall, ForcedSearchTrigger)>, BackendError> {
     if request.tools.is_none() {
         return Ok(None);
     }
-    let Some(current_input) = request.messages.iter().rev().find(|m| m.role == Role::User) else {
-        return Err(BackendError::Protocol(
-            "Web Search requires a current user input".into(),
-        ));
+    let (query, trigger) = match route {
+        router::WebRouteDecision::Local => return Ok(None),
+        router::WebRouteDecision::SearchCurrent { query } => {
+            (query.as_str(), ForcedSearchTrigger::CurrentUserInput)
+        }
+        router::WebRouteDecision::SearchGenerated { query } => {
+            (query.as_str(), ForcedSearchTrigger::ModelGeneratedQuery)
+        }
     };
-    if !web_search::requires_mandatory_search(&current_input.content) {
-        return Ok(None);
-    }
-    current_input_web_search_call(request).map(Some)
+    Ok(Some((
+        ToolCall {
+            name: "web_search".into(),
+            arguments: serde_json::json!({
+                "query": query,
+                "limit": request.max_search_results.clamp(1, 5),
+            }),
+        },
+        trigger,
+    )))
 }
 
 fn current_input_web_search_call(request: &ChatRequest) -> Result<ToolCall, BackendError> {
@@ -470,16 +543,15 @@ fn current_input_web_search_call(request: &ChatRequest) -> Result<ToolCall, Back
     })
 }
 
-fn should_probe_assistant_search_intent(
-    tools_enabled: bool,
-    web_tool_phase_started: bool,
-    web_request_budget_exhausted: bool,
-    assistant_search_fallback_used: bool,
-) -> bool {
-    tools_enabled
-        && !web_tool_phase_started
-        && !web_request_budget_exhausted
-        && !assistant_search_fallback_used
+fn assistant_intent_web_search_call(
+    request: &ChatRequest,
+    assistant_output: &str,
+) -> Result<ToolCall, BackendError> {
+    let mut call = current_input_web_search_call(request)?;
+    if let Some(query) = web_search::concrete_search_query_from_assistant(assistant_output) {
+        call.arguments["query"] = serde_json::Value::String(query);
+    }
+    Ok(call)
 }
 
 fn wire_tool_call(call: &ToolCall) -> serde_json::Value {
@@ -491,10 +563,22 @@ fn wire_tool_call(call: &ToolCall) -> serde_json::Value {
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ForcedSearchTrigger {
     CurrentUserInput,
+    ModelGeneratedQuery,
     AssistantIntent,
+}
+
+impl ForcedSearchTrigger {
+    fn chatgpt_prompt_source(self) -> ChatGptPromptSource {
+        match self {
+            Self::CurrentUserInput => ChatGptPromptSource::CurrentUserInput,
+            Self::ModelGeneratedQuery | Self::AssistantIntent => {
+                ChatGptPromptSource::LocalModelQuery
+            }
+        }
+    }
 }
 
 async fn perform_forced_web_search(
@@ -531,6 +615,7 @@ async fn perform_forced_web_search(
         request.web_authorization.clone(),
         current_input,
         chatgpt_request_ordinal,
+        trigger.chatgpt_prompt_source(),
         &call,
         events,
         fetch_count,
@@ -558,8 +643,9 @@ async fn perform_forced_web_search(
         }
     }
     let trigger_description = match trigger {
-        ForcedSearchTrigger::CurrentUserInput => {
-            "Tacetaは現在の入力に明白なWeb検索意図を検出しました"
+        ForcedSearchTrigger::CurrentUserInput => "現在の入力はWeb検索が必要だと判定されました",
+        ForcedSearchTrigger::ModelGeneratedQuery => {
+            "ローカルのWeb判定が具体的な検索質問を作成しました"
         }
         ForcedSearchTrigger::AssistantIntent => {
             "ローカルモデルがWeb検索を実行すると発言したため、Tacetaがその発言を表示せず検索として実行しました"
@@ -660,6 +746,7 @@ async fn execute_tool(
     authorization: Option<crate::domain::WebAuthorization>,
     current_input: Option<&ChatMessage>,
     chatgpt_request_ordinal: Option<u8>,
+    chatgpt_prompt_source: ChatGptPromptSource,
     call: &ToolCall,
     events: &UnboundedSender<GenerationEvent>,
     fetch_count: &mut usize,
@@ -702,6 +789,7 @@ async fn execute_tool(
                     Some(query),
                     current_input,
                     ordinal,
+                    chatgpt_prompt_source,
                     auth,
                 )
                 .map_err(|e| BackendError::Protocol(e.to_string()))?;
@@ -1303,9 +1391,10 @@ mod tests {
             model: "unknown-model".into(),
             messages: Vec::new(),
             stream: true,
-            options: ChatOptions { num_ctx: 4096 },
+            options: ChatOptions::generation(4096),
             think: think_value(ThinkingMode::Default),
             tools: None,
+            format: None,
         };
         let json = serde_json::to_value(body).unwrap();
         assert!(!json.as_object().unwrap().contains_key("think"));
@@ -1416,9 +1505,9 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_search_uses_only_the_current_user_input() {
+    fn structured_route_selects_the_initial_search_without_reading_history() {
         let tools = Some(web_search::tool_definitions());
-        let request = ChatRequest {
+        let mut request = ChatRequest {
             model: "qwen3.8".into(),
             messages: vec![
                 ChatMessage::new_user("最新情報をWeb検索して"),
@@ -1435,49 +1524,83 @@ mod tests {
             web_authorization: None,
         };
         assert!(
-            mandatory_initial_web_search_call(&request)
+            initial_web_search_call(&request, &router::WebRouteDecision::Local)
                 .unwrap()
                 .is_none()
         );
 
-        let mut search_request = request;
-        search_request.messages.push(ChatMessage::new_user(
-            "2026年9月3日時点の情報を、出典元URL付きで教えて",
-        ));
-        let call = mandatory_initial_web_search_call(&search_request)
-            .unwrap()
-            .unwrap();
+        let (call, trigger) = initial_web_search_call(
+            &request,
+            &router::WebRouteDecision::SearchCurrent {
+                query: "2026年9月3日時点の情報を、出典元URL付きで教えて".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(trigger, ForcedSearchTrigger::CurrentUserInput);
         assert_eq!(call.name, "web_search");
         assert_eq!(
             call.arguments["query"],
             "2026年9月3日時点の情報を、出典元URL付きで教えて"
         );
 
-        search_request.tools = None;
+        request.tools = None;
         assert!(
-            mandatory_initial_web_search_call(&search_request)
-                .unwrap()
-                .is_none()
+            initial_web_search_call(
+                &request,
+                &router::WebRouteDecision::SearchCurrent {
+                    query: "ignored because Web is OFF".into(),
+                },
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
     #[test]
-    fn assistant_search_intent_probe_stops_after_web_tool_phase_starts() {
-        assert!(should_probe_assistant_search_intent(
-            true, false, false, false
-        ));
-        assert!(!should_probe_assistant_search_intent(
-            true, true, false, false
-        ));
-        assert!(!should_probe_assistant_search_intent(
-            false, false, false, false
-        ));
-        assert!(!should_probe_assistant_search_intent(
-            true, false, true, false
-        ));
-        assert!(!should_probe_assistant_search_intent(
-            true, false, false, true
-        ));
+    fn assistant_intent_search_uses_the_generated_question() {
+        let request = ChatRequest {
+            model: "qwen3.8".into(),
+            messages: vec![ChatMessage::new_user("別の質問を投げてみて")],
+            thinking: ThinkingMode::Default,
+            context_length: 4096,
+            tools: Some(web_search::tool_definitions()),
+            web_search_provider: Some("chatgpt_web".into()),
+            max_search_results: 5,
+            chatgpt_web_request_limit: 1,
+            fetch_search_pages: false,
+            web_authorization: None,
+        };
+        let call = assistant_intent_web_search_call(
+            &request,
+            "では別の質問です。『2026年に注目されるオープンソースAIモデルは何ですか？』をWeb検索します。",
+        )
+        .unwrap();
+        assert_eq!(
+            call.arguments["query"],
+            "2026年に注目されるオープンソースAIモデルは何ですか？"
+        );
+
+        let fallback =
+            assistant_intent_web_search_call(&request, "承知しました。WEBサーチを実行します。")
+                .unwrap();
+        assert_eq!(fallback.arguments["query"], "別の質問を投げてみて");
+    }
+
+    #[test]
+    fn interrupted_assistant_output_never_reenters_model_context() {
+        let mut interrupted = ChatMessage::new_assistant("partial answer");
+        interrupted.interrupted = true;
+        let messages = vec![
+            ChatMessage::new_user("first question"),
+            interrupted,
+            ChatMessage::new_assistant("生成を停止しました"),
+            ChatMessage::new_user("current question"),
+        ];
+        let wired = wire_conversation_messages(&messages);
+        assert_eq!(wired.len(), 2);
+        assert_eq!(wired[0].content, "first question");
+        assert_eq!(wired[1].content, "current question");
     }
 
     #[test]
