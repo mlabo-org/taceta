@@ -468,7 +468,8 @@ mod tests {
         e.protocol_version += 1;
         assert!(matches!(
             validate_envelope(&e, "0.1.0"),
-            Err(ProtocolError::ProtocolVersion(2))
+            Err(ProtocolError::ProtocolVersion(version))
+                if version == PROTOCOL_VERSION + 1
         ));
     }
     #[test]
