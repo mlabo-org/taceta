@@ -1819,23 +1819,7 @@ impl TacetaApp {
             NoticeKind::Error => palette.error,
         };
         let text_value = notice.text.clone();
-        let mut dismiss = false;
-        theme::card(
-            color.gamma_multiply(0.10),
-            color.gamma_multiply(0.65),
-            10,
-            10,
-        )
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(text_value).color(color));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("×").clicked() {
-                        dismiss = true;
-                    }
-                });
-            });
-        });
+        let (dismiss, _) = show_notice_card(ui, &text_value, color);
         ui.add_space(8.0);
         if dismiss {
             self.notice = None;
@@ -3092,8 +3076,8 @@ impl TacetaApp {
                                                 kind: NoticeKind::Info,
                                                 text: text(
                                                     language,
-                                                    "Web検索をONにしました。通常会話は検索しません。現在の入力に明白な検索意図がある場合だけ、回答前に最低1回検索します。LLMがtool callを返さず直ちに検索する意思だけを明言した場合も、予告文を表示せず1ターン1回だけ検索へ回します。",
-                                                    "Web Search is ON. Normal conversation is not forced to search. A clear search intent in the current input requires at least one search before answering. If the LLM states only an immediate intent to search without returning a tool call, Taceta suppresses the announcement and routes the input to search once per turn.",
+                                                    "Web検索：ON\n通常会話は検索しません",
+                                                    "Web Search: ON\nNormal conversation stays local",
                                                 )
                                                 .to_owned(),
                                             });
@@ -3350,6 +3334,38 @@ impl TacetaApp {
             }
         }
     }
+}
+
+fn show_notice_card(ui: &mut Ui, text_value: &str, color: egui::Color32) -> (bool, egui::Response) {
+    let mut dismiss = false;
+    let response = theme::card(
+        color.gamma_multiply(0.10),
+        color.gamma_multiply(0.65),
+        10,
+        10,
+    )
+    .show(ui, |ui| {
+        let close_width = ui.spacing().interact_size.x;
+        let item_spacing = ui.spacing().item_spacing.x;
+        let text_width = (ui.available_width() - close_width - item_spacing).max(1.0);
+        let font_id = egui::TextStyle::Body.resolve(ui.style());
+        let text_galley =
+            ui.fonts_mut(|fonts| fonts.layout(text_value.to_owned(), font_id, color, text_width));
+        ui.horizontal_top(|ui| {
+            ui.add(egui::Label::new(text_galley));
+            if ui
+                .add_sized(
+                    Vec2::new(close_width, ui.spacing().interact_size.y),
+                    Button::new("×").small(),
+                )
+                .clicked()
+            {
+                dismiss = true;
+            }
+        });
+    })
+    .response;
+    (dismiss, response)
 }
 
 fn show_composer_editor(
@@ -3815,6 +3831,43 @@ fn model_candidate_list_height(available_height: f32) -> f32 {
         (available_height * 0.42).clamp(240.0, 420.0)
     } else {
         320.0
+    }
+}
+
+#[cfg(test)]
+mod notice_layout_tests {
+    use super::*;
+
+    fn notice_size(text: &str) -> Vec2 {
+        let mut size = Vec2::ZERO;
+        let context = egui::Context::default();
+        context.set_fonts(egui::FontDefinitions::default());
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(320.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = context.run_ui(input, |ui| {
+            ui.set_width(320.0);
+            let (_, response) = show_notice_card(ui, text, egui::Color32::from_rgb(176, 135, 255));
+            size = response.rect.size();
+        });
+        size
+    }
+
+    #[test]
+    fn long_notice_wraps_without_exceeding_its_available_width() {
+        let short = notice_size("Web Search is ON.");
+        let long = notice_size(
+            "Web Search is ON. Normal conversation stays local. Taceta searches only when the current request clearly needs it.",
+        );
+        assert!(long.x <= 320.0, "notice width was {}", long.x);
+        assert!(
+            long.y > short.y,
+            "long notice did not gain a wrapped row: short={short:?}, long={long:?}"
+        );
     }
 }
 
