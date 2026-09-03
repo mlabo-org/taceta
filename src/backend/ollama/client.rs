@@ -532,16 +532,7 @@ async fn execute_tool(
                     }
                     Err(error) => return Err(BackendError::Protocol(error.to_string())),
                 };
-                let urls = result
-                    .data
-                    .get("citations")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_owned))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let urls = result.citation_urls();
                 return Ok((result.untrusted_context(), urls));
             }
             let _ = events.send(GenerationEvent::SearchProgress(format!("検索中: {query}")));
@@ -606,17 +597,7 @@ async fn execute_tool(
                 let wait_ms = link_wait_duration(job.timeout_ms);
                 return match tokio::time::timeout(wait_ms, service.enqueue_and_wait(job)).await {
                     Ok(Ok(result)) => {
-                        let urls = result
-                            .data
-                            .get("citations")
-                            .and_then(|value| value.as_array())
-                            .map(|items| {
-                                items
-                                    .iter()
-                                    .filter_map(|value| value.as_str().map(str::to_owned))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                        let urls = result.citation_urls();
                         Ok((result.untrusted_context(), urls))
                     }
                     Ok(Err(error)) => {

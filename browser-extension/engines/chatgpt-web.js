@@ -34,11 +34,21 @@ function snapshotDocument(documentLike) {
 }
 
 function extractCitations(documentLike, assistant) {
-  const links = assistant ? assistant.querySelectorAll("a[href]") : documentLike.querySelectorAll(`${ASSISTANT_SELECTOR} a[href]`);
-  return [...links].map((link) => {
+  const candidates = [];
+  const addLinks = (node) => {
+    if (!node?.querySelectorAll) return;
+    candidates.push(...node.querySelectorAll("a[href]"));
+  };
+  addLinks(assistant);
+  const turn = assistant?.closest?.(TURN_SELECTOR);
+  if (turn && turn !== assistant) addLinks(turn);
+  if (!assistant) addLinks(documentLike);
+  const seen = new Set();
+  return candidates.map((link) => {
     try {
       const url = new URL(link.href || link.getAttribute("href"), documentLike.location?.href || "https://chatgpt.com/");
-      if (url.protocol !== "https:") return null;
+      if (url.protocol !== "https:" || url.username || url.password || seen.has(url.href)) return null;
+      seen.add(url.href);
       return { title: (link.innerText || link.textContent || "").trim(), url: url.href };
     } catch { return null; }
   }).filter(Boolean);
@@ -134,7 +144,19 @@ export async function runChatGPTWeb({ page, prompt, url = "https://chatgpt.com/"
   const result = await page.evaluate((id) => {
     const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
     const assistant = nodes.find((node) => node.getAttribute("data-message-id") === id) || nodes.at(-1);
-    return { answer: (assistant?.innerText || assistant?.textContent || "").trim(), citations: [...(assistant?.querySelectorAll("a[href]") || [])].map((link) => ({ title: (link.innerText || link.textContent || "").trim(), url: link.href })).filter((link) => /^https:\/\//i.test(link.url)) };
+    const candidates = [...(assistant?.querySelectorAll("a[href]") || [])];
+    const turn = assistant?.closest?.('section[data-testid^="conversation-turn-"]');
+    if (turn && turn !== assistant) candidates.push(...turn.querySelectorAll("a[href]"));
+    const seen = new Set();
+    const citations = candidates.map((link) => {
+      try {
+        const url = new URL(link.href || link.getAttribute("href"), location.href);
+        if (url.protocol !== "https:" || url.username || url.password || seen.has(url.href)) return null;
+        seen.add(url.href);
+        return { title: (link.innerText || link.textContent || "").trim(), url: url.href };
+      } catch { return null; }
+    }).filter(Boolean);
+    return { answer: (assistant?.innerText || assistant?.textContent || "").trim(), citations };
   }, candidate.id);
   return { status: "completed", answer: result.answer, citations: result.citations, exact: true, mutation_state: "performed" };
 }

@@ -135,9 +135,46 @@ pub struct LinkProgress {
 }
 
 impl LinkResult {
+    /// Normalizes every supported bridge citation shape into a safe HTTPS URL
+    /// for Taceta's transcript UI. ChatGPT Web returns `{ title, url }`
+    /// objects, while page-fetch workflows return URL strings.
+    pub fn citation_urls(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.data
+            .get("citations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|citation| {
+                citation
+                    .as_str()
+                    .or_else(|| citation.get("url").and_then(Value::as_str))
+            })
+            .filter_map(|raw| {
+                let url = url::Url::parse(raw).ok()?;
+                if url.scheme() != "https"
+                    || url.username() != ""
+                    || url.password().is_some()
+                    || url.host_str().is_none()
+                {
+                    return None;
+                }
+                Some(url.to_string())
+            })
+            .filter(|url| seen.insert(url.clone()))
+            .collect()
+    }
+
     /// Browser output is context for local synthesis, never Taceta's final answer.
     pub fn untrusted_context(&self) -> String {
-        serde_json::json!({"source":"browser_workflow", "trusted":false, "workflow":self.workflow, "data":self.data}).to_string()
+        serde_json::json!({
+            "source":"browser_workflow",
+            "trusted":false,
+            "workflow":self.workflow,
+            "citation_urls":self.citation_urls(),
+            "data":self.data,
+        })
+        .to_string()
     }
 }
 
@@ -693,6 +730,35 @@ mod tests {
         let context = result.untrusted_context();
         assert!(context.contains("\"trusted\":false"));
         assert!(context.contains("untrusted"));
+    }
+
+    #[test]
+    fn chatgpt_citation_objects_reach_context_and_taceta_as_https_urls() {
+        let result = LinkResult {
+            workflow: WebWorkflow::ChatGptWeb,
+            data: serde_json::json!({
+                "answer": "sourced answer",
+                "citations": [
+                    {"title": "Example", "url": "https://example.com/source"},
+                    "https://www.rust-lang.org/learn",
+                    {"title": "Duplicate", "url": "https://example.com/source"},
+                    {"title": "Unsafe", "url": "javascript:alert(1)"}
+                ]
+            }),
+            mutation_state: MutationState::Performed,
+            lifecycle: Some(LifecycleState::Completed),
+        };
+
+        assert_eq!(
+            result.citation_urls(),
+            vec![
+                "https://example.com/source".to_owned(),
+                "https://www.rust-lang.org/learn".to_owned(),
+            ]
+        );
+        let context: Value = serde_json::from_str(&result.untrusted_context()).unwrap();
+        assert_eq!(context["citation_urls"][0], "https://example.com/source");
+        assert_eq!(context["data"]["citations"][0]["title"], "Example");
     }
 
     #[test]
