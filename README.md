@@ -15,7 +15,7 @@ Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT We
 - 会話ごとの Web Search（既定は OFF）
 - Brave Search / Ollama Web Search API、または Taceta Link 経由のブラウザー検索、Google 検索、ChatGPT Web
 
-Web Search が OFF のときは外部リクエストを作りません。ON のときは選択された executor だけを使い、検索結果やブラウザーの回答は untrusted context としてローカル Ollama の最終回答に渡します。ChatGPT Web への質問回数は既定1回、設定可能範囲は1〜3回です。Google等の最大検索結果とは独立しており、設定した上限を超える追加質問は行いません。上限到達後（最大設定なら4回目以降）の `web_search` 要求は ChatGPT Web へ送らず、それまでに取得した最大3回答をローカルモデルが最終回答へ統合します。
+Web Search が OFF のときは外部リクエストを作りません。ON でも通常会話をすべて検索へ送ることはありません。現在の入力に明示的な検索命令、現在性・最新性や特定日時点の確認、出典 URL の要求など明白な検索意図がある場合だけ、Taceta は回答前に最低1回の検索を完了させます。過去の会話履歴は検索意図の判定に使いません。通常会話や曖昧な入力では検索を強制せず、ローカルモデルが必要と判断した場合に限って従来どおり `web_search` を呼び出せます。さらに、ローカルモデルが tool call を返さず、現在の入力に対して直ちに検索する意思だけを通常テキストで明言した場合は、その予告文を最終回答として表示せず、同じ入力を1ターンにつき1回だけ検索へ回します。検索についての説明、過去形、否定、質問、通常会話はこのフォールバックの対象外です。検索時は選択された executor だけを使い、検索結果やブラウザーの回答は untrusted context としてローカル Ollama の最終回答に渡します。ChatGPT Web への質問回数は既定1回、設定可能範囲は1〜3回です。Google等の最大検索結果とは独立しており、設定した上限を超える追加質問は行いません。上限到達後（最大設定なら4回目以降）の `web_search` 要求は ChatGPT Web へ送らず、それまでに取得した最大3回答をローカルモデルが最終回答へ統合します。
 
 ## 画面
 
@@ -163,7 +163,7 @@ Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly star
 - Per-conversation Web Search, off by default
 - Brave Search / Ollama Web Search APIs, or browser search, Google Search, and ChatGPT Web through Taceta Link
 
-When Web Search is OFF, Taceta creates no external request. When it is ON, only the selected executor is used, and search or browser output is passed to local Ollama as untrusted context for the final answer. ChatGPT Web defaults to one request and can be limited from one to three independently of the search-result limit used by Google and other search providers. After the configured limit is reached (the fourth request at the maximum setting), Taceta rejects further `web_search` requests instead of sending them to ChatGPT Web, and the local model synthesizes the final answer from the responses already collected, up to three.
+When Web Search is OFF, Taceta creates no external request. ON does not send every conversation to the web. Only a clear search intent in the current input—such as an explicit search command, a request to verify current/latest or date-specific information, or a request for source URLs—requires Taceta to complete at least one search before answering. Conversation history is not used to detect search intent. For normal conversation or ambiguous input, search is not forced; the local model may still call `web_search` when it determines that search is needed, as before. In addition, if the local model returns no tool call but plainly states in ordinary text that it will search immediately for the current input, Taceta suppresses that announcement instead of displaying it as the final answer and routes the same input to search once per turn. Explanations, past-tense statements, negations, questions about searching, and normal conversation do not trigger this fallback. When searching, only the selected executor is used, and search or browser output is passed to local Ollama as untrusted context for the final answer. ChatGPT Web defaults to one request and can be limited from one to three independently of the search-result limit used by Google and other search providers. After the configured limit is reached (the fourth request at the maximum setting), Taceta rejects further `web_search` requests instead of sending them to ChatGPT Web, and the local model synthesizes the final answer from the responses already collected, up to three.
 
 ## Screenshots
 
