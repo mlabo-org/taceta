@@ -29,6 +29,10 @@ pub struct ChatMessage {
     pub attachments: Vec<Attachment>,
     #[serde(default)]
     pub citations: Vec<String>,
+    /// Interrupted output remains visible in the transcript but must never
+    /// become input to a later model turn.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 impl ChatMessage {
@@ -40,6 +44,7 @@ impl ChatMessage {
             thinking: String::new(),
             attachments: Vec::new(),
             citations: Vec::new(),
+            interrupted: false,
         }
     }
     pub fn new_user(content: impl Into<String>) -> Self {
@@ -179,6 +184,7 @@ pub struct GenerationStats {
 pub enum GenerationEvent {
     ThinkingDelta(String),
     ContentDelta(String),
+    ReplaceContent(String),
     ExternalContentDelta { delta: String, replace: bool },
     ToolCall(serde_json::Value),
     SearchProgress(String),

@@ -93,16 +93,71 @@ pub fn tool_definitions() -> serde_json::Value {
     ])
 }
 
-/// Returns true only when the current user input itself carries a clear Web
-/// research intent. Conversation history is deliberately excluded by the
-/// caller so an earlier research turn cannot make later ordinary chat leave
-/// the Mac.
+/// Returns true when the user asks the local model to invent the concrete
+/// research question before searching. Such prompts must reach the model
+/// first; sending the meta-instruction itself to a search provider loses the
+/// question the user asked the model to create.
+pub fn requests_model_generated_search_query(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let asks_to_search = [
+        "web検索",
+        "webサーチ",
+        "ウェブ検索",
+        "ウェブサーチ",
+        "インターネット検索",
+        "ネット検索",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+        || [
+            "web search",
+            "search the web",
+            "search online",
+            "browse the web",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let asks_to_generate_query = [
+        "質問作って",
+        "質問を作って",
+        "質問考えて",
+        "質問を考えて",
+        "検索用の質問",
+        "検索する質問",
+        "検索クエリを作って",
+        "検索語を作って",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+        || [
+            "make up a question",
+            "come up with a question",
+            "create a question",
+            "generate a question",
+            "create a search query",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    asks_to_search && asks_to_generate_query
+}
+
+/// Bypasses semantic routing only for an explicit command to search now.
+/// Freshness, source, and factual-verification needs are deliberately absent:
+/// the local structured router decides those cases without a phrase list.
 pub fn requires_mandatory_search(input: &str) -> bool {
     let lower = input.to_lowercase();
     let compact: String = lower
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
+
+    if requests_model_generated_search_query(input) {
+        return false;
+    }
 
     const DIRECT_JA: &[&str] = &[
         "web検索して",
@@ -136,71 +191,41 @@ pub fn requires_mandatory_search(input: &str) -> bool {
         "run a web search",
         "look it up online",
     ];
-    if DIRECT_JA.iter().any(|marker| compact.contains(marker))
+    DIRECT_JA.iter().any(|marker| compact.contains(marker))
         || DIRECT_EN.iter().any(|marker| lower.contains(marker))
-    {
-        return true;
-    }
+}
 
-    const CURRENT_JA: &[&str] = &[
-        "最新",
-        "直近",
-        "現時点",
-        "時点",
-        "今日現在",
-        "最新情報",
-        "最新ニュース",
-        "現在の価格",
-        "現在のバージョン",
-        "最新バージョン",
-        "最新リリース",
-        "最新モデル",
-    ];
-    const SOURCE_JA: &[&str] = &[
-        "出典url",
-        "出典元url",
-        "引用元url",
-        "参照元url",
-        "公式url",
-        "ソースurl",
-    ];
-    const REQUEST_JA: &[&str] = &[
-        "教えて",
-        "選んで",
-        "選び",
-        "どれ",
-        "どの",
-        "何",
-        "示して",
-        "挙げて",
-        "確認して",
-        "比較して",
-        "まとめて",
-        "探して",
-    ];
-    const CURRENT_EN: &[&str] = &[
-        "latest",
-        "as of",
-        "current version",
-        "current price",
-        "recent news",
-        "today's",
-    ];
-    const SOURCE_EN: &[&str] = &["source url", "citation url", "official url"];
-    const REQUEST_EN: &[&str] = &[
-        "tell me", "which", "what", "show me", "find", "compare", "list",
-    ];
-
-    let asks_for_information = compact.contains('?')
-        || compact.contains('？')
-        || REQUEST_JA.iter().any(|marker| compact.contains(marker))
-        || REQUEST_EN.iter().any(|marker| lower.contains(marker));
-    let current_information = CURRENT_JA.iter().any(|marker| compact.contains(marker))
-        || CURRENT_EN.iter().any(|marker| lower.contains(marker));
-    let source_requested = SOURCE_JA.iter().any(|marker| compact.contains(marker))
-        || SOURCE_EN.iter().any(|marker| lower.contains(marker));
-
-    asks_for_information && (current_information || source_requested)
+/// Extracts the concrete question from a model response that announced an
+/// immediate search without issuing a tool call. Only a question-terminated
+/// sentence is accepted; callers retain their original-input fallback when
+/// the model did not actually state a usable query.
+pub fn concrete_search_query_from_assistant(output: &str) -> Option<String> {
+    let output = output.trim();
+    let (question_index, question_mark) = output
+        .char_indices()
+        .filter(|(_, character)| matches!(character, '?' | '？'))
+        .last()?;
+    let before_question = &output[..question_index];
+    let start = before_question
+        .char_indices()
+        .rev()
+        .find(|(_, character)| {
+            matches!(
+                character,
+                '\n' | '「' | '『' | '“' | '"' | ':' | '：' | '。' | '！' | '!'
+            )
+        })
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let end = question_index + question_mark.len_utf8();
+    let query = output[start..end]
+        .trim()
+        .trim_start_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '-' | '*' | '#' | '・' | '「' | '『' | '“' | '"')
+        })
+        .trim();
+    let length = query.chars().count();
+    (4..=512).contains(&length).then(|| query.to_owned())
 }
 
 /// Detects a model response that promises an immediate Web search instead of
@@ -792,18 +817,34 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_search_intent_covers_explicit_current_and_sourced_requests() {
+    fn mandatory_search_bypass_covers_only_explicit_search_commands() {
         assert!(requires_mandatory_search(
             "喋らずに WEBサーチを起動しろ。WEBサーチを実行してください。"
         ));
         assert!(requires_mandatory_search(
+            "Please search the web and show me the official URL."
+        ));
+        assert!(!requires_mandatory_search(
             "2026年9月3日時点で最も注目されているモデルを選び、出典元URLを教えてください。"
         ));
-        assert!(requires_mandatory_search(
+        assert!(!requires_mandatory_search(
             "最新のQwenモデルを教えてください"
         ));
-        assert!(requires_mandatory_search(
-            "Please search the web and show me the official URL."
+        assert!(!requires_mandatory_search(
+            "今日リリースされたOAIのGPT-6はAGIですか？"
+        ));
+    }
+
+    #[test]
+    fn generated_question_search_waits_for_the_local_model_query() {
+        assert!(requests_model_generated_search_query(
+            "何か質問作ってWEBサーチしてみてよ"
+        ));
+        assert!(!requires_mandatory_search(
+            "何か質問作ってWEBサーチしてみてよ"
+        ));
+        assert!(requests_model_generated_search_query(
+            "Come up with a question and search the web."
         ));
     }
 
@@ -843,6 +884,28 @@ mod tests {
         assert!(!expresses_immediate_search_intent(
             "WEB検索は実行しません。"
         ));
+    }
+
+    #[test]
+    fn assistant_generated_question_becomes_the_search_query() {
+        assert_eq!(
+            concrete_search_query_from_assistant(
+                "では別の質問です。『2026年に注目されるオープンソースAIモデルは何ですか？』をWeb検索します。"
+            )
+            .as_deref(),
+            Some("2026年に注目されるオープンソースAIモデルは何ですか？")
+        );
+        assert_eq!(
+            concrete_search_query_from_assistant(
+                "Question: Which open-source AI model is drawing attention in 2026? I'll search the web."
+            )
+            .as_deref(),
+            Some("Which open-source AI model is drawing attention in 2026?")
+        );
+        assert_eq!(
+            concrete_search_query_from_assistant("承知しました。WEBサーチを実行します。"),
+            None
+        );
     }
 
     #[test]
