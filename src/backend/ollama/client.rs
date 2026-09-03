@@ -201,10 +201,13 @@ impl InferenceBackend for OllamaClient {
                             ChatGptWebAdmission::Exhausted => {
                                 chatgpt_web_budget_exhausted = true;
                                 let _ = events.send(GenerationEvent::SearchProgress(
-                                    "ChatGPT Webへの質問回数上限に達しました".into(),
+                                    "Tacetaで設定した質問回数に達したため、収集した回答をまとめています"
+                                        .into(),
                                 ));
                                 (
-                                    budget_payload("ChatGPT Webへの質問回数上限に達しました"),
+                                    budget_payload(
+                                        "Tacetaで設定したChatGPT Web質問回数に達しました。追加質問は実行せず、取得済みの回答を統合してください",
+                                    ),
                                     Vec::new(),
                                 )
                             }
