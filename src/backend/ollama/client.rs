@@ -43,46 +43,12 @@ impl OllamaClient {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.endpoint.base_url())
     }
-    async fn models(&self) -> Result<Vec<ModelDescriptor>, BackendError> {
-        lifecycle::ensure_ready(&self.http, &self.endpoint).await?;
-        let tags: TagsResponse = self
-            .http
-            .get(self.url("/api/tags"))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let mut result = Vec::with_capacity(tags.models.len());
-        for model in tags.models {
-            let name = model.name;
-            let show: ShowResponse = self
-                .http
-                .post(self.url("/api/show"))
-                .json(&serde_json::json!({"model": name}))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let thinking = capability::classify(&name, &show.details.family);
-            result.push(ModelDescriptor {
-                name,
-                size: model.size,
-                thinking,
-                vision: capability::has_vision(&show.capabilities),
-                tools: capability::has_tools(&show.capabilities),
-                context_length: model_context_length(&show.model_info),
-            });
-        }
-        Ok(result)
-    }
 }
 
 impl InferenceBackend for OllamaClient {
     fn list_models(&self) -> BackendFuture<Vec<ModelDescriptor>> {
         let client = self.clone_for_task();
-        Box::pin(async move { client.models().await })
+        Box::pin(async move { installed_models(&client.http, &client.endpoint).await })
     }
     fn stream_chat(
         &self,
@@ -1044,40 +1010,6 @@ impl OllamaModelManager {
             endpoint: self.endpoint.clone(),
         }
     }
-    async fn installed(&self) -> Result<Vec<ModelDescriptor>, BackendError> {
-        lifecycle::ensure_ready(&self.http, &self.endpoint).await?;
-        let tags: TagsResponse = self
-            .http
-            .get(self.url("/api/tags"))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let mut result = Vec::with_capacity(tags.models.len());
-        for model in tags.models {
-            let name = model.name;
-            let show: ShowResponse = self
-                .http
-                .post(self.url("/api/show"))
-                .json(&serde_json::json!({"model": name}))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            result.push(ModelDescriptor {
-                name: name.clone(),
-                size: model.size,
-                thinking: capability::classify(&name, &show.details.family),
-                vision: capability::has_vision(&show.capabilities),
-                tools: capability::has_tools(&show.capabilities),
-                context_length: model_context_length(&show.model_info),
-            });
-        }
-        Ok(result)
-    }
-
     async fn available(&self, model: &str) -> Result<Vec<ModelCandidate>, BackendError> {
         let base = catalog_model_base(model)?;
         let model_url = format!("https://ollama.com/library/{base}");
@@ -1115,10 +1047,49 @@ impl OllamaModelManager {
     }
 }
 
+async fn installed_models(
+    http: &reqwest::Client,
+    endpoint: &OllamaEndpoint,
+) -> Result<Vec<ModelDescriptor>, BackendError> {
+    lifecycle::ensure_ready(http, endpoint).await?;
+    let tags: TagsResponse = http
+        .get(format!("{}{path}", endpoint.base_url(), path = "/api/tags"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let mut result = Vec::with_capacity(tags.models.len());
+    for model in tags.models {
+        let name = model.name;
+        let show: ShowResponse = http
+            .post(format!("{}{path}", endpoint.base_url(), path = "/api/show"))
+            .json(&serde_json::json!({"model": name.clone()}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thinking = capability::classify(&name, &show.details.family);
+        let vision = capability::has_vision(&show.capabilities);
+        let tools = capability::has_tools(&show.capabilities);
+        let context_length = model_context_length(&show.model_info);
+        result.push(ModelDescriptor {
+            name,
+            size: model.size,
+            thinking,
+            vision,
+            tools,
+            context_length,
+        });
+    }
+    Ok(result)
+}
+
 impl ModelManager for OllamaModelManager {
     fn list_installed(&self) -> BackendFuture<Vec<ModelDescriptor>> {
         let manager = self.clone_for_task();
-        Box::pin(async move { manager.installed().await })
+        Box::pin(async move { installed_models(&manager.http, &manager.endpoint).await })
     }
     fn list_available(&self, model: String) -> BackendFuture<Vec<ModelCandidate>> {
         let manager = self.clone_for_task();
@@ -1150,6 +1121,7 @@ impl ModelManager for OllamaModelManager {
                 .await?
                 .error_for_status()?;
             let mut pending = Vec::new();
+            let mut completed = false;
             let mut body = response.bytes_stream();
             while let Some(chunk) = body.next().await {
                 pending.extend_from_slice(&chunk?);
@@ -1166,10 +1138,17 @@ impl ModelManager for OllamaModelManager {
             }
             if !pending.is_empty() {
                 if let Some(event) = parse_pull_line(&pending, &model)? {
+                    completed = matches!(event, ModelManagerEvent::Completed { .. });
                     let _ = events.send(event);
                 }
             }
-            Ok(())
+            if completed {
+                Ok(())
+            } else {
+                Err(BackendError::Protocol(
+                    "pull stream ended before completion".into(),
+                ))
+            }
         })
     }
     fn delete(&self, model: String) -> BackendFuture<()> {
@@ -1353,6 +1332,64 @@ fn parse_pull_line(line: &[u8], model: &str) -> Result<Option<ModelManagerEvent>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::OllamaEndpointMode;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn spawn_pull_server(body: &'static [u8]) -> String {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request);
+                let request = String::from_utf8_lossy(&request);
+                let response_body: &[u8] = if request.starts_with("GET /api/version") {
+                    b"{}"
+                } else {
+                    body
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(response_body).unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    async fn pull_from_fake_server(body: &'static [u8]) -> Result<(), BackendError> {
+        let endpoint = OllamaEndpoint::resolve_from_values(
+            OllamaEndpointMode::Custom,
+            &spawn_pull_server(body),
+            None,
+            None,
+        )
+        .unwrap();
+        let manager = OllamaModelManager::new(endpoint);
+        let (events, _received) = tokio::sync::mpsc::unbounded_channel();
+        manager
+            .pull(
+                ModelPullRequest {
+                    model: "qwen3:8b".into(),
+                },
+                events,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn pull_requires_success_event_at_real_http_boundary() {
+        let incomplete = pull_from_fake_server(b"{\"status\":\"downloading\"}\n").await;
+        assert!(matches!(incomplete, Err(BackendError::Protocol(message)) if message.contains("before completion")));
+
+        let completed = pull_from_fake_server(br#"{"status":"success"}"#).await;
+        assert!(completed.is_ok());
+    }
+
     #[test]
     fn wire_message_never_includes_thinking_and_routes_attachments() {
         let mut m = ChatMessage::new_user("ask");

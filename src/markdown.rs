@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::OnceLock};
+use std::{
+    collections::{HashMap, VecDeque},
+    hash::{Hash, Hasher},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use eframe::egui::{
     Align, Color32, FontFamily, FontId, Grid, Label, Layout, RichText, ScrollArea, TextFormat,
@@ -22,11 +26,63 @@ const TABLE_ROW_SPACING: f32 = 8.0;
 /// to native egui styling so model output can use common `<strong>`, `<em>`, `<del>`, and `<u>`
 /// tags without creating a browser or script surface.
 pub fn show(ui: &mut Ui, markdown: &str) {
-    let Node::Root { children } = parse(markdown) else {
+    let document = cached_parse(markdown);
+    let Node::Root { children } = document.as_ref() else {
         return;
     };
     let mut context = RenderContext::for_document(&children);
     render_children(ui, &children, 0, &mut context);
+}
+
+const MARKDOWN_CACHE_LIMIT: usize = 32;
+
+struct ParseCache {
+    entries: HashMap<u64, (String, Arc<Node>)>,
+    order: VecDeque<u64>,
+}
+
+impl ParseCache {
+    fn get_or_insert(&mut self, markdown: &str) -> Arc<Node> {
+        let key = cache_key(markdown);
+        if let Some((source, document)) = self.entries.get(&key)
+            && source == markdown
+        {
+            self.order.retain(|candidate| *candidate != key);
+            self.order.push_back(key);
+            return Arc::clone(document);
+        }
+        let document = Arc::new(parse(markdown));
+        self.entries.insert(key, (markdown.to_owned(), Arc::clone(&document)));
+        self.order.retain(|candidate| *candidate != key);
+        self.order.push_back(key);
+        while self.order.len() > MARKDOWN_CACHE_LIMIT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        document
+    }
+}
+
+fn cache_key(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn markdown_cache() -> &'static Mutex<ParseCache> {
+    static CACHE: OnceLock<Mutex<ParseCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ParseCache {
+        entries: HashMap::new(),
+        order: VecDeque::new(),
+    }))
+}
+
+fn cached_parse(markdown: &str) -> Arc<Node> {
+    markdown_cache()
+        .lock()
+        .expect("markdown cache mutex poisoned")
+        .get_or_insert(markdown)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1151,6 +1207,18 @@ fn highlighted_code_job(ui: &Ui, language: Option<&str>, code: &str) -> LayoutJo
             _ => None,
         })
         .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+    let cache_key = CodeCacheKey {
+        language: token,
+        code: code.to_owned(),
+        dark_mode: ui.visuals().dark_mode,
+    };
+    if let Some(job) = code_cache()
+        .lock()
+        .expect("code cache mutex poisoned")
+        .get(&cache_key)
+    {
+        return job;
+    }
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut job = LayoutJob::default();
     for line in LinesWithEndings::from(code) {
@@ -1160,7 +1228,51 @@ fn highlighted_code_job(ui: &Ui, language: Option<&str>, code: &str) -> LayoutJo
         };
         append_highlighted_ranges(&mut job, &ranges);
     }
+    code_cache()
+        .lock()
+        .expect("code cache mutex poisoned")
+        .insert(cache_key, job.clone());
     job
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CodeCacheKey {
+    language: String,
+    code: String,
+    dark_mode: bool,
+}
+
+struct CodeCache {
+    entries: HashMap<CodeCacheKey, LayoutJob>,
+    order: VecDeque<CodeCacheKey>,
+}
+
+impl CodeCache {
+    fn get(&mut self, key: &CodeCacheKey) -> Option<LayoutJob> {
+        let job = self.entries.get(key).cloned()?;
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.clone());
+        Some(job)
+    }
+
+    fn insert(&mut self, key: CodeCacheKey, job: LayoutJob) {
+        self.entries.insert(key.clone(), job);
+        self.order.retain(|candidate| candidate != &key);
+        self.order.push_back(key);
+        while self.order.len() > MARKDOWN_CACHE_LIMIT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+}
+
+fn code_cache() -> &'static Mutex<CodeCache> {
+    static CACHE: OnceLock<Mutex<CodeCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(CodeCache {
+        entries: HashMap::new(),
+        order: VecDeque::new(),
+    }))
 }
 
 fn append_highlighted_ranges(job: &mut LayoutJob, ranges: &[(syntect::highlighting::Style, &str)]) {
@@ -1413,10 +1525,17 @@ fn latex_to_unicode(source: &str) -> String {
             ("\\ne", "≠"),
             ("\\,", " "),
         ];
-        if let Some((command, replacement)) = commands
-            .iter()
-            .find(|(command, _)| remaining.starts_with(command))
-        {
+        if let Some((command, replacement)) = commands.iter().find(|(command, _)| {
+            if !remaining.starts_with(command) {
+                return false;
+            }
+            // A command must end at a non-letter. This keeps `\\left` from
+            // being interpreted as the shorter `\\le` command.
+            command == &"\\," || remaining[command.len()..]
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_ascii_alphabetic())
+        }) {
             rendered.push_str(replacement);
             index += command.len();
             continue;
@@ -1424,7 +1543,8 @@ fn latex_to_unicode(source: &str) -> String {
         if remaining.starts_with('^') || remaining.starts_with('_') {
             let superscript = remaining.starts_with('^');
             let cursor = index + 1;
-            let (argument, end) = if source[cursor..].starts_with('{') {
+            let braced = source[cursor..].starts_with('{');
+            let (argument, end) = if braced {
                 braced_argument(source, cursor).unwrap_or_else(|| (String::new(), cursor))
             } else if let Some(character) = source[cursor..].chars().next() {
                 (character.to_string(), cursor + character.len_utf8())
@@ -1432,7 +1552,21 @@ fn latex_to_unicode(source: &str) -> String {
                 (String::new(), cursor)
             };
             let argument = latex_to_unicode(&argument);
-            rendered.push_str(&script_text(&argument, superscript));
+            if let Some(script) = script_text(&argument, superscript) {
+                rendered.push_str(&script);
+            } else {
+                // Keep the original notation intact when any character has
+                // no Unicode script equivalent. Dropping the marker/braces
+                // would silently change the formula's meaning.
+                rendered.push(if superscript { '^' } else { '_' });
+                if braced && end >= cursor + 2 && source.as_bytes().get(end - 1) == Some(&b'}') {
+                    rendered.push('{');
+                    rendered.push_str(&source[cursor + 1..end - 1]);
+                    rendered.push('}');
+                } else {
+                    rendered.push_str(&source[cursor..end]);
+                }
+            }
             index = end;
             continue;
         }
@@ -1445,10 +1579,10 @@ fn latex_to_unicode(source: &str) -> String {
     rendered
 }
 
-fn script_text(source: &str, superscript: bool) -> String {
+fn script_text(source: &str, superscript: bool) -> Option<String> {
     source
         .chars()
-        .map(|character| script_character(character, superscript).unwrap_or(character))
+        .map(|character| script_character(character, superscript))
         .collect()
 }
 
@@ -1832,5 +1966,46 @@ HTML
         assert!(matrix.contains('⎛'));
         assert!(matrix.contains('⎝'));
         assert!(!matrix.contains("pmatrix"));
+    }
+
+    #[test]
+    fn preserves_unrepresentable_script_syntax_and_command_boundaries() {
+        assert_eq!(latex_to_unicode("x^{AB}"), "x^{AB}");
+        assert_eq!(latex_to_unicode("x_\\left"), "x_\\left");
+        assert_eq!(latex_to_unicode("x^2"), "x²");
+        assert_eq!(latex_to_unicode("\\leq"), "\\leq");
+        assert_eq!(latex_to_unicode("a \\le b"), "a ≤ b");
+    }
+
+    #[test]
+    fn markdown_cache_reuses_unchanged_documents_and_invalidates_changed_text() {
+        let first = cached_parse("同じ本文");
+        let second = cached_parse("同じ本文");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let changed = cached_parse("変更後の本文");
+        assert!(!Arc::ptr_eq(&first, &changed));
+    }
+
+    #[test]
+    fn code_cache_reuses_exact_key_and_invalidates_theme_or_text_changes() {
+        let mut cache = CodeCache {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        };
+        let key = CodeCacheKey {
+            language: "rust".into(),
+            code: "let x = 1;".into(),
+            dark_mode: false,
+        };
+        cache.insert(key.clone(), LayoutJob::default());
+        assert!(cache.get(&key).is_some());
+
+        let mut changed = key.clone();
+        changed.dark_mode = true;
+        assert!(cache.get(&changed).is_none());
+        changed.dark_mode = false;
+        changed.code.push(' ');
+        assert!(cache.get(&changed).is_none());
     }
 }

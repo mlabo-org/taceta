@@ -7,7 +7,7 @@
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::{
-    net::{IpAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     process::Command,
     time::Duration,
 };
@@ -519,7 +519,7 @@ impl WebSearchProvider {
     /// Fetches one page with manual redirect validation so every hop receives
     /// the same SSRF checks. Only http(s), public IPs and text-like content are allowed.
     pub async fn fetch(&self, url: &str) -> Result<FetchedPage, WebError> {
-        let validated = validate_public_url(url)?;
+        let (validated, validated_address) = validated_public_target(url)?;
         if matches!(
             self.kind,
             ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb
@@ -546,9 +546,9 @@ impl WebSearchProvider {
             });
         }
         let mut current = validated;
+        let mut current_address = validated_address;
         for _ in 0..=MAX_REDIRECTS {
-            let response = self
-                .client
+            let response = fetch_client(&current, current_address)?
                 .get(current.clone())
                 .send()
                 .await
@@ -559,12 +559,10 @@ impl WebSearchProvider {
                     .get(header::LOCATION)
                     .and_then(|v| v.to_str().ok())
                     .ok_or_else(|| WebError::Protocol("redirect without Location".into()))?;
-                current = validate_public_url(
-                    current
-                        .join(location)
-                        .map_err(|_| WebError::UnsafeUrl(location.into()))?
-                        .as_str(),
-                )?;
+                let redirected = current
+                    .join(location)
+                    .map_err(|_| WebError::UnsafeUrl(location.into()))?;
+                (current, current_address) = validated_public_target(redirected.as_str())?;
                 continue;
             }
             let response = response
@@ -669,6 +667,10 @@ pub fn has_keychain_secret(account: &str) -> bool {
 /// browser workflow.  It rejects non-web schemes, embedded credentials, and
 /// addresses that resolve to local or private networks.
 pub fn validate_public_url(raw: &str) -> Result<Url, WebError> {
+    validated_public_target(raw).map(|(url, _)| url)
+}
+
+fn validated_public_target(raw: &str) -> Result<(Url, SocketAddr), WebError> {
     if raw.len() > MAX_URL {
         return Err(WebError::UnsafeUrl("URL too long".into()));
     }
@@ -683,13 +685,34 @@ pub fn validate_public_url(raw: &str) -> Result<Url, WebError> {
     let port = url
         .port_or_known_default()
         .ok_or_else(|| WebError::UnsafeUrl(raw.into()))?;
-    let addrs = (host, port)
+    let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
-        .map_err(|_| WebError::UnsafeUrl(raw.into()))?;
-    if addrs.map(|a| a.ip()).any(is_private_or_local) {
+        .map_err(|_| WebError::UnsafeUrl(raw.into()))?
+        .collect();
+    let address = addrs
+        .iter()
+        .copied()
+        .find(|address| !is_private_or_local(address.ip()))
+        .ok_or_else(|| WebError::UnsafeUrl(raw.into()))?;
+    if addrs.iter().any(|address| is_private_or_local(address.ip())) {
         return Err(WebError::UnsafeUrl(raw.into()));
     }
-    Ok(url)
+    Ok((url, address))
+}
+
+fn fetch_client(url: &Url, address: SocketAddr) -> Result<Client, WebError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| WebError::UnsafeUrl(url.to_string()))?;
+    Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(45))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve(host, address)
+        .user_agent("Taceta/0.1 (+local web search)")
+        .build()
+        .map_err(WebError::Request)
 }
 
 fn transport_error(stage: &'static str, error: &reqwest::Error) -> WebError {
@@ -802,6 +825,14 @@ mod tests {
         assert!(validate_public_url("http://localhost/").is_err());
         assert!(validate_public_url("file:///tmp/a").is_err());
         assert!(validate_public_url("http://user:pass@example.com/").is_err());
+    }
+
+    #[test]
+    fn public_literal_resolution_is_the_address_pinned_for_fetch() {
+        let (url, address) = validated_public_target("https://198.51.100.7:8443/article").unwrap();
+        assert_eq!(url.host_str(), Some("198.51.100.7"));
+        assert_eq!(address, "198.51.100.7:8443".parse().unwrap());
+        assert!(fetch_client(&url, address).is_ok());
     }
     #[test]
     fn clamps_result_limit() {
