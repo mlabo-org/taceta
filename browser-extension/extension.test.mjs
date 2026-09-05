@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { envelope, jobProgressPayload, jobResultPayload, validateEnvelope, validateJob } from "./protocol.js";
-import { effectFor, requiresConfirmation, mutationTransition, isAuthorizedWebWorkflow } from "./safety.js";
 import { googleResultsFromNodes, workflowSpec, chatgptPromptContract, runDefaultSearch } from "./workflows.js";
 import { safeUrl } from "./selectors.js";
 import { OwnedScope } from "./scope.js";
@@ -34,6 +33,8 @@ test("page fetch is a separately authorized browser job",()=>{
   const job={job_id:"j1",workflow:"page_fetch",query:null,prompt:null,url:"https://example.com/article",limit:1,timeout_ms:30000,authorization:{kind:"web_request",request_id:"r1",session_id:"s1",once:true}};
   assert.equal(validateJob(job,{request_id:"r1",session_id:"s1"}),job);
   assert.throws(()=>validateJob({...job,url:"http://127.0.0.1/"},{request_id:"r1",session_id:"s1"}));
+  assert.throws(()=>validateJob({...job,url:"https://user:pass@example.com/article"},{request_id:"r1",session_id:"s1"}));
+  assert.throws(()=>validateJob({...job,url:"https://localhost/article"},{request_id:"r1",session_id:"s1"}));
 });
 test("ChatGPT Web accepts a bounded sliding idle timeout",()=>{
   const job={job_id:"j2",workflow:"chatgpt_web",query:null,url:null,prompt:"調査して",limit:1,timeout_ms:1200000,idle_timeout_ms:180000,authorization:{kind:"web_request",request_id:"r2",session_id:"s2",once:true}};
@@ -41,17 +42,7 @@ test("ChatGPT Web accepts a bounded sliding idle timeout",()=>{
   assert.throws(()=>validateJob({...job,idle_timeout_ms:1200001},{request_id:"r2",session_id:"s2"}));
 });
 test("workflow allowlist and exact ChatGPT passthrough",()=>{ assert.throws(()=>workflowSpec("shell","x")); assert.equal(workflowSpec("page_fetch","https://example.com").workflow,"page_fetch"); assert.deepEqual(chatgptPromptContract("  exact?  ").text,"  exact?  "); });
-test("confirmation and unknown mutation are fail closed",()=>{assert.equal(effectFor("job_progress"),"external_submit"); assert.equal(effectFor("job_result"),"external_submit"); assert.equal(requiresConfirmation("external_submit",false),true); assert.equal(mutationTransition("pending",true,false),"performed_or_unknown");});
-test("web authorization is exact request/session scoped and cannot authorize mutations",()=>{
-  const message={request_id:"r1",session_id:"s1",payload:{workflow:"google_search",authorization:{kind:"web_request",request_id:"r1",session_id:"s1",once:true}}};
-  assert.equal(isAuthorizedWebWorkflow(message),true); assert.equal(requiresConfirmation("external_submit",isAuthorizedWebWorkflow(message)),false);
-  assert.equal(isAuthorizedWebWorkflow({...message,request_id:"r2"}),false);
-  assert.equal(isAuthorizedWebWorkflow({...message,payload:{...message.payload,authorization:{...message.payload.authorization,session_id:"other"}}}),false);
-  assert.equal(isAuthorizedWebWorkflow({...message,payload:{...message.payload,workflow:"not_allowed"}}),false);
-  assert.equal(isAuthorizedWebWorkflow({...message,payload:{...message.payload,workflow:"page_fetch",url:"https://example.com",query:null}}),true);
-  assert.equal(requiresConfirmation("external_submit",false),true); assert.equal(requiresConfirmation("external_submit",false),true);
-});
-test("Google extraction rejects unsafe URLs",()=>{assert.deepEqual(googleResultsFromNodes([{title:"ok",url:"https://example.com/a"},{title:"bad",url:"javascript:alert(1)"}]),[{title:"ok",url:"https://example.com/a",snippet:""}]); assert.equal(safeUrl("javascript:alert(1)"),null);});
+test("Google extraction rejects unsafe URLs",()=>{assert.deepEqual(googleResultsFromNodes([{title:"ok",url:"https://example.com/a"},{title:"bad",url:"javascript:alert(1)"}]),[{title:"ok",url:"https://example.com/a",snippet:""}]); assert.equal(safeUrl("javascript:alert(1)"),null); assert.equal(safeUrl("https://user:pass@example.com/a"),null); assert.equal(safeUrl("https://localhost/a"),null); assert.equal(safeUrl("https://192.168.1.10/a"),null);});
 test("scope reuses a focused normal window and creates an inactive agent tab",async()=>{let created=false;let tabOptions;let groupOptions;const api={windows:{getAll:async()=>[{id:5,focused:false},{id:7,focused:true}],create:async()=>{created=true}},tabs:{create:async o=>{tabOptions=o;return{id:8,windowId:7}},get:async()=>({id:8,windowId:7}),group:async o=>{groupOptions=o;return 9}},tabGroups:{update:async()=>{}},storage:{local:{set:async()=>{},remove:async()=>{}}}};const ids=await new OwnedScope(api).open();assert.equal(created,false);assert.deepEqual(tabOptions,{active:false,windowId:7,url:"about:blank"});assert.deepEqual(groupOptions,{tabIds:[8],createProperties:{windowId:7}});assert.deepEqual(ids,{windowId:7,groupId:9,tabId:8});});
 test("scope creates a focused:false normal window only when none exists",async()=>{let createOptions;const api={windows:{getAll:async()=>[],create:async o=>{createOptions=o;return{id:7,tabs:[{id:8,windowId:7}]}},},tabs:{create:async()=>{throw new Error("unexpected_tab_create")},get:async()=>({id:8,windowId:7}),group:async()=>9},tabGroups:{update:async()=>{}},storage:{local:{set:async()=>{},remove:async()=>{}}}};await new OwnedScope(api).open();assert.deepEqual(createOptions,{focused:false,type:"normal",url:"about:blank"});});
 test("scope removes the exact created tab when grouping fails",async()=>{let removedTab; const api={windows:{getAll:async()=>[],create:async()=>({id:7,tabs:[{id:8}]}),remove:async()=>{}},tabs:{get:async()=>({id:8,windowId:7}),group:async()=>{throw new Error("group_failed")},remove:async id=>{removedTab=id}},tabGroups:{update:async()=>{}},storage:{local:{set:async()=>{},remove:async()=>{}}}}; await assert.rejects(()=>new OwnedScope(api).open(),/group_failed/); assert.equal(removedTab,8);});

@@ -1,3 +1,4 @@
+import { safeUrl } from "./selectors.js";
 export const SCHEMA_VERSION = 1;
 export const PRODUCT_VERSION = "0.1.0";
 export const PROTOCOL_VERSION = 2;
@@ -25,7 +26,7 @@ export function validateJob(job, request) {
   const validInput = search
     ? typeof job.query === "string" && Boolean(job.query.trim()) && !job.url && !job.prompt
     : job.workflow === "page_fetch"
-      ? typeof job.url === "string" && /^https:\/\//i.test(job.url) && !job.query && !job.prompt
+      ? typeof job.url === "string" && Boolean(safeUrl(job.url)) && !job.query && !job.prompt
       : typeof job.prompt === "string" && Boolean(job.prompt) && !job.query && !job.url;
   if (!validInput) throw new Error("invalid job input");
   const a=job.authorization; if (!a || a.kind !== "web_request" || a.request_id !== request.request_id || a.session_id !== request.session_id || a.once !== true) throw new Error("invalid authorization");

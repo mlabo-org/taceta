@@ -143,9 +143,6 @@ pub struct TacetaApp {
     conversation_bulk_delete_confirmation: Option<ConversationBulkDeleteConfirmation>,
     scroll_to_bottom: bool,
     web_key_draft: String,
-    model_manager_result_tx: std_mpsc::Sender<Result<Vec<ModelDescriptor>, String>>,
-    model_manager_result_rx: std_mpsc::Receiver<Result<Vec<ModelDescriptor>, String>>,
-    model_manager_pending: bool,
     model_catalog_result_tx: std_mpsc::Sender<(String, Result<Vec<ModelCandidate>, String>)>,
     model_catalog_result_rx: std_mpsc::Receiver<(String, Result<Vec<ModelCandidate>, String>)>,
     model_catalog_pending: bool,
@@ -182,20 +179,8 @@ impl TacetaApp {
             load_app_shell_preferences(creation_context.storage, APP_SHELL_STORAGE_KEY);
         apply_app_shell_preferences(&creation_context.egui_ctx, shell_preferences);
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("taceta-runtime")
-            .enable_all()
-            .build()
-            .expect("Taceta could not start its local async runtime");
-        let (model_result_tx, model_result_rx) = std_mpsc::channel();
-        let (model_manager_result_tx, model_manager_result_rx) = std_mpsc::channel();
-        let (model_catalog_result_tx, model_catalog_result_rx) = std_mpsc::channel();
-        let (delete_result_tx, delete_result_rx) = std_mpsc::channel();
         let link_service = Arc::new(TacetaLinkService::default());
         let state = load_app_state(creation_context.storage);
-        let ollama_endpoint_mode_draft = state.ollama_endpoint_mode;
-        let ollama_custom_endpoint_draft = state.ollama_custom_endpoint.clone();
         let endpoint_result =
             OllamaEndpoint::resolve(state.ollama_endpoint_mode, &state.ollama_custom_endpoint);
         let (ollama_endpoint, initial_endpoint_error) = match endpoint_result {
@@ -236,55 +221,18 @@ impl TacetaApp {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"));
 
-        let mut app = Self {
-            shell_preferences,
-            system_language: system_language(),
+        let mut app = Self::with_services(
             state,
-            screen: Screen::Chat,
-            backend: Arc::new(
+            shell_preferences,
+            ollama_endpoint.clone(),
+            Arc::new(
                 OllamaClient::new(ollama_endpoint.clone())
                     .with_link_service(Arc::clone(&link_service)),
             ),
-            model_manager: Arc::new(OllamaModelManager::new(ollama_endpoint.clone())),
-            runtime,
-            model_result_tx,
-            model_result_rx,
-            model_refresh_pending: false,
-            models: Vec::new(),
-            connection: ConnectionState::Connecting,
-            ollama_endpoint,
-            ollama_endpoint_mode_draft,
-            ollama_custom_endpoint_draft,
-            model_storage_path: resolve_model_storage_path(),
-            generation: None,
-            external_preview_ids: HashSet::new(),
-            notice: None,
-            conversation_title_editor: None,
-            conversation_delete_confirmation: None,
-            conversation_bulk_delete_mode: false,
-            conversation_bulk_selection: HashSet::new(),
-            conversation_bulk_delete_confirmation: None,
-            scroll_to_bottom: true,
-            web_key_draft: String::new(),
-            model_manager_result_tx,
-            model_manager_result_rx,
-            model_manager_pending: false,
-            model_catalog_result_tx,
-            model_catalog_result_rx,
-            model_catalog_pending: false,
-            model_catalog_query: None,
-            model_candidates: Vec::new(),
-            selected_model_candidate: None,
-            model_pull: None,
-            model_id_draft: String::new(),
-            delete_confirmation: None,
-            delete_result_rx,
-            delete_result_tx,
+            Arc::new(OllamaModelManager::new(ollama_endpoint)),
             link_service,
-            link_installer: Installer::new(home, app_bundle),
-            link_status: None,
-            link_setup_open: false,
-        };
+            Installer::new(home, app_bundle),
+        );
         // Startup owns local materialization and Native Messaging registration.
         // Browser activation and internal-page navigation remain explicit user steps.
         match taceta_link_installer::detect_default_browser() {
@@ -329,6 +277,71 @@ impl TacetaApp {
             app.refresh_models();
         }
         app
+    }
+
+    fn with_services(
+        state: PersistedAppState,
+        shell_preferences: AppShellPreferences,
+        ollama_endpoint: OllamaEndpoint,
+        backend: Arc<dyn InferenceBackend>,
+        model_manager: Arc<dyn ModelManager>,
+        link_service: Arc<TacetaLinkService>,
+        link_installer: Installer,
+    ) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("taceta-runtime")
+            .enable_all()
+            .build()
+            .expect("Taceta could not start its local async runtime");
+        let (model_result_tx, model_result_rx) = std_mpsc::channel();
+        let (model_catalog_result_tx, model_catalog_result_rx) = std_mpsc::channel();
+        let (delete_result_tx, delete_result_rx) = std_mpsc::channel();
+        let ollama_endpoint_mode_draft = state.ollama_endpoint_mode;
+        let ollama_custom_endpoint_draft = state.ollama_custom_endpoint.clone();
+        Self {
+            shell_preferences,
+            system_language: system_language(),
+            state,
+            screen: Screen::Chat,
+            backend,
+            model_manager,
+            runtime,
+            model_result_tx,
+            model_result_rx,
+            model_refresh_pending: false,
+            models: Vec::new(),
+            connection: ConnectionState::Connecting,
+            ollama_endpoint,
+            ollama_endpoint_mode_draft,
+            ollama_custom_endpoint_draft,
+            model_storage_path: resolve_model_storage_path(),
+            generation: None,
+            external_preview_ids: HashSet::new(),
+            notice: None,
+            conversation_title_editor: None,
+            conversation_delete_confirmation: None,
+            conversation_bulk_delete_mode: false,
+            conversation_bulk_selection: HashSet::new(),
+            conversation_bulk_delete_confirmation: None,
+            scroll_to_bottom: true,
+            web_key_draft: String::new(),
+            model_catalog_result_tx,
+            model_catalog_result_rx,
+            model_catalog_pending: false,
+            model_catalog_query: None,
+            model_candidates: Vec::new(),
+            selected_model_candidate: None,
+            model_pull: None,
+            model_id_draft: String::new(),
+            delete_confirmation: None,
+            delete_result_rx,
+            delete_result_tx,
+            link_service,
+            link_installer,
+            link_status: None,
+            link_setup_open: false,
+        }
     }
 
     fn language(&self) -> AppShellLanguage {
@@ -418,26 +431,6 @@ impl TacetaApp {
         self.runtime.spawn(async move {
             let result = backend
                 .list_models()
-                .await
-                .map_err(|error| error.to_string());
-            let _ = result_tx.send(result);
-        });
-    }
-
-    fn refresh_managed_models(&mut self) {
-        if self.model_manager_pending || self.model_pull.is_some() {
-            return;
-        }
-        if let Err(error) = self.synchronize_auto_ollama_endpoint() {
-            self.handle_ollama_endpoint_error(error);
-            return;
-        }
-        self.model_manager_pending = true;
-        let manager = Arc::clone(&self.model_manager);
-        let result_tx = self.model_manager_result_tx.clone();
-        self.runtime.spawn(async move {
-            let result = manager
-                .list_installed()
                 .await
                 .map_err(|error| error.to_string());
             let _ = result_tx.send(result);
@@ -555,6 +548,13 @@ impl TacetaApp {
         });
     }
 
+    fn confirm_model_delete(&mut self) {
+        let Some(model) = self.delete_confirmation.take() else {
+            return;
+        };
+        self.start_model_delete(model);
+    }
+
     fn start_model_delete(&mut self, model: String) {
         match self.synchronize_auto_ollama_endpoint() {
             Ok(true) => {
@@ -634,32 +634,6 @@ impl TacetaApp {
             }
         }
 
-        if let Ok(result) = self.model_manager_result_rx.try_recv() {
-            self.model_manager_pending = false;
-            match result {
-                Ok(mut models) => {
-                    models.sort_by(|a, b| a.name.cmp(&b.name));
-                    self.models = models;
-                    self.connection = ConnectionState::Ready;
-                    if self
-                        .state
-                        .selected_model
-                        .as_ref()
-                        .is_none_or(|name| !self.models.iter().any(|m| &m.name == name))
-                    {
-                        self.state.selected_model = self.models.first().map(|m| m.name.clone());
-                    }
-                    self.ensure_selected_thinking_mode();
-                }
-                Err(error) => {
-                    self.notice = Some(Notice {
-                        kind: NoticeKind::Error,
-                        text: safe_model_manager_error(self.language(), &error),
-                    });
-                }
-            }
-        }
-
         if let Ok((query, result)) = self.model_catalog_result_rx.try_recv() {
             if self.model_catalog_query.as_deref() == Some(query.as_str()) {
                 self.model_catalog_pending = false;
@@ -724,7 +698,6 @@ impl TacetaApp {
                         ),
                     });
                     self.refresh_models();
-                    self.refresh_managed_models();
                 }
                 Err(error) => {
                     self.notice = Some(Notice {
@@ -746,7 +719,6 @@ impl TacetaApp {
                         ),
                     });
                     self.refresh_models();
-                    self.refresh_managed_models();
                 }
                 Err(error) => {
                     self.notice = Some(Notice {
@@ -1966,10 +1938,8 @@ impl TacetaApp {
 
     fn show_ollama_endpoint_settings(&mut self, ui: &mut Ui, language: AppShellLanguage) {
         let palette = theme::palette(ui);
-        let endpoint_busy = self.generation.is_some()
-            || self.model_pull.is_some()
-            || self.model_refresh_pending
-            || self.model_manager_pending;
+        let endpoint_busy =
+            self.generation.is_some() || self.model_pull.is_some() || self.model_refresh_pending;
         let mut apply_requested = false;
         theme::card(
             ui.visuals().faint_bg_color,
@@ -2158,7 +2128,7 @@ impl TacetaApp {
                             ui.add_space(10.0);
                             if ui.button(text(language, "モデルを管理", "Manage models")).clicked() {
                                 self.screen = Screen::Models;
-                                self.refresh_managed_models();
+                                self.refresh_models();
                             }
                         });
                         ui.add_space(14.0);
@@ -2671,13 +2641,13 @@ impl TacetaApp {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui
                                     .add_enabled(
-                                        !self.model_manager_pending && self.model_pull.is_none(),
+                                        !self.model_refresh_pending && self.model_pull.is_none(),
                                         Button::new("↻"),
                                     )
                                     .on_hover_text(text(language, "一覧を更新", "Refresh list"))
                                     .clicked()
                                 {
-                                    self.refresh_managed_models();
+                                    self.refresh_models();
                                 }
                                 if ui
                                     .button(text(language, "Ollama Library", "Ollama Library"))
@@ -2690,7 +2660,7 @@ impl TacetaApp {
                             });
                         });
                         ui.add_space(8.0);
-                        if self.model_manager_pending {
+                        if self.model_refresh_pending {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.label(text(
@@ -2700,7 +2670,7 @@ impl TacetaApp {
                                 ));
                             });
                         }
-                        if self.models.is_empty() && !self.model_manager_pending {
+                        if self.models.is_empty() && !self.model_refresh_pending {
                             ui.label(
                                 RichText::new(text(
                                     language,
@@ -2764,8 +2734,7 @@ impl TacetaApp {
                             self.delete_confirmation = None;
                         }
                         if ui.button(text(language, "削除", "Delete")).clicked() {
-                            self.delete_confirmation = None;
-                            self.start_model_delete(model.clone());
+                            self.confirm_model_delete();
                         }
                     });
                 });
@@ -2774,7 +2743,6 @@ impl TacetaApp {
 
     fn show_chat(&mut self, root_ui: &mut Ui) {
         let language = self.language();
-        let messages = self.state.active_conversation().messages.clone();
         let active_generation_target = self
             .generation
             .as_ref()
@@ -2790,6 +2758,7 @@ impl TacetaApp {
                     Layout::top_down(Align::Min),
                     |ui| {
                         self.show_notice(ui);
+                        let messages = &self.state.active_conversation().messages;
                         let transcript_height = ui.available_height();
                         ScrollArea::vertical()
                             .id_salt("chat-transcript")
@@ -2814,7 +2783,7 @@ impl TacetaApp {
                                     );
                                     });
                                 }
-                                for message in &messages {
+                                for message in messages {
                                     self.show_message(
                                         ui,
                                         message,
@@ -2824,11 +2793,11 @@ impl TacetaApp {
                                 }
                                 ui.add_space(12.0);
                             });
-                        self.scroll_to_bottom = false;
                     },
                 );
             });
         });
+        self.scroll_to_bottom = false;
     }
 
     fn show_message(&self, ui: &mut Ui, message: &ChatMessage, generating: bool) {
@@ -3477,11 +3446,7 @@ impl eframe::App for TacetaApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.drain_background_work();
 
-        if self.generation.is_some()
-            || self.model_refresh_pending
-            || self.model_manager_pending
-            || self.model_pull.is_some()
-        {
+        if self.generation.is_some() || self.model_refresh_pending || self.model_pull.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
@@ -3994,14 +3959,105 @@ mod composer_tests {
 mod model_manager_tests {
     use super::*;
     use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+    use taceta::backend::BackendFuture;
 
-    struct FakeModelManager {
-        pulls: Arc<AtomicUsize>,
-        deletes: Arc<AtomicUsize>,
-        listed: Vec<ModelDescriptor>,
+    #[derive(Default)]
+    struct RecordingServices {
+        operations: Arc<Mutex<Vec<String>>>,
+        lists: AtomicUsize,
+        pull_dropped: Arc<AtomicBool>,
+    }
+
+    impl InferenceBackend for RecordingServices {
+        fn list_models(&self) -> BackendFuture<Vec<ModelDescriptor>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![model("test-model")]) })
+        }
+        fn stream_chat(
+            &self,
+            request: ChatRequest,
+            events: mpsc::UnboundedSender<GenerationEvent>,
+        ) -> BackendFuture<()> {
+            let operations = self.operations.clone();
+            Box::pin(async move {
+                operations
+                    .lock()
+                    .unwrap()
+                    .push(format!("chat:{}", request.messages.last().unwrap().content));
+                events
+                    .send(GenerationEvent::ContentDelta("Test answer".into()))
+                    .unwrap();
+                Ok(())
+            })
+        }
+    }
+
+    impl ModelManager for RecordingServices {
+        fn list_installed(&self) -> BackendFuture<Vec<ModelDescriptor>> {
+            panic!("the UI must share the inference model-list request")
+        }
+        fn list_available(&self, _: String) -> BackendFuture<Vec<ModelCandidate>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn pull(
+            &self,
+            request: ModelPullRequest,
+            _: mpsc::UnboundedSender<ModelManagerEvent>,
+        ) -> BackendFuture<()> {
+            let operations = self.operations.clone();
+            let dropped = self.pull_dropped.clone();
+            Box::pin(async move {
+                struct OnDrop(Arc<AtomicBool>);
+                impl Drop for OnDrop {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _on_drop = OnDrop(dropped);
+                operations
+                    .lock()
+                    .unwrap()
+                    .push(format!("pull:{}", request.model));
+                std::future::pending().await
+            })
+        }
+        fn delete(&self, name: String) -> BackendFuture<()> {
+            let operations = self.operations.clone();
+            Box::pin(async move {
+                operations.lock().unwrap().push(format!("delete:{name}"));
+                Ok(())
+            })
+        }
+    }
+
+    fn test_app(services: Arc<RecordingServices>) -> TacetaApp {
+        let state = PersistedAppState {
+            ollama_endpoint_mode: OllamaEndpointMode::Custom,
+            ..Default::default()
+        };
+        TacetaApp::with_services(
+            state,
+            AppShellPreferences::default(),
+            OllamaEndpoint::default_local(),
+            services.clone(),
+            services,
+            Arc::new(TacetaLinkService::default()),
+            Installer::new("/tmp/taceta-test-unused-home", "/tmp/Taceta.app"),
+        )
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background operation did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -4034,37 +4090,6 @@ mod model_manager_tests {
             ..fresh
         };
         assert!(!TacetaApp::should_show_startup_link_setup(&acknowledged));
-        // The explicit Settings action owns this flag independently and can
-        // still open the guide when the user requests setup again.
-        let explicit_setup_open = true;
-        assert!(explicit_setup_open);
-    }
-
-    impl FakeModelManager {
-        fn new(listed: Vec<ModelDescriptor>) -> Self {
-            Self {
-                pulls: Arc::new(AtomicUsize::new(0)),
-                deletes: Arc::new(AtomicUsize::new(0)),
-                listed,
-            }
-        }
-        fn dispatch_pull(&self, active: &mut bool, id: &str) {
-            if *active || id.trim().is_empty() {
-                return;
-            }
-            *active = true;
-            self.pulls.fetch_add(1, Ordering::SeqCst);
-        }
-        fn cancel_pull(&self, active: &mut bool) {
-            *active = false;
-        }
-        fn dispatch_delete(&self, confirmed: bool, selected: Option<&str>) {
-            if confirmed {
-                if selected.is_some_and(|name| !name.trim().is_empty()) {
-                    self.deletes.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-        }
     }
 
     fn model(name: &str) -> ModelDescriptor {
@@ -4079,53 +4104,72 @@ mod model_manager_tests {
     }
 
     #[test]
-    fn model_manager_second_pull_cannot_dispatch_while_active() {
-        let manager = FakeModelManager::new(vec![]);
-        let mut active = false;
-        manager.dispatch_pull(&mut active, "qwen3:8b");
-        manager.dispatch_pull(&mut active, "llama3:8b");
-        assert_eq!(manager.pulls.load(Ordering::SeqCst), 1);
+    fn model_manager_duplicate_pull_is_blocked_and_stop_drops_real_task() {
+        let services = Arc::new(RecordingServices::default());
+        let mut app = test_app(services.clone());
+        app.start_model_pull("first-model".into());
+        app.start_model_pull("second-model".into());
+        wait_until(|| !services.operations.lock().unwrap().is_empty());
+        app.stop_model_pull();
+        wait_until(|| services.pull_dropped.load(Ordering::SeqCst));
+        assert!(app.model_pull.is_none());
+        assert_eq!(*services.operations.lock().unwrap(), ["pull:first-model"]);
     }
 
     #[test]
-    fn model_manager_cancel_clears_active_pull_state() {
-        let manager = FakeModelManager::new(vec![]);
-        let mut active = false;
-        manager.dispatch_pull(&mut active, "qwen3:8b");
-        manager.cancel_pull(&mut active);
-        assert!(!active);
+    fn model_manager_confirmation_dispatches_selected_model_only_once() {
+        let services = Arc::new(RecordingServices::default());
+        let mut app = test_app(services.clone());
+        app.confirm_model_delete();
+        assert!(services.operations.lock().unwrap().is_empty());
+        app.delete_confirmation = Some("chosen-model".into());
+        app.confirm_model_delete();
+        app.confirm_model_delete();
+        wait_until(|| !services.operations.lock().unwrap().is_empty());
+        assert_eq!(
+            *services.operations.lock().unwrap(),
+            ["delete:chosen-model"]
+        );
     }
 
     #[test]
-    fn model_manager_delete_cannot_dispatch_without_confirmation() {
-        let manager = FakeModelManager::new(vec![]);
-        manager.dispatch_delete(false, Some("qwen3:8b"));
-        assert_eq!(manager.deletes.load(Ordering::SeqCst), 0);
+    fn shared_model_refresh_updates_chat_choices_without_duplicate_requests() {
+        let services = Arc::new(RecordingServices::default());
+        let mut app = test_app(services.clone());
+        app.refresh_models();
+        app.refresh_models();
+        wait_until(|| {
+            app.drain_background_work();
+            !app.model_refresh_pending
+        });
+        assert_eq!(services.lists.load(Ordering::SeqCst), 1);
+        assert_eq!(app.state.selected_model.as_deref(), Some("test-model"));
+        assert_eq!(app.models, [model("test-model")]);
     }
 
     #[test]
-    fn model_manager_confirmed_delete_dispatches_exact_model_once() {
-        let manager = FakeModelManager::new(vec![]);
-        manager.dispatch_delete(true, Some("qwen3:8b"));
-        assert_eq!(manager.deletes.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn model_manager_list_completion_updates_chat_model_choices() {
-        let listed = vec![model("qwen3:8b")];
-        let manager = FakeModelManager::new(listed.clone());
-        assert_eq!(manager.listed, listed);
-        let mut state = PersistedAppState::default();
-        state.selected_model = manager.listed.first().map(|m| m.name.clone());
-        assert_eq!(state.selected_model.as_deref(), Some("qwen3:8b"));
-    }
-
-    #[test]
-    fn model_manager_chat_submit_does_not_mutate_manager() {
-        let manager = FakeModelManager::new(vec![]);
-        let _chat_was_submitted = true;
-        assert_eq!(manager.pulls.load(Ordering::SeqCst), 0);
-        assert_eq!(manager.deletes.load(Ordering::SeqCst), 0);
+    fn chat_submission_reaches_inference_without_model_mutation() {
+        let services = Arc::new(RecordingServices::default());
+        let mut app = test_app(services.clone());
+        app.models = vec![model("test-model")];
+        app.state.selected_model = Some("test-model".into());
+        app.state.draft = "Hello".into();
+        app.start_generation();
+        wait_until(|| {
+            app.drain_background_work();
+            app.generation.is_none()
+        });
+        assert_eq!(*services.operations.lock().unwrap(), ["chat:Hello"]);
+        assert_eq!(
+            app.state
+                .active_conversation()
+                .messages
+                .last()
+                .unwrap()
+                .content,
+            "Test answer"
+        );
+        assert!(app.state.draft.is_empty());
     }
 
     #[test]

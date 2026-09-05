@@ -217,6 +217,7 @@ pub struct TacetaLinkService {
     waiting_queue_jobs: Arc<Mutex<HashSet<Uuid>>>,
     waiters: Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<LinkResult, LinkError>>>>>,
     progress_waiters: Arc<Mutex<HashMap<Uuid, UnboundedSender<LinkProgress>>>>,
+    in_flight: Arc<Mutex<HashMap<Uuid, (WebWorkflow, Uuid)>>>,
     used_authorizations: Arc<Mutex<HashSet<Uuid>>>,
     last_seen: Arc<Mutex<Option<Instant>>>,
 }
@@ -392,7 +393,13 @@ impl TacetaLinkService {
                     // the one-shot request authorization before that
                     // connection exists, so bind the wire authorization to
                     // this poller's session at the protocol boundary.
-                    Some(job) => serde_json::json!({"job": wire_job(&job, request.session_id)}),
+                    Some(job) => {
+                        self.in_flight
+                            .lock()
+                            .expect("link in-flight jobs")
+                            .insert(job.job_id, (job.workflow.clone(), request.session_id));
+                        serde_json::json!({"job": wire_job(&job, request.session_id)})
+                    }
                     None => serde_json::json!({"job":null}),
                 };
                 Envelope::response_for(&request, Operation::PollJob, payload)
@@ -413,13 +420,31 @@ impl TacetaLinkService {
                 )
             }
             Operation::JobResult => {
-                let result = normalize_result(request.payload.clone());
-                if let Some(id) = request
+                let correlation = request
                     .payload
                     .get("job_id")
                     .and_then(Value::as_str)
                     .and_then(|s| Uuid::parse_str(s).ok())
-                {
+                    .and_then(|id| {
+                        self.in_flight
+                            .lock()
+                            .expect("link in-flight jobs")
+                            .get(&id)
+                            .cloned()
+                            .map(|expected| (id, expected))
+                    });
+                let result = normalize_result(request.payload.clone());
+                let workflow_matches = correlation.as_ref().is_some_and(|(_, (workflow, session))| {
+                    request.session_id == *session
+                        && request.payload.get("workflow").and_then(Value::as_str)
+                            == Some(workflow_name(workflow))
+                });
+                let accepted = workflow_matches;
+                if let Some((id, _)) = correlation.filter(|_| workflow_matches) {
+                    self.in_flight
+                        .lock()
+                        .expect("link in-flight jobs")
+                        .remove(&id);
                     self.waiting_queue_jobs
                         .lock()
                         .expect("waiting link jobs")
@@ -435,13 +460,13 @@ impl TacetaLinkService {
                 Envelope::response_for(
                     &request,
                     Operation::JobResult,
-                    serde_json::json!({"accepted":true}),
+                    serde_json::json!({"accepted":accepted}),
                 )
             }
             Operation::Cancel => Envelope::response_for(
                 &request,
                 Operation::CancelAck,
-                serde_json::json!({"cancelled":true}),
+                serde_json::json!({"cancelled":false,"error":"cancel_not_supported"}),
             ),
             _ => Envelope::response_for(
                 &request,
@@ -470,6 +495,15 @@ fn wire_job(job: &LinkJob, session_id: Uuid) -> Value {
     };
     serde_json::json!({"job_id":job.job_id,"workflow":workflow,"query":job.query,"url":job.url,"prompt":job.prompt,"limit":job.limit,"timeout_ms":job.timeout_ms,"idle_timeout_ms":job.idle_timeout_ms,
         "authorization":{"kind":"web_request","request_id":job.authorization.request_id,"session_id":session_id,"once":true}})
+}
+
+fn workflow_name(workflow: &WebWorkflow) -> &'static str {
+    match workflow {
+        WebWorkflow::DefaultSearch => "default_search",
+        WebWorkflow::GoogleSearch => "google_search",
+        WebWorkflow::PageFetch => "page_fetch",
+        WebWorkflow::ChatGptWeb => "chatgpt_web",
+    }
 }
 
 fn normalize_result(payload: Value) -> Result<LinkResult, LinkError> {
@@ -955,6 +989,55 @@ mod tests {
         assert_eq!(result.data["citations"][0], "https://example.com");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unknown_job_result_is_not_acknowledged_as_accepted() {
+        let path = default_socket_path().unwrap().with_file_name("service-unknown-result.sock");
+        let server = crate::browser_harness::SocketServer::bind(&path).unwrap();
+        let service = TacetaLinkService::default();
+        let worker = std::thread::spawn(move || {
+            let stream = server.accept().unwrap();
+            service.serve_connection(stream).unwrap();
+        });
+        let session = Uuid::new_v4();
+        let mut client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let request = Envelope::new(
+            "0.1.0",
+            session,
+            Operation::JobResult,
+            serde_json::json!({
+                "job_id": Uuid::new_v4(), "workflow": "google_search", "status": "completed",
+                "mutation_state": "performed"
+            }),
+        );
+        client.send(&request).unwrap();
+        let ack: Envelope<Value> = client.receive().unwrap();
+        assert_eq!(ack.payload["accepted"], false);
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_ack_reports_unsupported_instead_of_false_success() {
+        let path = default_socket_path().unwrap().with_file_name("service-cancel.sock");
+        let server = crate::browser_harness::SocketServer::bind(&path).unwrap();
+        let service = TacetaLinkService::default();
+        let worker = std::thread::spawn(move || {
+            let stream = server.accept().unwrap();
+            service.serve_connection(stream).unwrap();
+        });
+        let session = Uuid::new_v4();
+        let mut client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let request = Envelope::new(
+            "0.1.0", session, Operation::Cancel, serde_json::json!({"job_id": Uuid::new_v4()}),
+        );
+        client.send(&request).unwrap();
+        let ack: Envelope<Value> = client.receive().unwrap();
+        assert_eq!(ack.payload["cancelled"], false);
+        assert_eq!(ack.payload["error"], "cancel_not_supported");
+        worker.join().unwrap();
+    }
+
     #[test]
     fn extension_failure_keeps_workflow_in_timeout_error() {
         let result = normalize_result(serde_json::json!({
@@ -1054,7 +1137,7 @@ mod tests {
         let service = TacetaLinkService::default();
         service.enqueue(job.clone()).unwrap();
         let worker = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..5 {
                 let stream = server.accept().unwrap();
                 service.serve_connection(stream).unwrap();
             }
@@ -1079,16 +1162,37 @@ mod tests {
             job.authorization.session_id.to_string()
         );
         let mut result_client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let wrong_workflow = Envelope::new(
+            "0.1.0", session, Operation::JobResult,
+            serde_json::json!({"job_id":job.job_id,"workflow":"page_fetch","status":"completed","mutation_state":"performed"}),
+        );
+        result_client.send(&wrong_workflow).unwrap();
+        let wrong_ack: Envelope<Value> = result_client.receive().unwrap();
+        assert_eq!(wrong_ack.payload["accepted"], false);
+        let wrong_session = Uuid::new_v4();
+        let mut wrong_session_client = ConnectionManager::connect(&path, "0.1.0", wrong_session).unwrap();
+        let wrong_session_request = Envelope::new(
+            "0.1.0", wrong_session, Operation::JobResult,
+            serde_json::json!({"job_id":job.job_id,"workflow":"google_search","status":"completed","mutation_state":"performed"}),
+        );
+        wrong_session_client.send(&wrong_session_request).unwrap();
+        let wrong_session_ack: Envelope<Value> = wrong_session_client.receive().unwrap();
+        assert_eq!(wrong_session_ack.payload["accepted"], false);
+        let mut result_client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
         let result_request = Envelope::new(
             "0.1.0",
             session,
             Operation::JobResult,
-            serde_json::json!({"job_id":job.job_id,"status":"completed","answer":"untrusted","citations":[]}),
+            serde_json::json!({"job_id":job.job_id,"workflow":"google_search","status":"completed","answer":"untrusted","citations":[],"mutation_state":"performed"}),
         );
         result_client.send(&result_request).unwrap();
         let ack: Envelope<Value> = result_client.receive().unwrap();
         assert_eq!(ack.operation, Operation::JobResult);
         assert_eq!(ack.payload["accepted"], true);
+        let mut duplicate_client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        duplicate_client.send(&result_request).unwrap();
+        let duplicate_ack: Envelope<Value> = duplicate_client.receive().unwrap();
+        assert_eq!(duplicate_ack.payload["accepted"], false);
         worker.join().unwrap();
     }
 }
