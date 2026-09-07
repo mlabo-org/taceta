@@ -14,13 +14,44 @@ function typedError(code, message = code, details = {}) {
   return error;
 }
 
-function snapshotDocument(documentLike) {
-  const assistants = [...documentLike.querySelectorAll(ASSISTANT_SELECTOR)].map((node) => ({
-    id: node.getAttribute("data-message-id") || "",
-    text: (node.innerText || node.textContent || "").trim(),
-  }));
-  const prompt = documentLike.querySelector(PROMPT_SELECTOR);
-  const send = documentLike.querySelector(SEND_SELECTOR);
+// Self-contained: this exact function is serialized into the owned browser tab.
+// The polling and final-read paths must use the same completion contract.
+export function readChatGPTDocument(messageId = null, documentLike = document) {
+  const assistantSelector = '[data-message-author-role="assistant"]';
+  const turnSelector = 'section[data-testid^="conversation-turn-"]';
+  const visible = (node) => Boolean(node) && !node.hidden
+    && node.getAttribute?.("aria-hidden") !== "true"
+    && (!node.getClientRects || node.getClientRects().length > 0);
+  const stopped = [...documentLike.querySelectorAll('button,[aria-label]')].some((node) =>
+    visible(node) && (node.getAttribute("data-testid") === "stop-button"
+      || /停止|stop generating|stop/i.test(node.getAttribute("aria-label") || node.textContent || "")));
+  const nodes = [...documentLike.querySelectorAll(assistantSelector)];
+  const completed = (node) => {
+    const turn = node.closest?.(turnSelector);
+    const copy = turn?.querySelector?.('button[data-testid="copy-turn-action-button"]');
+    return !stopped && visible(copy) && !copy.disabled;
+  };
+  if (messageId !== null) {
+    const node = nodes.find((item) => item.getAttribute("data-message-id") === messageId);
+    if (!node || !completed(node)) return { __error: "assistant_response_not_complete" };
+    const answer = (node.innerText || node.textContent || "").trim();
+    if (!answer) return { __error: "assistant_response_empty" };
+    const turn = node.closest?.(turnSelector);
+    const links = [...node.querySelectorAll("a[href]")];
+    if (turn && turn !== node) links.push(...turn.querySelectorAll("a[href]"));
+    const seen = new Set();
+    const citations = links.map((link) => {
+      try {
+        const url = new URL(link.href || link.getAttribute("href"), documentLike.location?.href || "https://chatgpt.com/");
+        if (url.protocol !== "https:" || url.username || url.password || seen.has(url.href)) return null;
+        seen.add(url.href);
+        return { title: (link.innerText || link.textContent || "").trim(), url: url.href };
+      } catch { return null; }
+    }).filter(Boolean);
+    return { answer, citations };
+  }
+  const prompt = documentLike.querySelector('#prompt-textarea[contenteditable="true"][role="textbox"]');
+  const send = documentLike.querySelector('button[data-testid="send-button"]');
   const profile = documentLike.querySelector('button[aria-label*="プロファイルメニュー"],button[aria-label*="Profile"]');
   const loginText = (documentLike.body?.innerText || "").match(/ログイン|Log in|Sign in/i);
   return {
@@ -28,8 +59,12 @@ function snapshotDocument(documentLike) {
     composer: Boolean(prompt),
     send: Boolean(send),
     sendDisabled: Boolean(send?.disabled),
-    assistants,
-    stop: [...documentLike.querySelectorAll("button,[aria-label]")].some((node) => /停止|stop generating|stop/i.test(node.getAttribute("aria-label") || node.textContent || "")),
+    assistants: nodes.map((node) => ({
+      id: node.getAttribute("data-message-id") || "",
+      text: (node.innerText || node.textContent || "").trim(),
+      completed: completed(node),
+    })),
+    stop: stopped,
   };
 }
 
@@ -58,13 +93,14 @@ export function chatGPTWebSelectors() {
   return Object.freeze({ prompt: PROMPT_SELECTOR, send: SEND_SELECTOR, assistant: ASSISTANT_SELECTOR, turn: TURN_SELECTOR });
 }
 
-export function readChatGPTWebState(documentLike) { return snapshotDocument(documentLike); }
+export function readChatGPTWebState(documentLike) { return readChatGPTDocument(null, documentLike); }
 export function citationsFromAssistant(documentLike, assistant) { return extractCitations(documentLike, assistant); }
 export function chatGPTWebActivityFingerprint(state) {
   const latest = state?.assistants?.at?.(-1) || {};
   return JSON.stringify([
     latest.id || "",
     latest.text || "",
+    Boolean(latest.completed),
     Boolean(state?.composer),
     Boolean(state?.send),
     Boolean(state?.sendDisabled),
@@ -87,7 +123,7 @@ export async function runChatGPTWeb({ page, prompt, url = "https://chatgpt.com/"
   const hardDeadline = Date.now() + hardTimeout;
   let idleDeadline = Date.now() + idleTimeout;
   if (typeof page.goto === "function") await page.goto(url);
-  const read = () => page.evaluate(snapshotDocument);
+  const read = () => page.evaluate(readChatGPTDocument);
   let state = await read();
   let activity = chatGPTWebActivityFingerprint(state);
   if (!state.authenticated) throw typedError("auth_required");
@@ -131,9 +167,12 @@ export async function runChatGPTWeb({ page, prompt, url = "https://chatgpt.com/"
         await onProgress(progress);
       }
     }
-    if (next && !state.stop) {
+    if (next?.completed && !state.stop) {
       if (!candidate || candidate.id !== next.id || candidate.text !== next.text) { candidate = next; stableSince = Date.now(); }
       if (Date.now() - stableSince >= stabilityMs) { completed = true; break; }
+    } else {
+      candidate = null;
+      stableSince = 0;
     }
     await sleep(pollMs);
   }
@@ -141,23 +180,11 @@ export async function runChatGPTWeb({ page, prompt, url = "https://chatgpt.com/"
     if (Date.now() >= hardDeadline) throw typedError("response_hard_timeout", "response_hard_timeout", { partialAnswer: sentText });
     throw typedError("response_stalled", "response_stalled", { partialAnswer: sentText });
   }
-  const result = await page.evaluate((id) => {
-    const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-    const assistant = nodes.find((node) => node.getAttribute("data-message-id") === id) || nodes.at(-1);
-    const candidates = [...(assistant?.querySelectorAll("a[href]") || [])];
-    const turn = assistant?.closest?.('section[data-testid^="conversation-turn-"]');
-    if (turn && turn !== assistant) candidates.push(...turn.querySelectorAll("a[href]"));
-    const seen = new Set();
-    const citations = candidates.map((link) => {
-      try {
-        const url = new URL(link.href || link.getAttribute("href"), location.href);
-        if (url.protocol !== "https:" || url.username || url.password || seen.has(url.href)) return null;
-        seen.add(url.href);
-        return { title: (link.innerText || link.textContent || "").trim(), url: url.href };
-      } catch { return null; }
-    }).filter(Boolean);
-    return { answer: (assistant?.innerText || assistant?.textContent || "").trim(), citations };
-  }, candidate.id);
+  const result = await page.evaluate(readChatGPTDocument, candidate.id);
+  if (result?.__error) throw typedError(result.__error);
+  // Deliver the final DOM text even if it changed since the last progress tick.
+  const finalProgress = chatGPTWebProgressChunk(sentText, result.answer, progressSequence + 1);
+  if (finalProgress) await onProgress(finalProgress);
   return { status: "completed", answer: result.answer, citations: result.citations, exact: true, mutation_state: "performed" };
 }
 
