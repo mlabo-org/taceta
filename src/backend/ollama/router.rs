@@ -16,7 +16,7 @@ Examples:
 - "今日リリースされたOAIのGPT-6はAGIですか？" -> search_current, even if you believe GPT-6 does not exist
 - "何か質問を作ってWeb検索して" -> search_generated
 
-For search_current, put a concise self-contained search query in query. Never use stale factual knowledge to skip research. Return only the required JSON object."#;
+For search_current, leave query empty: Taceta sends the user's original input unchanged. You do not rewrite or narrow that input. For search_generated, preserve the user's temporal scope: never replace "latest", "current", or "today" with years from your training, and never invent a year range the user did not request. Never use stale factual knowledge to skip research. Return only the required JSON object."#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum WebRouteDecision {
@@ -66,7 +66,7 @@ pub(super) async fn classify(
         .map(|message| message.content)
         .filter(|content| !content.trim().is_empty())
         .ok_or_else(|| BackendError::Protocol("web routing returned no decision".into()))?;
-    parse_decision(&content)
+    parse_decision(&content, current_input)
 }
 
 fn routing_request_error(error: reqwest::Error) -> BackendError {
@@ -115,16 +115,18 @@ fn route_schema() -> serde_json::Value {
     })
 }
 
-fn parse_decision(content: &str) -> Result<WebRouteDecision, BackendError> {
+fn parse_decision(content: &str, current_input: &str) -> Result<WebRouteDecision, BackendError> {
     let payload: RoutePayload = serde_json::from_str(content.trim()).map_err(|_| {
         BackendError::Protocol(
             "web routing returned invalid JSON; nothing was sent to the browser".into(),
         )
     })?;
     match payload.action {
-        RouteAction::SearchCurrent => {
-            valid_query(payload.query).map(|query| WebRouteDecision::SearchCurrent { query })
-        }
+        // The caller owns the search subject and time range. A model-produced
+        // rewrite is not authoritative for an existing user question.
+        RouteAction::SearchCurrent => Ok(WebRouteDecision::SearchCurrent {
+            query: current_input.trim().to_owned(),
+        }),
         RouteAction::SearchGenerated => {
             valid_query(payload.query).map(|query| WebRouteDecision::SearchGenerated { query })
         }
@@ -147,19 +149,21 @@ mod tests {
 
     #[test]
     fn parses_only_search_routes_when_web_is_on() {
-        assert!(parse_decision(r#"{"action":"local","query":""}"#).is_err());
+        assert!(parse_decision(r#"{"action":"local","query":""}"#, "質問").is_err());
         assert_eq!(
             parse_decision(
-                r#"{"action":"search_current","query":"OpenAI GPT-6 release today AGI"}"#
+                r#"{"action":"search_current","query":"OpenAI GPT-6 release today AGI"}"#,
+                "今日リリースされたOAIのGPT-6はAGIですか？"
             )
             .unwrap(),
             WebRouteDecision::SearchCurrent {
-                query: "OpenAI GPT-6 release today AGI".into()
+                query: "今日リリースされたOAIのGPT-6はAGIですか？".into()
             }
         );
         assert_eq!(
             parse_decision(
-                r#"{"action":"search_generated","query":"Which open-source AI model is most discussed in 2026?"}"#
+                r#"{"action":"search_generated","query":"Which open-source AI model is most discussed in 2026?"}"#,
+                "Come up with a question and search the web."
             )
             .unwrap(),
             WebRouteDecision::SearchGenerated {
@@ -170,9 +174,25 @@ mod tests {
 
     #[test]
     fn refusal_or_explanatory_text_never_silently_becomes_local() {
-        assert!(parse_decision("GPT-6 does not exist, so I will not search.").is_err());
-        assert!(parse_decision(r#"{"action":"local","query":"latest GPT release"}"#).is_err());
-        assert!(parse_decision(r#"{"action":"search_current","query":""}"#).is_err());
+        assert!(parse_decision("GPT-6 does not exist, so I will not search.", "質問").is_err());
+        assert!(parse_decision(r#"{"action":"local","query":"latest GPT release"}"#, "質問").is_err());
+        assert!(parse_decision(r#"{"action":"search_generated","query":""}"#, "質問を作ってWeb検索して").is_err());
+    }
+
+    #[test]
+    fn current_search_preserves_the_users_scope_even_if_the_model_invents_old_years() {
+        for question in [
+            "主要なAI陣営の 最新モデルの名称を調査しろ",
+            "2024年と2025年に発表されたAIモデルを比較して",
+        ] {
+            for proposed in ["主要なAI開発企業 最新モデル 一覧 2024 2025", ""] {
+                let response = serde_json::json!({"action":"search_current", "query":proposed});
+                assert_eq!(
+                    parse_decision(&response.to_string(), question).unwrap(),
+                    WebRouteDecision::SearchCurrent { query: question.into() }
+                );
+            }
+        }
     }
 
     #[test]

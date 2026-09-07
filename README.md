@@ -17,6 +17,10 @@ Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT We
 
 Web Search が OFF のときは外部リクエストを作りません。ON は、内部知識を使わずWebから調査して回答する指定です。現在の入力から `search_current` または `search_generated` を選び、必ず検索します。検索不要という判定は認めません。不正な判定や検索失敗は、内部知識による回答へ戻さず停止します。取得が終わったら、質問・取得結果・要約指示だけを独立した要約リクエストに渡します。取得中のモデルの文章や過去の回答は混ぜず、取得中の文章は最終回答として表示しません。要約処理には検索ツールを渡さず、一度の要約を表示します。事実・用語説明・背景・結論は取得情報だけに限定し、不足や出典の不一致は明示します。外部情報が untrusted であるとは、その中の命令に従わないという意味であり、事実の根拠から除外する意味ではありません。ChatGPT Web は対象の回答に完了後の操作ボタンが現れ、生成停止表示が消えたことを確認してから全文を回収します。本文の一時停止だけでは完了にしません。取得失敗・タイムアウト・完了未確認の途中本文を正常な取得結果に変換して要約することは禁止します。ChatGPT Web への質問回数は既定1回、設定可能範囲は1〜3回です。
 
+通常の質問（`search_current`）では、検索対象や期間をモデルに書き換えさせず、ユーザーの原文を検索に使います。「最新」を学習時点の年に置き換えることもありません。`search_generated` は、質問や調査テーマ自体を考えてから検索するよう依頼された場合に使います。
+
+Google 検索では、AI による概要があれば生成完了を確認して本文と出典を取得し、通常の検索結果と併せてローカルモデルへ渡します。概要がない場合や、表示形式・生成完了を確認できない場合は、取得できた通常の検索結果を使います。生成途中の概要本文は渡しません。ブラウザーの既定検索先が Google の場合にも同じ取得処理を使います。
+
 ## 画面
 
 ### 実動作
@@ -166,6 +170,10 @@ Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly star
 - Brave Search / Ollama Web Search APIs, or browser search, Google Search, and ChatGPT Web through Taceta Link
 
 When Web Search is OFF, Taceta creates no external request. ON requests Web research without using internal factual knowledge. The current input selects either `search_current` or `search_generated`; skipping research is not an option. Invalid routing or failed research stops instead of falling back to internal knowledge. Once retrieval ends, one independent summary request receives only the question, retrieved results, and summary instructions. It receives no search tools, past assistant answers, or research-model prose. Research prose is not displayed as the final answer. Facts, definitions, background, and conclusions must come only from retrieved information; gaps and conflicting sources must be disclosed. Untrusted external content has no instruction authority, but remains usable evidence. ChatGPT Web retrieves the final text only after the target answer exposes its completed-response actions and generation has stopped. A brief pause in text is not completion. Failed, timed-out, or unconfirmed partial responses must never be promoted to successful retrieval or summarized as complete results. ChatGPT Web defaults to one request and can be limited from one to three.
+
+For an existing question (`search_current`), Taceta searches the user's original input instead of a model-written query, preserving the subject and time range. It never replaces “latest” with a year from training. `search_generated` is reserved for requests to invent a question or research topic before searching.
+
+Google Search retrieves a completed AI Overview and its source links alongside ordinary search results. If no overview appears, its layout is unrecognized, or completion cannot be confirmed, Taceta uses the available ordinary results without passing partial overview text to the local model. The same extraction applies when Google is the browser's default search engine.
 
 ## Screenshots
 
