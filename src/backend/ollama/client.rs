@@ -11,7 +11,7 @@ use crate::{
         ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingMode, WebWorkflow,
         normalize_chatgpt_web_request_limit,
     },
-    taceta_link_service::{self, ChatGptPromptSource, LinkProgress, LinkResult, TacetaLinkService},
+    taceta_link_service::{self, ChatGptPromptSource, LinkProgress, TacetaLinkService},
     web_search::{self, ProviderKind, ToolCall, WebSearchProvider},
 };
 use futures_util::StreamExt;
@@ -781,22 +781,6 @@ async fn execute_tool(
                 }
                 let result = match outcome {
                     Ok(result) => result,
-                    Err(error) if !streamed_answer.is_empty() => {
-                        let _ = events.send(GenerationEvent::SearchProgress(
-                            "ChatGPT Webの受信済み回答を使用します".into(),
-                        ));
-                        LinkResult {
-                            workflow: workflow.clone(),
-                            data: serde_json::json!({
-                                "answer": streamed_answer,
-                                "citations": [],
-                                "partial": true,
-                                "completion_error": error.to_string(),
-                            }),
-                            mutation_state: crate::browser_harness::MutationState::Performed,
-                            lifecycle: Some(crate::browser_harness::LifecycleState::Failed),
-                        }
-                    }
                     Err(taceta_link_service::LinkError::Timeout) => {
                         return Err(BackendError::Protocol(format!(
                             "Taceta Link {} request timed out",
@@ -1389,6 +1373,79 @@ mod tests {
     use crate::backend::OllamaEndpointMode;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn incomplete_chatgpt_response_is_never_promoted_to_search_success() {
+        use crate::browser_harness::{Envelope, Operation, read_frame, write_frame};
+        use crate::domain::WebAuthorization;
+        use std::os::unix::net::UnixStream;
+        use uuid::Uuid;
+
+        fn exchange(
+            service: &TacetaLinkService,
+            session: Uuid,
+            operation: Operation,
+            payload: serde_json::Value,
+        ) -> Envelope<serde_json::Value> {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let service = service.clone();
+            let worker = std::thread::spawn(move || service.serve_connection(server).unwrap());
+            write_frame(&mut client, &Envelope::new("0.1.0", session, operation, payload)).unwrap();
+            let response = read_frame(&mut client).unwrap();
+            worker.join().unwrap();
+            response
+        }
+
+        let service = Arc::new(TacetaLinkService::default());
+        let session = Uuid::new_v4();
+        let question = ChatMessage::new_user("現在の米国大統領は誰だ？");
+        let call = ToolCall {
+            name: "web_search".into(),
+            arguments: serde_json::json!({"query":question.content}),
+        };
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut fetch_count = 0;
+        let search = execute_tool(
+            None,
+            Some(&service),
+            Some(WebWorkflow::ChatGptWeb),
+            Some(WebAuthorization { request_id: Uuid::new_v4(), session_id: session }),
+            Some(&question),
+            Some(1),
+            ChatGptPromptSource::CurrentUserInput,
+            &call,
+            &events,
+            &mut fetch_count,
+            5,
+            false,
+        );
+        let browser = async {
+            // Let execute_tool enqueue its request before the extension polls.
+            tokio::task::yield_now().await;
+            let job = exchange(&service, session, Operation::PollJob, serde_json::json!({}));
+            let job_id = job.payload["job"]["job_id"].as_str().unwrap();
+            let progress = exchange(&service, session, Operation::JobProgress, serde_json::json!({
+                "job_id":job_id,"workflow":"chatgpt_web","sequence":1,
+                "delta":"現在の米国大統領は","replace":false,"status":"streaming","mutation_state":"performed"
+            }));
+            assert_eq!(progress.payload["accepted"], true);
+            let failure = exchange(&service, session, Operation::JobResult, serde_json::json!({
+                "job_id":job_id,"workflow":"chatgpt_web","status":"failed",
+                "mutation_state":"performed","error":{"code":"response_stalled","message":"incomplete"}
+            }));
+            assert_eq!(failure.payload["accepted"], true);
+        };
+        let (result, ()) = tokio::join!(search, browser);
+        assert!(matches!(result, Err(BackendError::Protocol(message)) if message.contains("progress stalled")));
+        let mut saw_partial = false;
+        while let Ok(event) = received.try_recv() {
+            if let GenerationEvent::ExternalContentDelta { delta, .. } = event {
+                saw_partial |= delta == "現在の米国大統領は";
+            }
+        }
+        assert!(saw_partial, "the failure must be tested after receiving partial text");
+    }
 
     #[test]
     fn web_synthesis_isolates_current_input_from_past_model_claims() {

@@ -27,26 +27,8 @@ function pageScript(source) {
     const headings = cards.length ? cards.map((card) => card.querySelector("h3")) : [...document.querySelectorAll("#search h3")];
     return headings.map((heading) => { const anchor = heading?.closest?.("a"); const url = external(anchor?.getAttribute?.("href") || anchor?.href); const title = String(heading?.textContent || "").trim(); if (!title || !url) return null; const card = heading.closest?.(".MjjYud") || heading.parentElement; const snippet = String(card?.querySelector?.(".VwiC3b")?.textContent || "").replace(/\\s+/g, " ").trim(); return { title, url, snippet }; }).filter(Boolean).slice(0, Math.max(1, Math.min(50, Number(limit) || 10)));
   };
-  if (source.includes("snapshotDocument")) return function readChatGPTState() { const prompt = document.querySelector('#prompt-textarea[contenteditable="true"][role="textbox"]'); const send = document.querySelector('button[data-testid="send-button"]'); return { authenticated: !/(ログイン|Log in|Sign in)/i.test(document.body?.innerText || ""), composer: !!prompt, send: !!send, sendDisabled: !!send?.disabled, assistants: [...document.querySelectorAll('[data-message-author-role="assistant"]')].map((node) => ({ id: node.getAttribute("data-message-id") || "", text: (node.innerText || node.textContent || "").trim() })), stop: [...document.querySelectorAll("button,[aria-label]")].some((node) => /停止|stop generating|stop/i.test(node.getAttribute("aria-label") || node.textContent || "")) }; };
   if (source.includes("node.replaceChildren")) return function fillComposer(value) { const node = document.querySelector('#prompt-textarea[contenteditable="true"][role="textbox"]'); if (!node) return { __error: "composer_missing" }; node.focus(); node.replaceChildren(document.createTextNode(value)); node.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value })); return null; };
   if (source.includes("send-button") && source.includes("click")) return function clickSend() { document.querySelector('button[data-testid="send-button"]')?.click(); return null; };
-  if (source.includes("data-message-author-role") && source.includes("citations")) return function readAssistant(id) {
-    const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-    const node = nodes.find((item) => item.getAttribute("data-message-id") === id) || nodes.at(-1);
-    const candidates = [...(node?.querySelectorAll("a[href]") || [])];
-    const turn = node?.closest?.('section[data-testid^="conversation-turn-"]');
-    if (turn && turn !== node) candidates.push(...turn.querySelectorAll("a[href]"));
-    const seen = new Set();
-    const citations = candidates.map((a) => {
-      try {
-        const url = new URL(a.href || a.getAttribute("href"), location.href);
-        if (url.protocol !== "https:" || url.username || url.password || seen.has(url.href)) return null;
-        seen.add(url.href);
-        return { title: (a.innerText || a.textContent || "").trim(), url: url.href };
-      } catch { return null; }
-    }).filter(Boolean);
-    return { answer: (node?.innerText || node?.textContent || "").trim(), citations };
-  };
   return null;
 }
 
