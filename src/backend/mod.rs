@@ -47,8 +47,8 @@ pub trait ModelManager: Send + Sync {
         events: UnboundedSender<ModelManagerEvent>,
     ) -> BackendFuture<()>;
     fn delete(&self, model: String) -> BackendFuture<()>;
-    /// Unload one model from the connected server without deleting its files.
-    fn unload(&self, model: String) -> BackendFuture<()>;
+    /// Unload all currently loaded models without deleting files; return their count.
+    fn unload_all(&self) -> BackendFuture<usize>;
 }
 
 pub use ollama::{
