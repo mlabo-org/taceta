@@ -17,16 +17,6 @@ function pageScript(source) {
     const maximum = 120000;
     return { url, title: String(document.title || "").trim(), text: text.slice(0, maximum), truncated: text.length > maximum, citations: [url] };
   };
-  if (source.includes("extractSearchResults")) return function extractGoogleResults(limit = 10) {
-    const text = String(document.body?.innerText || document.body?.textContent || "");
-    if (/(captcha|unusual traffic|robot|ロボット|人間であること)/i.test(text)) return { __error: "captcha_detected" };
-    if (/(before you continue|consent|同意|プライバシーと利用規約)/i.test(text)) return { __error: "consent_required" };
-    if (!document.querySelector("#search")) return { __error: "results_page_unavailable" };
-    const external = (value) => { try { let url = new URL(value, location.href); if (url.protocol !== "https:") return null; if (/(^|\\.)google\\.[a-z.]+$/i.test(url.hostname)) { const target = url.searchParams.get("q") || url.searchParams.get("url") || url.searchParams.get("uddg"); if (!target) return null; url = new URL(target); if (url.protocol !== "https:" || /(^|\\.)google\\.[a-z.]+$/i.test(url.hostname)) return null; } return url.href; } catch { return null; } };
-    const cards = [...document.querySelectorAll("#search .MjjYud")];
-    const headings = cards.length ? cards.map((card) => card.querySelector("h3")) : [...document.querySelectorAll("#search h3")];
-    return headings.map((heading) => { const anchor = heading?.closest?.("a"); const url = external(anchor?.getAttribute?.("href") || anchor?.href); const title = String(heading?.textContent || "").trim(); if (!title || !url) return null; const card = heading.closest?.(".MjjYud") || heading.parentElement; const snippet = String(card?.querySelector?.(".VwiC3b")?.textContent || "").replace(/\\s+/g, " ").trim(); return { title, url, snippet }; }).filter(Boolean).slice(0, Math.max(1, Math.min(50, Number(limit) || 10)));
-  };
   if (source.includes("node.replaceChildren")) return function fillComposer(value) { const node = document.querySelector('#prompt-textarea[contenteditable="true"][role="textbox"]'); if (!node) return { __error: "composer_missing" }; node.focus(); node.replaceChildren(document.createTextNode(value)); node.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value })); return null; };
   if (source.includes("send-button") && source.includes("click")) return function clickSend() { document.querySelector('button[data-testid="send-button"]')?.click(); return null; };
   return null;

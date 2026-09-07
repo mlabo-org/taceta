@@ -12,6 +12,14 @@ later job add the local model's unverified research angle to that original
 prompt. The extension executes only the jobs admitted by Taceta and does not
 read cookies, tokens, profiles, local storage, or CAPTCHA pages.
 
+Google result payloads contain ordinary `results`, an `ai_overview` status,
+and combined `citations`. Only an overview whose outer stream and answer
+container explicitly report completion contains `text`. An absent or
+unavailable overview contributes no partial text; ordinary results remain
+usable. The self-contained DOM reader is used unchanged by browser execution
+and tests. Google controls its page layout, so unrecognized layouts are not
+treated as completed AI answers.
+
 Load this directory as an unpacked extension after installing the native host
 manifest from `native-host-manifest.template.json`. `VERSION` must match the
 Taceta Cargo package version. Validate with:
