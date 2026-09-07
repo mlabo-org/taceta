@@ -150,6 +150,7 @@ pub struct TacetaApp {
     model_candidates: Vec<ModelCandidate>,
     selected_model_candidate: Option<String>,
     model_pull: Option<ActiveModelPull>,
+    model_unload_result: Option<std_mpsc::Receiver<Result<String, String>>>,
     model_id_draft: String,
     delete_confirmation: Option<String>,
     delete_result_rx: std_mpsc::Receiver<Result<String, String>>,
@@ -333,6 +334,7 @@ impl TacetaApp {
             model_candidates: Vec::new(),
             selected_model_candidate: None,
             model_pull: None,
+            model_unload_result: None,
             model_id_draft: String::new(),
             delete_confirmation: None,
             delete_result_rx,
@@ -471,7 +473,7 @@ impl TacetaApp {
     }
 
     fn start_model_pull(&mut self, model: String) {
-        if self.model_pull.is_some() {
+        if self.model_pull.is_some() || self.model_unload_result.is_some() {
             return;
         }
         match self.synchronize_auto_ollama_endpoint() {
@@ -556,6 +558,9 @@ impl TacetaApp {
     }
 
     fn start_model_delete(&mut self, model: String) {
+        if self.model_unload_result.is_some() {
+            return;
+        }
         match self.synchronize_auto_ollama_endpoint() {
             Ok(true) => {
                 self.refresh_models();
@@ -588,7 +593,69 @@ impl TacetaApp {
         });
     }
 
+    fn can_unload_model(&self) -> bool {
+        self.generation.is_none()
+            && self.model_pull.is_none()
+            && !self.model_refresh_pending
+            && self.model_unload_result.is_none()
+            && self.selected_model().is_some()
+    }
+
+    fn start_model_unload(&mut self) {
+        if !self.can_unload_model() {
+            return;
+        }
+        match self.synchronize_auto_ollama_endpoint() {
+            Ok(true) => {
+                self.refresh_models();
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.handle_ollama_endpoint_error(error);
+                return;
+            }
+        }
+        let Some(model) = self.state.selected_model.clone() else {
+            return;
+        };
+        let manager = Arc::clone(&self.model_manager);
+        let (tx, rx) = std_mpsc::channel();
+        self.model_unload_result = Some(rx);
+        self.notice = Some(Notice {
+            kind: NoticeKind::Info,
+            text: format!("{}: {model}", text(self.language(), "メモリを解放中…", "Releasing memory…")),
+        });
+        self.runtime.spawn(async move {
+            let result = manager.unload(model.clone()).await
+                .map(|()| model).map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
     fn drain_background_work(&mut self) {
+        if let Some(receiver) = &self.model_unload_result {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std_mpsc::TryRecvError::Empty) => None,
+                Err(std_mpsc::TryRecvError::Disconnected) => Some(Err("model unload task stopped".into())),
+            };
+            if let Some(result) = result {
+                self.model_unload_result = None;
+                self.notice = Some(match result {
+                    Ok(model) => Notice {
+                        kind: NoticeKind::Info,
+                        text: format!("{model}: {}", text(self.language(),
+                            "モデルをメモリから解放しました。次の送信時に再読み込みします。",
+                            "Model unloaded from memory. It will reload on your next message.")),
+                    },
+                    Err(error) => Notice {
+                        kind: NoticeKind::Error,
+                        text: format!("{}: {}", text(self.language(), "メモリ解放に失敗しました", "Memory release failed"), self.safe_backend_error(&error)),
+                    },
+                });
+            }
+        }
         if let Ok(result) = self.model_result_rx.try_recv() {
             self.model_refresh_pending = false;
             match result {
@@ -1054,7 +1121,7 @@ impl TacetaApp {
     }
 
     fn start_generation(&mut self) {
-        if self.generation.is_some() {
+        if self.generation.is_some() || self.model_unload_result.is_some() {
             return;
         }
         match self.synchronize_auto_ollama_endpoint() {
@@ -1783,6 +1850,20 @@ impl TacetaApp {
                         if let Some(details) = details {
                             response.response.on_hover_text(details);
                         }
+                        let label = if self.model_unload_result.is_some() {
+                            text(language, "解放中…", "Releasing…")
+                        } else {
+                            text(language, "メモリ解放", "Release memory")
+                        };
+                        let model = self.state.selected_model.as_deref().unwrap_or("—");
+                        if ui.add_enabled(self.can_unload_model(), Button::new(label).small())
+                            .on_hover_text(format!("{}\n{model}", text(language,
+                                "選択中のモデルを接続先のメモリから解放します。モデルファイルと会話は残ります。他のアプリで同じモデルを使用中の場合も影響します。",
+                                "Unload the selected model from the connected server. Files and conversations remain. Other apps using the same model are also affected.")))
+                            .clicked()
+                        {
+                            self.start_model_unload();
+                        }
                     });
                 });
             });
@@ -1939,7 +2020,8 @@ impl TacetaApp {
     fn show_ollama_endpoint_settings(&mut self, ui: &mut Ui, language: AppShellLanguage) {
         let palette = theme::palette(ui);
         let endpoint_busy =
-            self.generation.is_some() || self.model_pull.is_some() || self.model_refresh_pending;
+            self.generation.is_some() || self.model_pull.is_some() || self.model_refresh_pending
+                || self.model_unload_result.is_some();
         let mut apply_requested = false;
         theme::card(
             ui.visuals().faint_bg_color,
@@ -3089,6 +3171,7 @@ impl TacetaApp {
                                                 .clicked();
                                         } else {
                                             let ready = self.state.selected_model.is_some()
+                                                && self.model_unload_result.is_none()
                                                 && (!self.state.draft.trim().is_empty()
                                                     || !self.state.pending_attachments.is_empty());
                                             let dark = ui.visuals().dark_mode;
@@ -3446,7 +3529,8 @@ impl eframe::App for TacetaApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.drain_background_work();
 
-        if self.generation.is_some() || self.model_refresh_pending || self.model_pull.is_some() {
+        if self.generation.is_some() || self.model_refresh_pending || self.model_pull.is_some()
+            || self.model_unload_result.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
@@ -3996,6 +4080,13 @@ mod model_manager_tests {
     }
 
     impl ModelManager for RecordingServices {
+        fn unload(&self, name: String) -> BackendFuture<()> {
+            let operations = self.operations.clone();
+            Box::pin(async move {
+                operations.lock().unwrap().push(format!("unload:{name}"));
+                Ok(())
+            })
+        }
         fn list_installed(&self) -> BackendFuture<Vec<ModelDescriptor>> {
             panic!("the UI must share the inference model-list request")
         }
@@ -4101,6 +4192,45 @@ mod model_manager_tests {
             tools: false,
             context_length: None,
         }
+    }
+
+    #[test]
+    fn model_unload_preserves_selection_and_blocks_duplicate_and_chat() {
+        let services = Arc::new(RecordingServices::default());
+        let mut app = test_app(services.clone());
+        app.models = vec![model("chosen-model")];
+        app.state.selected_model = Some("chosen-model".into());
+        app.state.draft = "keep my draft".into();
+        app.start_model_unload();
+        app.start_model_unload();
+        app.start_generation();
+        wait_until(|| {
+            app.drain_background_work();
+            app.model_unload_result.is_none()
+        });
+        assert_eq!(*services.operations.lock().unwrap(), ["unload:chosen-model"]);
+        assert_eq!(app.state.selected_model.as_deref(), Some("chosen-model"));
+        assert_eq!(app.state.draft, "keep my draft");
+        assert_eq!(app.models.len(), 1);
+        assert!(matches!(app.notice.as_ref().unwrap().kind, NoticeKind::Info));
+        assert!(app.can_unload_model());
+    }
+
+    #[test]
+    fn model_unload_failure_restores_controls_and_reports_error() {
+        let services = Arc::new(RecordingServices::default());
+        let mut app = test_app(services);
+        app.models = vec![model("chosen-model")];
+        app.state.selected_model = Some("chosen-model".into());
+        let (tx, rx) = std_mpsc::channel();
+        app.model_unload_result = Some(rx);
+        tx.send(Err("server rejected unloading".into())).unwrap();
+        app.drain_background_work();
+        assert!(app.can_unload_model());
+        assert!(matches!(app.notice.as_ref().unwrap().kind, NoticeKind::Error));
+        app.start_generation();
+        // An empty draft must remain empty; release failure does not send a chat.
+        assert!(app.generation.is_none());
     }
 
     #[test]

@@ -1087,6 +1087,63 @@ async fn installed_models(
 }
 
 impl ModelManager for OllamaModelManager {
+    fn unload(&self, model: String) -> BackendFuture<()> {
+        let manager = self.clone_for_task();
+        Box::pin(async move {
+            if model.trim().is_empty() {
+                return Err(BackendError::Protocol("model name is empty".into()));
+            }
+            // Do not start an idle server just to release a model. The server
+            // may acknowledge unloading before its runner has actually exited.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let response = manager
+                    .http
+                    .post(manager.url("/api/generate"))
+                    .json(&serde_json::json!({
+                        "model": model, "keep_alive": 0, "stream": false
+                    }))
+                    .send()
+                    .await?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body: serde_json::Value = response.json().await?;
+                    return Err(BackendError::Protocol(format!(
+                        "model unload failed ({status}): {}",
+                        body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error")
+                    )));
+                }
+                let body: serde_json::Value = response.json().await?;
+                if body.get("done").and_then(|v| v.as_bool()) != Some(true) {
+                    return Err(BackendError::Protocol("model unload was not acknowledged".into()));
+                }
+                loop {
+                    #[derive(serde::Deserialize)]
+                    struct RunningModels {
+                        models: Vec<RunningModel>,
+                    }
+                    #[derive(serde::Deserialize)]
+                    struct RunningModel {
+                        name: String,
+                    }
+                    let running: RunningModels = manager
+                        .http
+                        .get(manager.url("/api/ps"))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    if !running.models.iter().any(|loaded| loaded.name == model) {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            })
+            .await
+            .map_err(|_| BackendError::Protocol("model unload timed out after 30 seconds".into()))?
+        })
+    }
+
     fn list_installed(&self) -> BackendFuture<Vec<ModelDescriptor>> {
         let manager = self.clone_for_task();
         Box::pin(async move { installed_models(&manager.http, &manager.endpoint).await })
@@ -1335,6 +1392,60 @@ mod tests {
     use crate::backend::OllamaEndpointMode;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn model_unload_waits_for_runner_exit_and_surfaces_rejection() {
+        for reject in [false, true] {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let replies = if reject {
+                    vec![("400 Bad Request", r#"{"error":"cannot unload"}"#)]
+                } else {
+                    vec![
+                        ("200 OK", r#"{"done":true}"#),
+                        ("200 OK", r#"{"models":[{"name":"chosen:latest"},{"name":"other:latest"}]}"#),
+                        ("200 OK", r#"{"models":[{"name":"other:latest"}]}"#),
+                    ]
+                };
+                for (index, (status, body)) in replies.into_iter().enumerate() {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).unwrap();
+                        header.push(byte[0]);
+                    }
+                    let header = String::from_utf8(header).unwrap();
+                    if index == 0 {
+                        assert!(header.starts_with("POST /api/generate "));
+                        let length: usize = header.lines().find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                        }).unwrap();
+                        let mut bytes = vec![0; length];
+                        stream.read_exact(&mut bytes).unwrap();
+                        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(body, serde_json::json!({"model":"chosen:latest","keep_alive":0,"stream":false}));
+                    } else {
+                        assert!(header.starts_with("GET /api/ps "));
+                    }
+                    write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            let endpoint = OllamaEndpoint::resolve_from_values(
+                OllamaEndpointMode::Custom, &format!("http://{address}"), None, None,
+            ).unwrap();
+            let result = OllamaModelManager::new(endpoint).unload("chosen:latest".into()).await;
+            server.join().unwrap();
+            if reject {
+                assert!(result.unwrap_err().to_string().contains("cannot unload"));
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
 
     fn spawn_pull_server(body: &'static [u8]) -> String {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
