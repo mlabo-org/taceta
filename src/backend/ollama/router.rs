@@ -3,21 +3,20 @@ use crate::backend::BackendError;
 use serde::Deserialize;
 
 const WEB_ROUTER_PROMPT: &str = r#"You are Taceta's local Web-routing controller, not an answering assistant.
-Classify only the CURRENT USER INPUT below. You have no conversation history and must not answer, refuse, correct, or assess whether a named thing exists.
+Web is ON: external research is mandatory for every input, including explanations, writing, and casual questions. Choose a search query only for the CURRENT USER INPUT below. You have no conversation history and must not answer, refuse, correct, or assess whether a named thing exists. Never decide that internal knowledge is sufficient.
 
 Choose exactly one action:
-- local: timeless explanation, writing, casual conversation, or reasoning that can be completed from the supplied input without current external facts.
-- search_current: an accurate answer materially depends on current, recent, changing, date-specific, released, available, priced, sourced, or otherwise externally verifiable facts. Use this even when a claim seems false, impossible, unknown, or newer than your training; searching is how the premise is checked.
+- search_current: search the current user's question. This is the default for every input. Use this even when a claim seems false, impossible, unknown, or newer than your training; searching is how the premise is checked.
 - search_generated: the user asks the local model to invent, choose, or formulate a concrete question/topic and then search it. Put that new self-contained research question in query.
 
-If deciding whether a name, product, release, event, claim, date, or premise is real would require external verification, choose search_current. A premise that conflicts with your training is evidence that verification is needed, never a reason to refuse or choose local.
+If deciding whether a name, product, release, event, claim, date, or premise is real would require external verification, choose search_current. A premise that conflicts with your training is evidence that verification is needed, never a reason to refuse or skip research.
 
 Examples:
-- "AGIの定義ってなんだっけ" -> local
+- "AGIの定義ってなんだっけ" -> search_current
 - "今日リリースされたOAIのGPT-6はAGIですか？" -> search_current, even if you believe GPT-6 does not exist
 - "何か質問を作ってWeb検索して" -> search_generated
 
-For search_current, put a concise self-contained search query in query. For local, query must be an empty string. Never use stale factual knowledge to turn a verification request into local. Return only the required JSON object."#;
+For search_current, put a concise self-contained search query in query. Never use stale factual knowledge to skip research. Return only the required JSON object."#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum WebRouteDecision {
@@ -29,7 +28,6 @@ pub(super) enum WebRouteDecision {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RouteAction {
-    Local,
     SearchCurrent,
     SearchGenerated,
 }
@@ -108,7 +106,7 @@ fn route_schema() -> serde_json::Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["local", "search_current", "search_generated"]
+                "enum": ["search_current", "search_generated"]
             },
             "query": {"type": "string", "maxLength": 512}
         },
@@ -124,11 +122,6 @@ fn parse_decision(content: &str) -> Result<WebRouteDecision, BackendError> {
         )
     })?;
     match payload.action {
-        RouteAction::Local if payload.query.trim().is_empty() => Ok(WebRouteDecision::Local),
-        RouteAction::Local => Err(BackendError::Protocol(
-            "web routing returned a query for a local answer; nothing was sent to the browser"
-                .into(),
-        )),
         RouteAction::SearchCurrent => {
             valid_query(payload.query).map(|query| WebRouteDecision::SearchCurrent { query })
         }
@@ -153,11 +146,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_only_the_three_structured_routes() {
-        assert_eq!(
-            parse_decision(r#"{"action":"local","query":""}"#).unwrap(),
-            WebRouteDecision::Local
-        );
+    fn parses_only_search_routes_when_web_is_on() {
+        assert!(parse_decision(r#"{"action":"local","query":""}"#).is_err());
         assert_eq!(
             parse_decision(
                 r#"{"action":"search_current","query":"OpenAI GPT-6 release today AGI"}"#
@@ -189,7 +179,8 @@ mod tests {
     fn routing_contract_treats_a_dubious_new_claim_as_a_reason_to_search() {
         assert!(WEB_ROUTER_PROMPT.contains("even when a claim seems false"));
         assert!(WEB_ROUTER_PROMPT.contains("must not answer, refuse, correct"));
-        assert!(WEB_ROUTER_PROMPT.contains("never a reason to refuse or choose local"));
+        assert!(WEB_ROUTER_PROMPT.contains("external research is mandatory for every input"));
+        assert_eq!(route_schema()["properties"]["action"]["enum"], serde_json::json!(["search_current", "search_generated"]));
         assert_eq!(route_schema()["additionalProperties"], false);
     }
 
