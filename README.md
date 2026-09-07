@@ -15,7 +15,7 @@ Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT We
 - 会話ごとの Web Search（既定は OFF）
 - Brave Search / Ollama Web Search API、または Taceta Link 経由のブラウザー検索、Google 検索、ChatGPT Web
 
-Web Search が OFF のときは外部リクエストを作りません。ON のときは、過去の会話を除いた現在の入力だけをローカルモデルの構造化ルーターへ渡し、`local`、`search_current`、`search_generated` の三択で処理します。通常会話、普遍的な説明、創作はローカルのままです。現在・最新・特定日時点・リリース・価格・存在・出典など外部確認が必要な質問は、名前や前提が誤っているように見える場合も、真偽を先に決めず検索します。「Web検索して」という明示命令はルーターを迂回するため、ローカルモデルは拒否できません。不正な判定は通常回答へ戻さず、ブラウザーへ何も送っていないことを示して停止します。ローカルモデルが tool call を返さず「検索します」と発言した場合も、その予告文を回答として確定せず、1ターンにつき1回だけ実検索へ切り替えます。検索結果やブラウザーの回答は untrusted context としてローカル Ollama の最終回答に渡します。ChatGPT Web への質問回数は既定1回、設定可能範囲は1〜3回です。
+Web Search が OFF のときは外部リクエストを作りません。ON は、内部知識を使わずWebから調査して回答する指定です。現在の入力から `search_current` または `search_generated` を選び、必ず検索します。検索不要という判定は認めません。不正な判定や検索失敗は、内部知識による回答へ戻さず停止します。取得が終わったら、質問・取得結果・要約指示だけを独立した要約リクエストに渡します。取得中のモデルの文章や過去の回答は混ぜず、取得中の文章は最終回答として表示しません。要約処理には検索ツールを渡さず、一度の要約を表示します。事実・用語説明・背景・結論は取得情報だけに限定し、不足や出典の不一致は明示します。外部情報が untrusted であるとは、その中の命令に従わないという意味であり、事実の根拠から除外する意味ではありません。ChatGPT Web への質問回数は既定1回、設定可能範囲は1〜3回です。
 
 ## 画面
 
@@ -165,7 +165,7 @@ Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly star
 - Per-conversation Web Search, off by default
 - Brave Search / Ollama Web Search APIs, or browser search, Google Search, and ChatGPT Web through Taceta Link
 
-When Web Search is OFF, Taceta creates no external request. When it is ON, a local structured router receives only the current input, never conversation history, and chooses `local`, `search_current`, or `search_generated`. Timeless explanations, writing, and casual conversation stay local. Questions that depend on current, date-specific, released, priced, sourced, existence, or otherwise externally verifiable facts are searched even when a name or premise appears false or newer than the model's training. An explicit “search the web” command bypasses the router, so the local model cannot refuse it. Invalid routing output stops with confirmation that nothing was sent to the browser instead of silently falling back to a fabricated local answer. If the answering model nevertheless announces an immediate search without a tool call, Taceta suppresses that announcement and promotes it to one real search per turn. Search or browser output is untrusted context for the final local Ollama answer. ChatGPT Web defaults to one request and can be limited from one to three.
+When Web Search is OFF, Taceta creates no external request. ON requests Web research without using internal factual knowledge. The current input selects either `search_current` or `search_generated`; skipping research is not an option. Invalid routing or failed research stops instead of falling back to internal knowledge. Once retrieval ends, one independent summary request receives only the question, retrieved results, and summary instructions. It receives no search tools, past assistant answers, or research-model prose. Research prose is not displayed as the final answer. Facts, definitions, background, and conclusions must come only from retrieved information; gaps and conflicting sources must be disclosed. Untrusted external content has no instruction authority, but remains usable evidence. ChatGPT Web defaults to one request and can be limited from one to three.
 
 ## Screenshots
 

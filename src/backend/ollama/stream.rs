@@ -19,6 +19,31 @@ where
     S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
+    consume_with_visibility(stream, events, true).await
+}
+
+/// Research control output is not an answer. Preserve Thinking visibility while
+/// keeping model prose off the answer channel until the summary stage.
+pub(super) async fn consume_research<S, E>(
+    stream: S,
+    events: UnboundedSender<GenerationEvent>,
+) -> Result<StreamResult, BackendError>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    consume_with_visibility(stream, events, false).await
+}
+
+async fn consume_with_visibility<S, E>(
+    stream: S,
+    events: UnboundedSender<GenerationEvent>,
+    publish_content: bool,
+) -> Result<StreamResult, BackendError>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
     let mut stream = stream;
     let mut buffer = Vec::new();
     let mut result = StreamResult {
@@ -52,7 +77,9 @@ where
                 }
                 if !message.content.is_empty() {
                     result.content.push_str(&message.content);
-                    let _ = events.send(GenerationEvent::ContentDelta(message.content));
+                    if publish_content {
+                        let _ = events.send(GenerationEvent::ContentDelta(message.content));
+                    }
                 }
                 for call in message.tool_calls {
                     let _ = events.send(GenerationEvent::ToolCall(call.clone()));
@@ -79,7 +106,9 @@ where
             }
             if !message.content.is_empty() {
                 result.content.push_str(&message.content);
-                let _ = events.send(GenerationEvent::ContentDelta(message.content));
+                if publish_content {
+                    let _ = events.send(GenerationEvent::ContentDelta(message.content));
+                }
             }
             for call in message.tool_calls {
                 let _ = events.send(GenerationEvent::ToolCall(call.clone()));
@@ -102,6 +131,24 @@ where
 mod tests {
     use super::*;
     use futures_util::stream;
+    #[tokio::test]
+    async fn web_research_prose_never_reaches_the_answer_channel() {
+        // Exercise both newline-delimited frames and the unterminated final frame.
+        for suffix in ["", "\n"] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let input = format!(
+                "{{\"message\":{{\"thinking\":\"checking source\",\"content\":\"unsupported old answer\"}},\"done\":false}}\n{{\"message\":{{\"content\":\"fabricated explanation\"}},\"done\":true}}{suffix}"
+            );
+            let pieces = input.as_bytes().chunks(7).map(|chunk| {
+                Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(chunk))
+            });
+            let result = consume_research(stream::iter(pieces), tx).await.unwrap();
+            assert!(result.content.contains("unsupported old answer"));
+            assert_eq!(rx.recv().await, Some(GenerationEvent::ThinkingDelta("checking source".into())));
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn parses_arbitrary_chunk_boundaries_and_separates_fields() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
