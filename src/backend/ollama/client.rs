@@ -1087,60 +1087,59 @@ async fn installed_models(
 }
 
 impl ModelManager for OllamaModelManager {
-    fn unload(&self, model: String) -> BackendFuture<()> {
+    fn unload_all(&self) -> BackendFuture<usize> {
         let manager = self.clone_for_task();
         Box::pin(async move {
-            if model.trim().is_empty() {
-                return Err(BackendError::Protocol("model name is empty".into()));
+            async fn loaded_models(manager: &OllamaModelManager) -> Result<Vec<String>, BackendError> {
+                #[derive(serde::Deserialize)]
+                struct RunningModels { models: Vec<RunningModel> }
+                #[derive(serde::Deserialize)]
+                struct RunningModel { name: String }
+                let running: RunningModels = manager.http.get(manager.url("/api/ps"))
+                    .timeout(Duration::from_secs(5)).send().await?
+                    .error_for_status()?.json().await?;
+                let mut seen = HashSet::new();
+                Ok(running.models.into_iter().map(|m| m.name)
+                    .filter(|name| seen.insert(name.clone())).collect())
             }
-            // Do not start an idle server just to release a model. The server
-            // may acknowledge unloading before its runner has actually exited.
+            // Snapshot only currently loaded models. Never start an idle server
+            // or chase new workloads started by another client during unloading.
             tokio::time::timeout(Duration::from_secs(30), async {
-                let response = manager
-                    .http
-                    .post(manager.url("/api/generate"))
-                    .json(&serde_json::json!({
-                        "model": model, "keep_alive": 0, "stream": false
-                    }))
-                    .send()
-                    .await?;
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let body: serde_json::Value = response.json().await?;
-                    return Err(BackendError::Protocol(format!(
-                        "model unload failed ({status}): {}",
-                        body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error")
-                    )));
+                let models = loaded_models(&manager).await?;
+                if models.is_empty() { return Ok(0); }
+                let mut errors = Vec::new();
+                for model in &models {
+                    let result: Result<(), BackendError> = async {
+                        let response = manager.http.post(manager.url("/api/generate"))
+                            .timeout(Duration::from_secs(5))
+                            .json(&serde_json::json!({"model": model, "keep_alive": 0, "stream": false}))
+                            .send().await?;
+                        let status = response.status();
+                        let body: serde_json::Value = response.json().await?;
+                        if !status.is_success() {
+                            return Err(BackendError::Protocol(format!("{status}: {}",
+                                body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error"))));
+                        }
+                        if body.get("done").and_then(|v| v.as_bool()) != Some(true) {
+                            return Err(BackendError::Protocol("model unload was not acknowledged".into()));
+                        }
+                        Ok(())
+                    }.await;
+                    if let Err(error) = result { errors.push(format!("{model}: {error}")); }
                 }
-                let body: serde_json::Value = response.json().await?;
-                if body.get("done").and_then(|v| v.as_bool()) != Some(true) {
-                    return Err(BackendError::Protocol("model unload was not acknowledged".into()));
+                if !errors.is_empty() {
+                    return Err(BackendError::Protocol(format!("Some models could not be unloaded: {}", errors.join("; "))));
                 }
                 loop {
-                    #[derive(serde::Deserialize)]
-                    struct RunningModels {
-                        models: Vec<RunningModel>,
-                    }
-                    #[derive(serde::Deserialize)]
-                    struct RunningModel {
-                        name: String,
-                    }
-                    let running: RunningModels = manager
-                        .http
-                        .get(manager.url("/api/ps"))
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .json()
-                        .await?;
-                    if !running.models.iter().any(|loaded| loaded.name == model) {
-                        return Ok(());
+                    let running = loaded_models(&manager).await?;
+                    if running.is_empty() { return Ok(models.len()); }
+                    if running.iter().all(|name| !models.contains(name)) {
+                        return Err(BackendError::Protocol(format!(
+                            "New models were loaded during memory release: {}", running.join(", "))));
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
-            })
-            .await
-            .map_err(|_| BackendError::Protocol("model unload timed out after 30 seconds".into()))?
+            }).await.map_err(|_| BackendError::Protocol("model unload timed out after 30 seconds".into()))?
         })
     }
 
@@ -1394,19 +1393,26 @@ mod tests {
     use std::net::TcpListener;
 
     #[tokio::test]
-    async fn model_unload_waits_for_runner_exit_and_surfaces_rejection() {
-        for reject in [false, true] {
+    async fn model_unload_all_handles_multiple_empty_and_partial_failure() {
+        for scenario in 0..3 {
             let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
-                let replies = if reject {
-                    vec![("400 Bad Request", r#"{"error":"cannot unload"}"#)]
-                } else {
-                    vec![
+                let loaded = r#"{"models":[{"name":"chosen:latest"},{"name":"other:latest"}]}"#;
+                let replies = match scenario {
+                    0 => vec![
+                        ("200 OK", loaded),
+                        ("400 Bad Request", r#"{"error":"cannot unload"}"#),
                         ("200 OK", r#"{"done":true}"#),
-                        ("200 OK", r#"{"models":[{"name":"chosen:latest"},{"name":"other:latest"}]}"#),
-                        ("200 OK", r#"{"models":[{"name":"other:latest"}]}"#),
-                    ]
+                    ],
+                    1 => vec![
+                        ("200 OK", loaded),
+                        ("200 OK", r#"{"done":true}"#),
+                        ("200 OK", r#"{"done":true}"#),
+                        ("200 OK", loaded),
+                        ("200 OK", r#"{"models":[]}"#),
+                    ],
+                    _ => vec![("200 OK", r#"{"models":[]}"#)],
                 };
                 for (index, (status, body)) in replies.into_iter().enumerate() {
                     let (mut stream, _) = listener.accept().unwrap();
@@ -1418,7 +1424,7 @@ mod tests {
                         header.push(byte[0]);
                     }
                     let header = String::from_utf8(header).unwrap();
-                    if index == 0 {
+                    if index == 1 || index == 2 {
                         assert!(header.starts_with("POST /api/generate "));
                         let length: usize = header.lines().find_map(|line| {
                             let (key, value) = line.split_once(':')?;
@@ -1427,7 +1433,8 @@ mod tests {
                         let mut bytes = vec![0; length];
                         stream.read_exact(&mut bytes).unwrap();
                         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                        assert_eq!(body, serde_json::json!({"model":"chosen:latest","keep_alive":0,"stream":false}));
+                        let expected_model = if index == 1 { "chosen:latest" } else { "other:latest" };
+                        assert_eq!(body, serde_json::json!({"model":expected_model,"keep_alive":0,"stream":false}));
                     } else {
                         assert!(header.starts_with("GET /api/ps "));
                     }
@@ -1437,12 +1444,13 @@ mod tests {
             let endpoint = OllamaEndpoint::resolve_from_values(
                 OllamaEndpointMode::Custom, &format!("http://{address}"), None, None,
             ).unwrap();
-            let result = OllamaModelManager::new(endpoint).unload("chosen:latest".into()).await;
+            let result = OllamaModelManager::new(endpoint).unload_all().await;
             server.join().unwrap();
-            if reject {
-                assert!(result.unwrap_err().to_string().contains("cannot unload"));
+            if scenario == 0 {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("chosen:latest") && error.contains("cannot unload"));
             } else {
-                assert!(result.is_ok());
+                assert_eq!(result.unwrap(), if scenario == 1 { 2 } else { 0 });
             }
         }
     }

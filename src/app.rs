@@ -150,7 +150,7 @@ pub struct TacetaApp {
     model_candidates: Vec<ModelCandidate>,
     selected_model_candidate: Option<String>,
     model_pull: Option<ActiveModelPull>,
-    model_unload_result: Option<std_mpsc::Receiver<Result<String, String>>>,
+    model_unload_result: Option<std_mpsc::Receiver<Result<usize, String>>>,
     model_id_draft: String,
     delete_confirmation: Option<String>,
     delete_result_rx: std_mpsc::Receiver<Result<String, String>>,
@@ -598,7 +598,6 @@ impl TacetaApp {
             && self.model_pull.is_none()
             && !self.model_refresh_pending
             && self.model_unload_result.is_none()
-            && self.selected_model().is_some()
     }
 
     fn start_model_unload(&mut self) {
@@ -616,19 +615,15 @@ impl TacetaApp {
                 return;
             }
         }
-        let Some(model) = self.state.selected_model.clone() else {
-            return;
-        };
         let manager = Arc::clone(&self.model_manager);
         let (tx, rx) = std_mpsc::channel();
         self.model_unload_result = Some(rx);
         self.notice = Some(Notice {
             kind: NoticeKind::Info,
-            text: format!("{}: {model}", text(self.language(), "メモリを解放中…", "Releasing memory…")),
+            text: text(self.language(), "全モデルのメモリを解放中…", "Unloading all models…").to_owned(),
         });
         self.runtime.spawn(async move {
-            let result = manager.unload(model.clone()).await
-                .map(|()| model).map_err(|error| error.to_string());
+            let result = manager.unload_all().await.map_err(|error| error.to_string());
             let _ = tx.send(result);
         });
     }
@@ -643,11 +638,15 @@ impl TacetaApp {
             if let Some(result) = result {
                 self.model_unload_result = None;
                 self.notice = Some(match result {
-                    Ok(model) => Notice {
+                    Ok(count) => Notice {
                         kind: NoticeKind::Info,
-                        text: format!("{model}: {}", text(self.language(),
-                            "モデルをメモリから解放しました。次の送信時に再読み込みします。",
-                            "Model unloaded from memory. It will reload on your next message.")),
+                        text: if count == 0 {
+                            text(self.language(), "読み込み中のモデルはありません。", "No models are loaded.").to_owned()
+                        } else {
+                            format!("{} ({count})", text(self.language(),
+                                "全モデルをメモリから解放しました。次の送信時に再読み込みします。",
+                                "All models unloaded from memory. Models reload on the next message."))
+                        },
                     },
                     Err(error) => Notice {
                         kind: NoticeKind::Error,
@@ -1853,13 +1852,12 @@ impl TacetaApp {
                         let label = if self.model_unload_result.is_some() {
                             text(language, "解放中…", "Releasing…")
                         } else {
-                            text(language, "メモリ解放", "Release memory")
+                            text(language, "全モデル解放", "Unload all models")
                         };
-                        let model = self.state.selected_model.as_deref().unwrap_or("—");
                         if ui.add_enabled(self.can_unload_model(), Button::new(label).small())
-                            .on_hover_text(format!("{}\n{model}", text(language,
-                                "選択中のモデルを接続先のメモリから解放します。モデルファイルと会話は残ります。他のアプリで同じモデルを使用中の場合も影響します。",
-                                "Unload the selected model from the connected server. Files and conversations remain. Other apps using the same model are also affected.")))
+                            .on_hover_text(text(language,
+                                "接続先で読み込み中の全モデルをメモリから解放します。モデルファイルと会話は残ります。他のアプリが使用するモデルも対象です。",
+                                "Unload every model currently loaded on the connected server, including models used by other apps. Files and conversations remain."))
                             .clicked()
                         {
                             self.start_model_unload();
@@ -4080,11 +4078,11 @@ mod model_manager_tests {
     }
 
     impl ModelManager for RecordingServices {
-        fn unload(&self, name: String) -> BackendFuture<()> {
+        fn unload_all(&self) -> BackendFuture<usize> {
             let operations = self.operations.clone();
             Box::pin(async move {
-                operations.lock().unwrap().push(format!("unload:{name}"));
-                Ok(())
+                operations.lock().unwrap().push("unload_all".into());
+                Ok(2)
             })
         }
         fn list_installed(&self) -> BackendFuture<Vec<ModelDescriptor>> {
@@ -4208,7 +4206,7 @@ mod model_manager_tests {
             app.drain_background_work();
             app.model_unload_result.is_none()
         });
-        assert_eq!(*services.operations.lock().unwrap(), ["unload:chosen-model"]);
+        assert_eq!(*services.operations.lock().unwrap(), ["unload_all"]);
         assert_eq!(app.state.selected_model.as_deref(), Some("chosen-model"));
         assert_eq!(app.state.draft, "keep my draft");
         assert_eq!(app.models.len(), 1);
@@ -4231,6 +4229,26 @@ mod model_manager_tests {
         app.start_generation();
         // An empty draft must remain empty; release failure does not send a chat.
         assert!(app.generation.is_none());
+    }
+
+    #[test]
+    fn model_unload_all_needs_no_selection_and_empty_result_is_clear() {
+        let services = Arc::new(RecordingServices::default());
+        let mut app = test_app(services.clone());
+        assert!(app.state.selected_model.is_none());
+        app.start_model_unload();
+        wait_until(|| {
+            app.drain_background_work();
+            app.model_unload_result.is_none()
+        });
+        assert_eq!(*services.operations.lock().unwrap(), ["unload_all"]);
+        let (tx, rx) = std_mpsc::channel();
+        app.model_unload_result = Some(rx);
+        tx.send(Ok(0)).unwrap();
+        app.drain_background_work();
+        let notice = app.notice.as_ref().unwrap();
+        assert!(matches!(notice.kind, NoticeKind::Info));
+        assert_eq!(notice.text, text(app.language(), "読み込み中のモデルはありません。", "No models are loaded."));
     }
 
     #[test]
