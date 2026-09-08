@@ -5,7 +5,7 @@ export const PROTOCOL_VERSION = 2;
 export const MESSAGE_TYPES = new Set(["request", "response", "event"]);
 export const OPERATIONS = new Set(["ping", "extension_ready", "poll_job", "job_progress", "job_result", "cancel", "cancel_ack", "health", "version_failure"]);
 export const MUTATION_STATES = new Set(["not_performed", "pending", "performed", "performed_or_unknown"]);
-export const WORKFLOWS = new Set(["default_search", "google_search", "page_fetch", "chatgpt_web"]);
+export const WORKFLOWS = new Set(["google_search", "page_fetch", "chatgpt_web"]);
 export function envelope(message_type, request_id, session_id, operation, payload = {}, mutation_state) {
   if (!MESSAGE_TYPES.has(message_type) || typeof request_id !== "string" || typeof session_id !== "string" || !OPERATIONS.has(operation)) throw new Error("invalid envelope");
   const m = {schema_version:SCHEMA_VERSION, product_version:PRODUCT_VERSION, protocol_version:PROTOCOL_VERSION, message_type, request_id, session_id, operation, payload};
@@ -22,7 +22,7 @@ export function validateEnvelope(message, expectedType) {
 export function validateJob(job, request) {
   if (!job || typeof job.job_id !== "string" || !WORKFLOWS.has(job.workflow) || !Number.isInteger(job.limit) || !Number.isInteger(job.timeout_ms)) throw new Error("invalid job");
   if (job.idle_timeout_ms != null && (!Number.isInteger(job.idle_timeout_ms) || job.idle_timeout_ms <= 0 || job.idle_timeout_ms > job.timeout_ms)) throw new Error("invalid idle timeout");
-  const search = ["default_search", "google_search"].includes(job.workflow);
+  const search = job.workflow === "google_search";
   const validInput = search
     ? typeof job.query === "string" && Boolean(job.query.trim()) && !job.url && !job.prompt
     : job.workflow === "page_fetch"

@@ -150,16 +150,5 @@ export async function searchGoogle({ tab, query, limit = DEFAULT_LIMIT, timeoutM
   return { provider: "google", query, ...await collectSearchPage(tab, limit, deadline, { now, sleep }) };
 }
 
-export async function searchDefault({ chrome, tab, tabId, query, limit = DEFAULT_LIMIT, timeoutMs = DEFAULT_TIMEOUT_MS, now = Date.now, sleep }) {
-  if (!chrome?.search?.query || !Number.isInteger(tabId)) throw new SearchEngineError(SEARCH_ERROR_CODES.INVALID_TAB);
-  if (typeof query !== "string" || !query.trim()) throw new TypeError("search_query_required");
-  const timeout = normalizeTimeout(timeoutMs);
-  const deadline = now() + timeout;
-  await chrome.search.query({ text: query, tabId });
-  await waitForTab(tab, timeout);
-  return { provider: "default", query, ...await collectSearchPage(tab, limit, deadline, { now, sleep }) };
-}
-
 export const extractGoogleResults = extractSearchResults;
 export const runGoogleSearch = searchGoogle;
-export const runDefaultSearch = searchDefault;

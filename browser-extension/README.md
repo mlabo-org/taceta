@@ -4,9 +4,9 @@ Taceta Link is the private, local browser extension boundary for Taceta. It
 uses Manifest V3 and Native Messaging (`org.mlabo.taceta.link`) to operate only
 on a window and tab created by the extension for the current session.
 
-The typed workflows are `google_search`, `default_search` (the browser's
-configured default provider through the official `chrome.search` API), and
-`chatgpt_web`. The first ChatGPT Web request passes the current user prompt
+The browser search choices are ChatGPT Web followed by Google Search. Their
+typed workflows are `chatgpt_web` and `google_search`; `page_fetch` reads pages
+returned by Google Search. The first ChatGPT Web request passes the current user prompt
 exactly. Only when the user explicitly configures two or three requests may a
 later job add the local model's unverified research angle to that original
 prompt. The extension executes only the jobs admitted by Taceta and does not

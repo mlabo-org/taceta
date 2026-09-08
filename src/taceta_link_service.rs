@@ -56,7 +56,7 @@ impl LinkJob {
     ) -> Result<Self, LinkError> {
         if !matches!(
             workflow,
-            WebWorkflow::DefaultSearch | WebWorkflow::GoogleSearch
+            WebWorkflow::GoogleSearch
         ) {
             return Err(LinkError::InvalidJob("search workflow required"));
         }
@@ -488,7 +488,6 @@ fn validate_service_request(request: &Envelope<Value>) -> Result<(), ProtocolErr
 
 fn wire_job(job: &LinkJob, session_id: Uuid) -> Value {
     let workflow = match job.workflow {
-        WebWorkflow::DefaultSearch => "default_search",
         WebWorkflow::GoogleSearch => "google_search",
         WebWorkflow::PageFetch => "page_fetch",
         WebWorkflow::ChatGptWeb => "chatgpt_web",
@@ -499,7 +498,6 @@ fn wire_job(job: &LinkJob, session_id: Uuid) -> Value {
 
 fn workflow_name(workflow: &WebWorkflow) -> &'static str {
     match workflow {
-        WebWorkflow::DefaultSearch => "default_search",
         WebWorkflow::GoogleSearch => "google_search",
         WebWorkflow::PageFetch => "page_fetch",
         WebWorkflow::ChatGptWeb => "chatgpt_web",
@@ -512,7 +510,6 @@ fn normalize_result(payload: Value) -> Result<LinkResult, LinkError> {
         .and_then(Value::as_str)
         .ok_or_else(|| LinkError::Protocol("missing workflow".into()))?;
     let workflow = match workflow_name {
-        "default_search" => WebWorkflow::DefaultSearch,
         "google_search" => WebWorkflow::GoogleSearch,
         "page_fetch" => WebWorkflow::PageFetch,
         "chatgpt_web" => WebWorkflow::ChatGptWeb,
@@ -660,7 +657,7 @@ pub fn job_for_workflow(
 ) -> Result<LinkJob, LinkError> {
     let job_authorization = fresh_job_authorization(&authorization);
     match workflow {
-        WebWorkflow::DefaultSearch | WebWorkflow::GoogleSearch => LinkJob::search(
+        WebWorkflow::GoogleSearch => LinkJob::search(
             workflow,
             query.ok_or(LinkError::InvalidJob("query is required"))?,
             job_authorization,

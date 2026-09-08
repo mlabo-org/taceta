@@ -9,7 +9,6 @@ import {
   extractSearchResults,
   googleSearchUrl,
   normalizeLimit,
-  searchDefault,
   searchGoogle,
 } from "./engines/search.js";
 
@@ -48,13 +47,6 @@ test("Google search navigates the supplied owned tab and extracts after load", a
   assert.equal(calls[0][1], googleSearchUrl("Ollama latest release"));
 });
 
-test("default search dispatches chrome.search to the same owned tab", async () => {
-  let request;
-  const tab = { async waitForLoad() {}, async evaluate(fn, limit) { return fn(limit, fakeDocument({ cards: [{ title: "Result", href: "https://example.com" }] })); } };
-  const result = await searchDefault({ chrome: { search: { query: async (value) => { request = value; } } }, tab, tabId: 7, query: "Ollama" });
-  assert.deepEqual(request, { text: "Ollama", tabId: 7 });
-  assert.equal(result.provider, "default");
-});
 
 test("limits are bounded", () => { assert.equal(normalizeLimit(0), 1); assert.equal(normalizeLimit(999), 50); });
 

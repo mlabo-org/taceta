@@ -151,7 +151,6 @@ pub struct WebAuthorization {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WebWorkflow {
-    DefaultSearch,
     GoogleSearch,
     PageFetch,
     ChatGptWeb,
