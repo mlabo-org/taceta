@@ -23,7 +23,7 @@ pub const KEYCHAIN_SERVICE: &str = "org.mlabo.taceta.web-search";
 pub enum ProviderKind {
     Brave,
     Ollama,
-    DefaultSearch,
+    #[serde(alias = "DefaultSearch")]
     GoogleSearch,
     ChatGptWeb,
     #[serde(other)]
@@ -41,7 +41,6 @@ impl ProviderKind {
         match self {
             Self::Brave => "Brave Search",
             Self::Ollama => "Ollama Web Search",
-            Self::DefaultSearch => "Default Browser Search",
             Self::GoogleSearch => "Google Search",
             Self::ChatGptWeb => "ChatGPT Web",
             Self::Unknown => "Unconfigured Web Executor",
@@ -53,7 +52,6 @@ impl ProviderKind {
         match self {
             Self::Brave => "brave",
             Self::Ollama => "ollama",
-            Self::DefaultSearch => "default_search",
             Self::GoogleSearch => "google_search",
             Self::ChatGptWeb => "chatgpt_web",
             Self::Unknown => "unknown",
@@ -64,7 +62,7 @@ impl ProviderKind {
         match self {
             Self::Brave => Some("brave"),
             Self::Ollama => Some("ollama"),
-            Self::DefaultSearch | Self::GoogleSearch | Self::ChatGptWeb => None,
+            Self::GoogleSearch | Self::ChatGptWeb => None,
             Self::Unknown => None,
         }
     }
@@ -402,7 +400,7 @@ impl WebSearchProvider {
         match kind {
             ProviderKind::Brave => Self::brave(),
             ProviderKind::Ollama => Self::ollama(),
-            ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
+            ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
                 Err(WebError::LinkUnavailable)
             }
             ProviderKind::Unknown => Err(WebError::Protocol("unknown web provider".into())),
@@ -413,7 +411,7 @@ impl WebSearchProvider {
         let endpoint = match kind {
             ProviderKind::Brave => "https://api.search.brave.com/res/v1/web/search".into(),
             ProviderKind::Ollama => "https://ollama.com/api/web_search".into(),
-            ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
+            ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
                 return Err(WebError::LinkUnavailable);
             }
             ProviderKind::Unknown => return Err(WebError::Protocol("unknown web provider".into())),
@@ -477,7 +475,7 @@ impl WebSearchProvider {
                 .send()
                 .await
                 .map_err(|error| transport_error("search", &error))?,
-            ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
+            ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
                 return Err(WebError::LinkUnavailable);
             }
         };
@@ -510,7 +508,7 @@ impl WebSearchProvider {
                     snippet: r.content,
                 })
                 .collect()),
-            ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
+            ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb => {
                 Err(WebError::LinkUnavailable)
             }
         }
@@ -522,7 +520,7 @@ impl WebSearchProvider {
         let (validated, validated_address) = validated_public_target(url)?;
         if matches!(
             self.kind,
-            ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb
+            ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb
         ) {
             return Err(WebError::LinkUnavailable);
         }
@@ -942,7 +940,6 @@ mod tests {
     #[test]
     fn browser_workflows_never_open_a_direct_provider() {
         for kind in [
-            ProviderKind::DefaultSearch,
             ProviderKind::GoogleSearch,
             ProviderKind::ChatGptWeb,
             ProviderKind::Unknown,

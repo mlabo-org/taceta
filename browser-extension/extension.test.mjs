@@ -1,11 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { envelope, jobProgressPayload, jobResultPayload, validateEnvelope, validateJob } from "./protocol.js";
-import { googleResultsFromNodes, workflowSpec, chatgptPromptContract, runDefaultSearch } from "./workflows.js";
+import { envelope, jobProgressPayload, jobResultPayload, validateEnvelope, validateJob, WORKFLOWS } from "./protocol.js";
+import { googleResultsFromNodes, workflowSpec, chatgptPromptContract } from "./workflows.js";
 import { safeUrl } from "./selectors.js";
 import { OwnedScope } from "./scope.js";
 import { CdpExecutor } from "./cdp.js";
+
+test("browser workflow surface contains two search routes and page fetching only", async () => {
+  assert.deepEqual([...WORKFLOWS].sort(), ["chatgpt_web", "google_search", "page_fetch"]);
+  const manifest = JSON.parse(await readFile(new URL("manifest.json", import.meta.url), "utf8"));
+  assert.equal(manifest.permissions.includes("search"), false);
+});
 
 test("protocol is one versioned envelope and rejects old raw browser wire",()=>{
   const s="00000000-0000-4000-8000-000000000002";
@@ -55,4 +61,3 @@ test("scope clears stale persisted IDs without closing any window",async()=>{let
 test("CDP attach uses the supported protocol on the exact owned tab",async()=>{let attachArgs;const scope={ledger:{windowId:7,groupId:9,tabId:8},validate:()=>true};const api={debugger:{attach:async(...args)=>{attachArgs=args},sendCommand:async()=>{}}};await new CdpExecutor(api,scope).attach();assert.deepEqual(attachArgs,[{tabId:8},"1.3"]);});
 test("page evaluation validates the exact tab and uses scripting execution",async()=>{const calls=[];const scope={ledger:{windowId:7,groupId:9,tabId:8},validate:()=>true};const api={tabs:{get:async id=>{calls.push(["get",id]);return{id,windowId:7,url:"https://www.google.com/search?q=x",status:"complete"};}},scripting:{executeScript:async details=>{calls.push(["execute",details]);return[{result:[{title:"x",url:"https://example.com",snippet:""}]}];}},debugger:{sendCommand:async()=>{throw new Error("legacy evaluator must not be used");}}};const value=await new CdpExecutor(api,scope).evaluate(function extractSearchResults() {},[3]);assert.deepEqual(value,[{title:"x",url:"https://example.com",snippet:""}]);assert.equal(calls[0][0],"get");assert.equal(calls[1][0],"execute");assert.equal(calls[1][1].target.tabId,8);assert.equal(typeof calls[1][1].func,"function");assert.deepEqual(calls[1][1].args,[3]);});
 test("page navigation waits for completion of the same exact tab",async()=>{let listener;let status="loading";const scope={ledger:{windowId:7,groupId:9,tabId:8},validate:()=>true};const api={tabs:{get:async id=>({id,windowId:7,url:"https://www.google.com/search?q=x",status})},webNavigation:{onCompleted:{addListener:fn=>{listener=fn;},removeListener:()=>{}}},debugger:{sendCommand:async()=>{status="loading";return{};}}};const executor=new CdpExecutor(api,scope);await executor.send("navigate",{url:"https://www.google.com/search?q=x"});const pending=executor.waitForLoad(1000);status="complete";listener({tabId:8,frameId:0});await pending;assert.equal(executor.navigationPending,false);});
-test("default search uses official API on the already-owned tab",async()=>{let call; await runDefaultSearch({chrome:{search:{query:async q=>{call=q;}}},tabId:8,query:"exact query"}); assert.deepEqual(call,{text:"exact query",tabId:8});});

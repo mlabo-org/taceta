@@ -288,6 +288,22 @@ mod tests {
     }
 
     #[test]
+    fn browser_search_routes_migrate_legacy_default_to_google() {
+        let state: PersistedAppState =
+            serde_json::from_value(serde_json::json!({
+                "web_search_provider": "DefaultSearch"
+            }))
+            .unwrap();
+
+        assert_eq!(state.web_search_provider, ProviderKind::GoogleSearch);
+        assert_eq!(state.web_search_provider.wire_value(), "google_search");
+        assert_eq!(
+            serde_json::to_value(state.web_search_provider).unwrap(),
+            serde_json::json!("GoogleSearch")
+        );
+    }
+
+    #[test]
     fn chatgpt_web_request_limit_defaults_to_one_and_stays_within_one_to_three() {
         let legacy: PersistedAppState = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(

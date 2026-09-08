@@ -1,9 +1,8 @@
 import { OwnedScope } from "./scope.js";
 import { CdpExecutor } from "./cdp.js";
 import { envelope, jobProgressPayload, jobResultPayload, validateEnvelope, validateJob } from "./protocol.js";
-import { runDefaultSearch } from "./workflows.js";
 import { fetchPage } from "./engines/fetch.js";
-import { searchGoogle, searchDefault } from "./engines/search.js";
+import { searchGoogle } from "./engines/search.js";
 import { runChatGPTWeb } from "./engines/chatgpt-web.js";
 
 const scope = new OwnedScope(chrome);
@@ -28,7 +27,6 @@ async function execute(message) {
       await scope.open(); await cdp.attach(); const page=cdp.page();
       let result;
       if (job.workflow === "google_search") result = await searchGoogle({tab:page, query:job.query, limit:job.limit, timeoutMs:job.timeout_ms});
-      else if (job.workflow === "default_search") result = await searchDefault({chrome, tab:page, tabId:scope.ledger.tabId, query:job.query, limit:job.limit, timeoutMs:job.timeout_ms});
       else if (job.workflow === "page_fetch") result = await fetchPage({tab:page, url:job.url, timeoutMs:job.timeout_ms});
       else result = await runChatGPTWeb({
         page,

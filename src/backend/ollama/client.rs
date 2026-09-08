@@ -110,8 +110,7 @@ impl InferenceBackend for OllamaClient {
             if request.fetch_search_pages
                 && matches!(
                     &link_workflow,
-                    Some(crate::domain::WebWorkflow::DefaultSearch)
-                        | Some(crate::domain::WebWorkflow::GoogleSearch)
+                    Some(crate::domain::WebWorkflow::GoogleSearch)
                 )
             {
                 messages.push(WireMessage {
@@ -686,7 +685,6 @@ fn parse_provider(value: &str) -> Result<ProviderKind, BackendError> {
     match value {
         "Brave" | "brave" => Ok(ProviderKind::Brave),
         "Ollama" | "ollama" => Ok(ProviderKind::Ollama),
-        "Default Browser Search" | "default_search" => Ok(ProviderKind::DefaultSearch),
         "Google Search" | "google_search" => Ok(ProviderKind::GoogleSearch),
         "ChatGPT Web" | "chatgpt_web" => Ok(ProviderKind::ChatGptWeb),
         _ => Err(BackendError::Protocol(
@@ -697,7 +695,6 @@ fn parse_provider(value: &str) -> Result<ProviderKind, BackendError> {
 
 fn link_workflow(provider: ProviderKind) -> Option<crate::domain::WebWorkflow> {
     match provider {
-        ProviderKind::DefaultSearch => Some(crate::domain::WebWorkflow::DefaultSearch),
         ProviderKind::GoogleSearch => Some(crate::domain::WebWorkflow::GoogleSearch),
         ProviderKind::ChatGptWeb => Some(crate::domain::WebWorkflow::ChatGptWeb),
         _ => None,
@@ -838,8 +835,7 @@ async fn execute_tool(
             if let Some(workflow) = link_workflow {
                 if !matches!(
                     workflow,
-                    crate::domain::WebWorkflow::DefaultSearch
-                        | crate::domain::WebWorkflow::GoogleSearch
+                    crate::domain::WebWorkflow::GoogleSearch
                 ) {
                     return Err(BackendError::Protocol(
                         "the selected browser workflow cannot read external pages".into(),
@@ -938,7 +934,6 @@ fn link_wait_duration(timeout_ms: u64) -> Duration {
 
 fn workflow_wire_name(workflow: crate::domain::WebWorkflow) -> &'static str {
     match workflow {
-        crate::domain::WebWorkflow::DefaultSearch => "default_search",
         crate::domain::WebWorkflow::GoogleSearch => "google_search",
         crate::domain::WebWorkflow::PageFetch => "page_fetch",
         crate::domain::WebWorkflow::ChatGptWeb => "chatgpt_web",
@@ -1909,6 +1904,22 @@ mod tests {
         assert_eq!(parse_provider("brave").unwrap(), ProviderKind::Brave);
         assert_eq!(parse_provider("ollama").unwrap(), ProviderKind::Ollama);
         assert!(parse_provider("google").is_err());
+    }
+
+    #[test]
+    fn browser_search_routes_link_only_google_and_chatgpt() {
+        assert_eq!(
+            link_workflow(ProviderKind::GoogleSearch),
+            Some(WebWorkflow::GoogleSearch)
+        );
+        assert_eq!(
+            link_workflow(ProviderKind::ChatGptWeb),
+            Some(WebWorkflow::ChatGptWeb)
+        );
+        for provider in [ProviderKind::Brave, ProviderKind::Ollama, ProviderKind::Unknown] {
+            assert_eq!(link_workflow(provider), None);
+        }
+        assert!(parse_provider("default_search").is_err());
     }
 
     #[test]

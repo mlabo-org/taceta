@@ -2228,20 +2228,20 @@ impl TacetaApp {
                                 if ui.selectable_label(api_selected, "API").clicked() && !api_selected {
                                     self.state.web_search_provider = ProviderKind::Brave;
                                 }
-                                let link_selected = matches!(self.state.web_search_provider, ProviderKind::DefaultSearch | ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb);
+                                let link_selected = matches!(self.state.web_search_provider, ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb);
                                 if ui.selectable_label(link_selected, "Taceta Link").clicked() && !link_selected {
-                                    self.state.web_search_provider = ProviderKind::DefaultSearch;
+                                    self.state.web_search_provider = ProviderKind::GoogleSearch;
                                 }
                             });
                             ui.horizontal(|ui| {
                                 let api_selected = matches!(self.state.web_search_provider, ProviderKind::Brave | ProviderKind::Ollama);
                                 ui.label(text(language, if api_selected { "APIプロバイダー" } else { "ブラウザーワークフロー" }, if api_selected { "API provider" } else { "Browser workflow" }));
                                 let providers = if api_selected {
-                                    [ProviderKind::Brave, ProviderKind::Ollama, ProviderKind::Unknown, ProviderKind::Unknown, ProviderKind::Unknown]
+                                    [ProviderKind::Brave, ProviderKind::Ollama]
                                 } else {
-                                    [ProviderKind::DefaultSearch, ProviderKind::GoogleSearch, ProviderKind::ChatGptWeb, ProviderKind::Unknown, ProviderKind::Unknown]
+                                    browser_provider_options()
                                 };
-                                for provider in providers.into_iter().filter(|p| *p != ProviderKind::Unknown) {
+                                for provider in providers {
                                     if ui.selectable_label(self.state.web_search_provider == provider, provider.label()).clicked() {
                                         self.state.web_search_provider = provider;
                                     }
@@ -2313,9 +2313,7 @@ impl TacetaApp {
                                 });
                             } else if matches!(
                                 self.state.web_search_provider,
-                                ProviderKind::DefaultSearch
-                                    | ProviderKind::GoogleSearch
-                                    | ProviderKind::ChatGptWeb
+                                ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb
                             ) {
                                 ui.add_space(8.0);
                                 ui.label(RichText::new(text(
@@ -3759,8 +3757,6 @@ fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
     if lower.contains("timed out") {
         let browser_label = if lower.contains("google_search") {
             text(language, "Google検索", "Google Search")
-        } else if lower.contains("default_search") {
-            text(language, "ブラウザー検索", "Browser Search")
         } else if lower.contains("chatgpt_web") {
             text(language, "ChatGPT Web", "ChatGPT Web")
         } else {
@@ -3789,6 +3785,10 @@ fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
 
 fn web_search_request_config(enabled: bool, provider: ProviderKind) -> Option<String> {
     enabled.then(|| provider.wire_value().to_owned())
+}
+
+fn browser_provider_options() -> [ProviderKind; 2] {
+    [ProviderKind::ChatGptWeb, ProviderKind::GoogleSearch]
 }
 
 fn safe_model_manager_error(language: AppShellLanguage, error: &str) -> String {
@@ -4404,6 +4404,14 @@ mod web_search_request_tests {
             Some("brave".to_owned())
         );
         assert_eq!(web_search_request_config(false, ProviderKind::Ollama), None);
+    }
+
+    #[test]
+    fn browser_search_routes_offer_chatgpt_before_google() {
+        assert_eq!(
+            browser_provider_options(),
+            [ProviderKind::ChatGptWeb, ProviderKind::GoogleSearch]
+        );
     }
 
     #[test]
