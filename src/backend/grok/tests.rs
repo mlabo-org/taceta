@@ -5,7 +5,10 @@ use crate::{
 };
 use auth::{CredentialStore, Credentials};
 use bytes::Bytes;
-use std::sync::{Mutex, atomic::AtomicUsize};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -50,6 +53,9 @@ pub(super) fn saved_token(store: &MemoryStore, expired: bool) {
             access_token: "fixture-access-old".into(),
             refresh_token: Some("fixture-refresh-old".into()),
             expires_at: Some(if expired { 0 } else { auth::now() + 3600 }),
+            user_id: Some("fixture-user".into()),
+            principal_type: None,
+            principal_id: None,
         })
         .unwrap();
 }
@@ -255,7 +261,7 @@ async fn split_sse_produces_complete_calls_then_serializes_paired_results() {
         .collect::<Vec<_>>();
     let mut visible = String::new();
     let mut thinking = String::new();
-    let result = responses::consume(futures_util::stream::iter(chunks), |delta| {
+    let (result, _) = responses::consume(futures_util::stream::iter(chunks), |delta| {
         match delta {
             OutputDelta::Content(text) => visible.push_str(&text),
             OutputDelta::Thinking(text) => thinking.push_str(&text),
@@ -355,12 +361,15 @@ async fn failed_truncated_and_cancelled_streams_never_return_tools() {
 #[tokio::test]
 async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract() {
     let call = json!({"type": "function_call", "id": "item", "call_id": "read-1", "name": "read_file", "arguments": "{\"path\":\"README.md\"}"});
+    let mut first_response = completed("", vec![call]);
+    first_response["response"]["model"] = json!("server-responses-id");
     // Required reference version comes from Grok Build 37949780's published
     // xai-grok-version package, independently of Taceta's package version.
     let mut fixture = Fixture::start_with_required_version(vec![
+        Reply::json(json!({"sub": "official-personal-subject"})),
         Reply::json(json!({})),
         Reply::json(json!({"data": [{"id": "account-current", "apiBackend": "responses", "contextWindow": 131072}]})),
-        Reply { status: "200 OK", content_type: "text/event-stream", body: event(completed("", vec![call])) },
+        Reply { status: "200 OK", content_type: "text/event-stream", body: event(first_response) },
         Reply { status: "200 OK", content_type: "text/event-stream", body: event(completed("The file says hello.", Vec::new())) },
     ], Some("1.0.24")).await;
     let store = Arc::new(MemoryStore::default());
@@ -369,6 +378,7 @@ async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract
         AuthEndpoints {
             authorize: format!("{}/authorize", fixture.base),
             token: format!("{}/token", fixture.base),
+            userinfo: format!("{}/userinfo", fixture.base),
         },
         format!("{}/v1", fixture.base),
         store.clone(),
@@ -377,6 +387,17 @@ async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract
         store.reads.load(Ordering::SeqCst),
         0,
         "constructor must not access credentials"
+    );
+    // A pre-repair token-only entry must acquire its real ID from official
+    // userinfo before even the first proxy request. This is the user's upgrade
+    // path; no fabricated identity or forced new login may fill the gap.
+    *store.bytes.lock().unwrap() = Some(
+        serde_json::to_vec(&json!({
+            "access_token": "fixture-access-old",
+            "refresh_token": "fixture-refresh-old",
+            "expires_at": auth::now() + 3600,
+        }))
+        .unwrap(),
     );
     // Reproduce the omitted-header request using the same authenticated POST
     // builder as inference, with fixture credentials only.
@@ -440,6 +461,16 @@ async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract
         .unwrap();
     assert_eq!(final_turn.content, "The file says hello.");
     fixture.task.await.unwrap();
+    let identity_request = fixture.requests.recv().await.unwrap();
+    assert_eq!(identity_request.path, "/userinfo");
+    assert_eq!(
+        identity_request.headers["authorization"],
+        "Bearer fixture-access-old"
+    );
+    assert_eq!(
+        store.load().unwrap().unwrap().user_id.as_deref(),
+        Some("official-personal-subject")
+    );
     let rejected_request = fixture.requests.recv().await.unwrap();
     assert_eq!(rejected_request.path, "/v1/responses");
     assert!(
@@ -454,7 +485,15 @@ async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract
     assert_eq!(first.path, "/v1/responses");
     assert_eq!(first.headers["authorization"], "Bearer fixture-access-old");
     assert_eq!(first.headers["x-xai-token-auth"], "xai-grok-cli");
-    assert_eq!(first.headers["x-grok-client-identifier"], "taceta");
+    for request in [&models_request, &first, &second] {
+        assert_eq!(request.headers["x-userid"], "official-personal-subject");
+        assert_eq!(
+            request.headers["x-grok-user-id"],
+            "official-personal-subject"
+        );
+        assert_eq!(request.headers["x-grok-client-identifier"], "grok-shell");
+        assert_eq!(request.headers["x-grok-client-mode"], "headless");
+    }
     assert_eq!(
         first.headers["user-agent"],
         concat!("Taceta/", env!("CARGO_PKG_VERSION"))
@@ -464,6 +503,20 @@ async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract
     assert_ne!(
         first.headers["x-grok-req-id"],
         second.headers["x-grok-req-id"]
+    );
+    assert_eq!(first.headers["x-grok-turn-idx"], "1");
+    assert_eq!(second.headers["x-grok-turn-idx"], "1");
+    assert_eq!(
+        first.headers["x-grok-conv-id"],
+        second.headers["x-grok-conv-id"]
+    );
+    assert_eq!(
+        first.headers["x-grok-conv-id"],
+        first.headers["x-grok-session-id"]
+    );
+    assert_ne!(
+        first.headers["x-grok-agent-id"],
+        second.headers["x-grok-agent-id"]
     );
     let first_body: Value = serde_json::from_slice(&first.body).unwrap();
     let second_body: Value = serde_json::from_slice(&second.body).unwrap();
@@ -556,7 +609,7 @@ fn ordinary_chat_excludes_thinking_and_interrupted_messages_and_gates_images() {
 #[tokio::test]
 async fn catalog_default_chat_completions_handles_tools_final_thinking_and_failure_boundaries() {
     let first_chunks = [
-        json!({"choices": [{"index": 0, "delta": {"role": "assistant", "content": "調べます", "reasoning_content": "separate thinking"}, "finish_reason": null}]}),
+        json!({"model": "server-chat-completions-id", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "調べます", "reasoning_content": "separate thinking"}, "finish_reason": null}]}),
         json!({"choices": [{"index": 0, "delta": {"tool_calls": [
             {"index": 0, "id": "read-a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\""}},
             {"index": 1, "id": "read-b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}
@@ -571,6 +624,7 @@ async fn catalog_default_chat_completions_handles_tools_final_thinking_and_failu
     let mut final_bytes = event(final_event.clone());
     final_bytes.extend_from_slice(b"data: [DONE]\n\n");
     let mut fixture = Fixture::start(vec![
+        Reply::json(json!({"access_token": "fixture-refreshed-access", "refresh_token": "fixture-rotated-refresh", "expires_in": 3600, "id_token": "new-id-token-is-not-an-identity-replacement"})),
         Reply::json(
             json!({"data": [{"id": "catalog-default", "contextWindow": 64000,
             "supportsReasoningEffort": true, "reasoningEfforts": ["low", "medium", "high"]}]}),
@@ -588,14 +642,20 @@ async fn catalog_default_chat_completions_handles_tools_final_thinking_and_failu
     ])
     .await;
     let store = Arc::new(MemoryStore::default());
-    saved_token(&store, false);
+    saved_token(&store, true);
+    let mut prior = store.load().unwrap().unwrap();
+    prior.user_id = Some("official-team-principal".into());
+    prior.principal_type = Some("Team".into());
+    prior.principal_id = Some("official-team-principal".into());
+    store.save(&prior).unwrap();
     let client = GrokClient::configured(
         AuthEndpoints {
             authorize: format!("{}/authorize", fixture.base),
             token: format!("{}/token", fixture.base),
+            userinfo: format!("{}/userinfo", fixture.base),
         },
         format!("{}/v1", fixture.base),
-        store,
+        store.clone(),
     );
     let (events, mut receiver) = mpsc::unbounded_channel();
     let tool = || ToolDefinition {
@@ -651,9 +711,39 @@ async fn catalog_default_chat_completions_handles_tools_final_thinking_and_failu
         .unwrap();
     assert_eq!(last.content, "Both files were read.");
     fixture.task.await.unwrap();
-    fixture.requests.recv().await.unwrap(); // catalog request
+    let refresh_request = fixture.requests.recv().await.unwrap();
+    assert_eq!(refresh_request.path, "/token");
+    assert_eq!(refresh_request.headers["x-grok-client-version"], "1.0.24");
+    let refresh: HashMap<String, String> = url::form_urlencoded::parse(&refresh_request.body)
+        .into_owned()
+        .collect();
+    assert_eq!(refresh["grant_type"], "refresh_token");
+    assert_eq!(refresh["principal_type"], "Team");
+    assert_eq!(refresh["principal_id"], "official-team-principal");
+    let saved = store.load().unwrap().unwrap();
+    assert_eq!(saved.user_id.as_deref(), Some("official-team-principal"));
+    assert_eq!(saved.principal_type.as_deref(), Some("Team"));
+    assert_eq!(
+        saved.principal_id.as_deref(),
+        Some("official-team-principal")
+    );
+    assert_eq!(
+        saved.refresh_token.as_deref(),
+        Some("fixture-rotated-refresh")
+    );
+    let catalog = fixture.requests.recv().await.unwrap();
     let first = fixture.requests.recv().await.unwrap();
     let second = fixture.requests.recv().await.unwrap();
+    for request in [&catalog, &first, &second] {
+        assert_eq!(
+            request.headers["authorization"],
+            "Bearer fixture-refreshed-access"
+        );
+        assert_eq!(request.headers["x-userid"], "official-team-principal");
+        assert_eq!(request.headers["x-grok-user-id"], "official-team-principal");
+        assert_eq!(request.headers["x-grok-client-identifier"], "grok-shell");
+        assert_eq!(request.headers["x-grok-client-mode"], "headless");
+    }
     assert_eq!(first.path, "/v1/chat/completions");
     assert_eq!(second.path, "/v1/chat/completions");
     let first: Value = serde_json::from_slice(&first.body).unwrap();

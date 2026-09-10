@@ -41,7 +41,7 @@ pub(super) fn tools(definitions: &[ToolDefinition]) -> Result<Vec<Value>, String
 pub(super) async fn consume<S, E>(
     mut stream: S,
     mut emit: impl FnMut(OutputDelta) -> Result<(), String>,
-) -> Result<AgentTurn, String>
+) -> Result<(AgentTurn, Option<String>), String>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
@@ -52,6 +52,7 @@ where
     let mut received = 0usize;
     let mut prompt_tokens = None;
     let mut completion_tokens = None;
+    let mut reported_model = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
             .map_err(|_| "The Grok Chat Completions stream disconnected before completion.")?;
@@ -73,15 +74,19 @@ where
                     if !arguments.is_object() { return Err("Grok function arguments must be a JSON object.".into()); }
                     Ok(AgentToolCall { id: call.id, name: call.name, arguments })
                 }).collect::<Result<Vec<_>, String>>()?;
-                return Ok(AgentTurn {
-                    content,
-                    tool_calls,
-                    prompt_tokens,
-                    completion_tokens,
-                });
+                return Ok((
+                    AgentTurn {
+                        content,
+                        tool_calls,
+                        prompt_tokens,
+                        completion_tokens,
+                    },
+                    reported_model,
+                ));
             }
             let event: Value = serde_json::from_str(&payload)
                 .map_err(|_| "Grok returned an invalid Chat Completions event.")?;
+            super::record_reported_model(&mut reported_model, event.get("model"))?;
             if event.get("error").is_some_and(|error| !error.is_null()) {
                 return Err(
                     "Grok reported a Chat Completions failure. No pending tools were executed."

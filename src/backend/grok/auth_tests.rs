@@ -13,6 +13,7 @@ fn auth(base: &str, store: Arc<MemoryStore>) -> AuthManager {
         AuthEndpoints {
             authorize: format!("{base}/authorize"),
             token: format!("{base}/token"),
+            userinfo: format!("{base}/userinfo"),
         },
         store,
     )
@@ -43,7 +44,10 @@ fn pkce_and_callback_bind_method_path_host_and_unique_state() {
 
 #[tokio::test]
 async fn loopback_login_exchanges_bound_code_and_only_saves_own_store() {
-    let mut fixture = Fixture::start(vec![Reply::json(json!({"access_token": "fixture-new-access", "refresh_token": "fixture-new-refresh", "expires_in": 3600, "token_type": "Bearer"}))]).await;
+    let mut fixture = Fixture::start(vec![
+        Reply::json(json!({"access_token": "fixture-new-access", "refresh_token": "fixture-new-refresh", "expires_in": 3600, "token_type": "Bearer"})),
+        Reply::json(json!({"sub": "official-login-subject"})),
+    ]).await;
     let store = Arc::new(MemoryStore::default());
     saved_token(&store, false);
     let manager = auth(&fixture.base, store.clone());
@@ -102,9 +106,9 @@ async fn concurrent_requests_refresh_once_and_rotate_the_saved_token() {
     let store = Arc::new(MemoryStore::default());
     saved_token(&store, true);
     let manager = auth(&fixture.base, store.clone());
-    let (first, second) = tokio::join!(manager.access_token(), manager.access_token());
-    assert_eq!(first.unwrap().as_str(), "fixture-new");
-    assert_eq!(second.unwrap().as_str(), "fixture-new");
+    let (first, second) = tokio::join!(manager.session_credential(), manager.session_credential());
+    assert_eq!(first.unwrap().token(), "fixture-new");
+    assert_eq!(second.unwrap().token(), "fixture-new");
     fixture.task.await.unwrap();
     let request = fixture.requests.recv().await.unwrap();
     let form: HashMap<String, String> = url::form_urlencoded::parse(&request.body)
@@ -139,7 +143,7 @@ async fn refresh_errors_preserve_credentials_and_do_not_echo_provider_secrets() 
         let store = Arc::new(MemoryStore::default());
         saved_token(&store, true);
         let manager = auth(&fixture.base, store.clone());
-        let error = manager.access_token().await.err().unwrap();
+        let error = manager.session_credential().await.err().unwrap();
         assert!(!error.contains("fixture-secret"));
         assert_eq!(
             store.load().unwrap().unwrap().access_token,
@@ -186,6 +190,9 @@ async fn dropping_login_closes_loopback_and_signout_invalidates_late_save() {
         access_token: "late".into(),
         refresh_token: None,
         expires_at: None,
+        user_id: None,
+        principal_type: None,
+        principal_id: None,
     };
     assert!(manager.save_if_current(&late, old_epoch, false).is_err());
     assert!(!manager.is_signed_in().unwrap());
