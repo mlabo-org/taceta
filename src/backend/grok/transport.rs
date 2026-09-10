@@ -1,11 +1,12 @@
 //! Grok transport copied from the MIT grok-codex-bridge src/grok.rs.
-//! Changes are limited to module paths and preserving catalog display metadata.
+//! Taceta preserves catalog display metadata and classifies stream failures
+//! without exposing response content or changing retry/completion behavior.
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use eventsource_stream::Eventsource;
+use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, ETAG, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
@@ -16,7 +17,7 @@ use uuid::Uuid;
 
 use super::auth::SessionCredential;
 use super::protocol::{
-    NamespaceToolProjection, NormalizedResponsesRequest, ProtocolError, TextStreamValidator,
+    NamespaceToolProjection, NormalizedResponsesRequest, ProtocolError, TextStreamState, TextStreamValidator,
     ValidatedTextStreamEvent,
 };
 
@@ -227,9 +228,7 @@ impl ResponsesByteStream {
     pub fn validated_text_events(self) -> ValidatedTextEventStream {
         let namespace_projection = self.namespace_projection.clone();
         let data = SseEofBoundaryStream::new(self).eventsource().map(|event| {
-            event
-                .map(|event| event.data)
-                .map_err(|_| GrokError::InvalidSseFraming)
+            event.map(|event| event.data)
         });
         ValidatedTextEventStream {
             inner: Box::pin(data),
@@ -291,7 +290,7 @@ where
 }
 
 pub struct ValidatedTextEventStream {
-    inner: Pin<Box<dyn Stream<Item = Result<String, GrokError>> + Send>>,
+    inner: Pin<Box<dyn Stream<Item = Result<String, EventStreamError<GrokError>>> + Send>>,
     validator: TextStreamValidator,
     namespace_projection: NamespaceToolProjection,
     finished: bool,
@@ -324,7 +323,10 @@ impl Stream for ValidatedTextEventStream {
                 },
                 std::task::Poll::Ready(Some(Err(error))) => {
                     self.finished = true;
-                    return std::task::Poll::Ready(Some(Err(error)));
+                    return std::task::Poll::Ready(Some(Err(GrokError::Sse {
+                        failure: SseFailure::from_eventsource(error),
+                        state: self.validator.state(),
+                    })));
                 }
                 std::task::Poll::Ready(None) => match self.validator.finish() {
                     Ok(()) => {
@@ -467,6 +469,39 @@ fn ensure_success(response: &reqwest::Response) -> Result<(), GrokError> {
     }
 }
 
+/// Safe, typed cause of this stream boundary's failure. The parser's input,
+/// invalid bytes, underlying error text, and request URL are never retained.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum SseFailure {
+    #[error("source=utf8; incomplete_codepoint={incomplete_codepoint}")]
+    Utf8 { incomplete_codepoint: bool },
+    #[error("source=parser; code={code}")]
+    Parser { code: String },
+    #[error("source=transport; timeout={timeout}; body={body}; decode={decode}")]
+    Transport { timeout: bool, body: bool, decode: bool },
+    #[error("source=transport; unclassified=true")]
+    OtherTransport,
+}
+
+impl SseFailure {
+    fn from_eventsource(error: EventStreamError<GrokError>) -> Self {
+        match error {
+            EventStreamError::Utf8(error) => Self::Utf8 {
+                incomplete_codepoint: error.utf8_error().error_len().is_none(),
+            },
+            EventStreamError::Parser(error) => Self::Parser {
+                code: error.code.description().to_owned(),
+            },
+            EventStreamError::Transport(GrokError::Stream(error)) => Self::Transport {
+                timeout: error.is_timeout(),
+                body: error.is_body(),
+                decode: error.is_decode(),
+            },
+            EventStreamError::Transport(_) => Self::OtherTransport,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum GrokError {
     #[error("failed to construct the origin-locked xAI client")]
@@ -499,8 +534,10 @@ pub enum GrokError {
     Catalog(#[from] super::catalog::CatalogError),
     #[error("xAI Responses transport did not return text/event-stream")]
     UnexpectedResponseContentType,
-    #[error("xAI Responses stream framing is invalid")]
-    InvalidSseFraming,
+    // Keep this distinct from Stream: stream classification must not activate
+    // retries that the previous SSE error boundary did not perform.
+    #[error("xAI Responses stream failed ({failure}; state={state:?})")]
+    Sse { failure: SseFailure, state: TextStreamState },
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
     #[error("xAI Responses stream failed")]

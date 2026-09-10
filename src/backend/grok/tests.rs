@@ -207,3 +207,99 @@ async fn bridge_stream_preserves_reference_eof_and_failure_behavior() {
     }
     assert!(adapter::consume(transport::fixture_events(vec![Bytes::from_static(b"data: not-json\n\n")]), &[], |_| Ok(())).await.is_err());
 }
+
+#[tokio::test]
+async fn bridge_stream_failure_preserves_cause_after_thinking() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::oneshot;
+
+    type Fixture = (
+        Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        Arc<AtomicUsize>,
+    );
+
+    async fn interrupted_response(State((gate, requests)): State<Fixture>) -> impl IntoResponse {
+        requests.fetch_add(1, Ordering::SeqCst);
+        let receiver = gate.lock().unwrap().take().unwrap();
+        let created = json!({
+            "type": "response.created",
+            "response": {"id": "resp_fixture", "model": "grok-4.6-build"}
+        });
+        let thinking = json!({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_fixture", "output_index": 0, "summary_index": 0,
+            "delta": "private fixture thinking"
+        });
+        let prefix = Bytes::from(format!("data: {created}\n\ndata: {thinking}\n\n"));
+        let body = stream::once(async move { Ok::<_, std::io::Error>(prefix) })
+            .chain(stream::once(async move {
+                // Do not close until Taceta has actually consumed Thinking.
+                // Dropping this HTTP body without its final chunk reproduces
+                // a receive failure rather than a clean SSE EOF.
+                let _ = receiver.await;
+                Err::<Bytes, _>(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "private fixture transport detail",
+                ))
+            }));
+        (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(body),
+        )
+    }
+
+    let (release, receiver) = oneshot::channel();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/v1/responses", post(interrupted_response))
+        .with_state((Arc::new(Mutex::new(Some(receiver))), requests.clone()));
+    let (base, server) = start(router).await;
+    let client = transport::GrokClient::for_test(base.clone()).unwrap();
+    let credential = Arc::new(auth::SessionCredential::for_test("fixture-token", "fixture-user"));
+    let request = adapter::request(
+        &admitted("grok-4.6"),
+        adapter::chat_input(
+            &chat_request("grok-4.6", vec![ChatMessage::new_user("fixture request")]),
+            false,
+        ).unwrap(),
+        &[],
+        ThinkingMode::Default,
+    ).unwrap();
+    let upstream = start_responses(&client, credential, &request).await.unwrap();
+    let captured_failure = Arc::new(Mutex::new(None));
+    let failure_for_stream = captured_failure.clone();
+    let upstream = upstream.inspect(move |result| {
+        if let Err(GrokError::Sse { failure, state }) = result {
+            *failure_for_stream.lock().unwrap() = Some((failure.clone(), *state));
+        }
+    });
+    let mut release = Some(release);
+    let mut received_thinking = false;
+    let error = adapter::consume(upstream, &[], |delta| {
+        if let OutputDelta::Thinking(_) = delta {
+            received_thinking = true;
+            release.take().unwrap().send(()).unwrap();
+        }
+        Ok(())
+    }).await.unwrap_err();
+
+    assert!(received_thinking);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *captured_failure.lock().unwrap(),
+        Some((
+            // reqwest 0.13.4 bytes_stream maps receive-body errors through
+            // error::decode; this is still a transport failure, not SSE JSON.
+            transport::SseFailure::Transport { timeout: false, body: false, decode: true },
+            protocol::TextStreamState::Streaming,
+        )),
+    );
+    assert_eq!(error, "xAI Responses stream failed (source=transport; timeout=false; body=false; decode=true; state=Streaming)");
+    for private in [
+        "private fixture thinking", "private fixture transport detail",
+        "fixture-token", "fixture-user", base.as_str(),
+    ] {
+        assert!(!error.contains(private));
+    }
+    server.abort();
+}
