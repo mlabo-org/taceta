@@ -45,6 +45,184 @@ impl OllamaClient {
     }
 }
 
+impl crate::agent::AgentModel for OllamaClient {
+    fn turn(
+        &self,
+        request: crate::agent::AgentRequest,
+        events: UnboundedSender<crate::agent::ModelDelta>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::agent::AgentTurn, String>> + Send>> {
+        let client = self.clone_for_task();
+        Box::pin(async move {
+            lifecycle::ensure_ready(&client.http, &client.endpoint)
+                .await.map_err(|error| error.to_string())?;
+            let body = agent_chat_body(request);
+            let response = client.http.post(client.url("/api/chat"))
+                .json(&body).send().await.map_err(|error| error.to_string())?
+                .error_for_status().map_err(|error| error.to_string())?;
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            // Both futures are scoped to this inference round. Dropping the round
+            // closes the HTTP stream and its UI forwarding path together.
+            let forward = async move {
+                while let Some(event) = rx.recv().await {
+                    let delta = match event {
+                        GenerationEvent::ContentDelta(text) => crate::agent::ModelDelta::Content(text),
+                        GenerationEvent::ThinkingDelta(text) => crate::agent::ModelDelta::Thinking(text),
+                        _ => continue,
+                    };
+                    let _ = events.send(delta);
+                }
+            };
+            let (result, ()) = tokio::join!(stream::consume(response.bytes_stream(), tx), forward);
+            let result = result.map_err(|error| error.to_string())?;
+            if result.done_reason.as_deref() == Some("length") {
+                return Err("Ollama reached its output limit before completing the agent response; context has not been replaced".into());
+            }
+            let mut calls = Vec::new();
+            for value in result.tool_calls {
+                let function = value.get("function").ok_or("Ollama returned a tool call without a function")?;
+                let name = function.get("name").and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.is_empty()).ok_or("Ollama returned an unnamed tool call")?;
+                let arguments = function.get("arguments").filter(|value| value.is_object())
+                    .ok_or("Ollama returned invalid tool arguments")?.clone();
+                calls.push(crate::agent::AgentToolCall {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: name.to_owned(),
+                    arguments,
+                });
+            }
+            Ok(crate::agent::AgentTurn {
+                content: result.content,
+                tool_calls: calls,
+                prompt_tokens: result.stats.prompt_tokens,
+                completion_tokens: result.stats.completion_tokens,
+            })
+        })
+    }
+}
+
+fn agent_chat_body(request: crate::agent::AgentRequest) -> ChatBody {
+    use crate::agent::AgentRole;
+    let mut options = ChatOptions::generation(request.context_length);
+    options.num_predict = Some(crate::agent::reserved_output_tokens(request.context_length));
+    ChatBody {
+        model: request.model,
+        messages: request.messages.into_iter().map(|message| WireMessage {
+            role: match message.role {
+                AgentRole::System => "system",
+                AgentRole::User => "user",
+                AgentRole::Assistant => "assistant",
+                AgentRole::Tool => "tool",
+            }.into(),
+            content: message.content,
+            images: Vec::new(),
+            tool_calls: (!message.tool_calls.is_empty()).then(|| message.tool_calls.into_iter()
+                .map(|call| serde_json::json!({"function":{"name":call.name,"arguments":call.arguments}})).collect()),
+            tool_name: message.tool_name,
+        }).collect(),
+        stream: true,
+        options,
+        think: think_value(request.thinking),
+        tools: (!request.tools.is_empty()).then(|| serde_json::Value::Array(request.tools.into_iter()
+            .map(|tool| serde_json::json!({"type":"function","function":{
+                "name":tool.name,"description":tool.description,"parameters":tool.parameters
+            }})).collect())),
+        format: None,
+    }
+}
+
+#[cfg(test)]
+mod agent_adapter_tests {
+    use super::*;
+    use crate::agent::{AgentMessage, AgentModel, AgentRequest, AgentRole, AgentToolCall, ModelDelta, ToolDefinition};
+    use crate::backend::OllamaEndpointMode;
+    use crate::domain::ThinkingLevel;
+    use std::io::{Read, Write};
+
+    #[tokio::test]
+    async fn agent_round_maps_tool_history_limits_and_streamed_results() {
+        for truncated in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut captured = None;
+            for round in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                let header_end = loop {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") { break end + 4; }
+                };
+                let header = String::from_utf8_lossy(&bytes[..header_end]);
+                let length: usize = header.lines().find_map(|line| {
+                    line.to_ascii_lowercase().strip_prefix("content-length:")
+                        .map(|value| value.trim().parse().unwrap())
+                }).unwrap_or(0);
+                while bytes.len() < header_end + length {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let response = if round == 0 {
+                    assert!(bytes.starts_with(b"GET /api/version "));
+                    "{}".to_owned()
+                } else {
+                    assert!(bytes.starts_with(b"POST /api/chat "));
+                    captured = Some(serde_json::from_slice::<serde_json::Value>(&bytes[header_end..header_end + length]).unwrap());
+                    let final_frame = serde_json::json!({
+                        "message":{"tool_calls":[{"function":{"name":"read_file","arguments":{"path":"src/main.rs"}}}]},
+                        "done":true,"done_reason":if truncated {"length"} else {"stop"},"prompt_eval_count":17,"eval_count":3
+                    });
+                    format!("{{\"message\":{{\"thinking\":\"trace only\",\"content\":\"next\"}},\"done\":false}}\n{final_frame}\n")
+                };
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+            }
+            captured.unwrap()
+        });
+        let endpoint = OllamaEndpoint::resolve_from_values(OllamaEndpointMode::Custom, &base_url, None, None).unwrap();
+        let client = OllamaClient::new(endpoint);
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let request = AgentRequest {
+            model: "fixture-model".into(), context_length: 32_768,
+            thinking: ThinkingMode::Level(ThinkingLevel::Low),
+            messages: vec![
+                AgentMessage { role: AgentRole::User, content: "Continue".into(), tool_calls: vec![], tool_call_id: None, tool_name: None },
+                AgentMessage { role: AgentRole::Assistant, content: String::new(),
+                    tool_calls: vec![AgentToolCall { id: "previous-call".into(), name: "read_file".into(), arguments: serde_json::json!({"path":"README.md"}) }],
+                    tool_call_id: None, tool_name: None },
+                AgentMessage { role: AgentRole::Tool, content: "file contents".into(), tool_calls: vec![],
+                    tool_call_id: Some("previous-call".into()), tool_name: Some("read_file".into()) },
+            ],
+            tools: vec![ToolDefinition { name: "read_file".into(), description: "Read a workspace file".into(), parameters: serde_json::json!({"type":"object"}) }],
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), client.turn(request, events)).await.unwrap();
+        let sent = server.join().unwrap();
+        assert_eq!(sent["messages"][1]["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(sent["messages"][2]["role"], "tool");
+        assert_eq!(sent["messages"][2]["tool_name"], "read_file");
+        assert_eq!(sent["messages"][2]["content"], "file contents");
+        assert_eq!(sent["think"], "low");
+        assert_eq!(sent["options"]["num_predict"], crate::agent::reserved_output_tokens(32_768));
+        assert_eq!(sent["tools"][0]["function"]["name"], "read_file");
+        if truncated {
+            assert!(result.unwrap_err().contains("output limit"));
+            continue;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.content, "next");
+        assert_eq!(result.tool_calls[0].name, "read_file");
+        assert_eq!(result.tool_calls[0].arguments["path"], "src/main.rs");
+        assert_eq!(result.prompt_tokens, Some(17));
+        assert!(matches!(received.recv().await, Some(ModelDelta::Thinking(value)) if value == "trace only"));
+        assert!(matches!(received.recv().await, Some(ModelDelta::Content(value)) if value == "next"));
+        assert!(received.recv().await.is_none());
+        }
+    }
+}
+
 impl InferenceBackend for OllamaClient {
     fn list_models(&self) -> BackendFuture<Vec<ModelDescriptor>> {
         let client = self.clone_for_task();

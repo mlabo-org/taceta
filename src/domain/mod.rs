@@ -1,6 +1,22 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InferenceProvider {
+    #[default]
+    Ollama,
+    Grok,
+}
+
+impl InferenceProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ollama => "Ollama",
+            Self::Grok => "Grok (OAuth)",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     System,
