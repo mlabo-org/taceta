@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use taceta::backend::OllamaEndpointMode;
 use taceta::domain::{
-    Attachment, ChatMessage, DEFAULT_CHATGPT_WEB_REQUEST_LIMIT, ThinkingMode,
+    Attachment, ChatMessage, DEFAULT_CHATGPT_WEB_REQUEST_LIMIT, InferenceProvider, ThinkingMode,
     normalize_chatgpt_web_request_limit,
 };
 use taceta::web_search::ProviderKind;
@@ -27,6 +27,8 @@ pub struct Conversation {
     /// Web access is deliberately opt-in for each conversation.
     #[serde(default)]
     pub web_search_enabled: bool,
+    pub agent_enabled: bool,
+    pub workspace: Option<std::path::PathBuf>,
 }
 
 impl Default for Conversation {
@@ -37,6 +39,8 @@ impl Default for Conversation {
             messages: Vec::new(),
             title_is_custom: false,
             web_search_enabled: false,
+            agent_enabled: false,
+            workspace: None,
         }
     }
 }
@@ -57,6 +61,10 @@ pub struct PersistedAppState {
     pub conversations: Vec<Conversation>,
     pub active_conversation_id: Uuid,
     pub selected_model: Option<String>,
+    pub inference_provider: InferenceProvider,
+    pub provider_models: HashMap<InferenceProvider, String>,
+    pub agent_max_steps: u32,
+    pub agent_max_duration_secs: u64,
     pub thinking_modes: HashMap<String, ThinkingMode>,
     pub show_thinking_trace: bool,
     pub context_length: u32,
@@ -90,6 +98,10 @@ impl Default for PersistedAppState {
             active_conversation_id: conversation.id,
             conversations: vec![conversation],
             selected_model: None,
+            inference_provider: InferenceProvider::Ollama,
+            provider_models: HashMap::new(),
+            agent_max_steps: 100,
+            agent_max_duration_secs: 3_600,
             thinking_modes: HashMap::new(),
             show_thinking_trace: false,
             context_length: DEFAULT_CONTEXT_LENGTH,
@@ -119,6 +131,8 @@ impl PersistedAppState {
             self.active_conversation_id = self.conversations[0].id;
         }
         self.context_length = normalize_context_length(self.context_length);
+        self.agent_max_steps = self.agent_max_steps.clamp(1, 1_000);
+        self.agent_max_duration_secs = self.agent_max_duration_secs.clamp(60, 43_200);
         self.max_search_results = self.max_search_results.clamp(1, 5);
         self.chatgpt_web_request_limit =
             normalize_chatgpt_web_request_limit(self.chatgpt_web_request_limit);

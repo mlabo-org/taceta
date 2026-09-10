@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+mod agent_ui;
+mod provider_ui;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use eframe::egui::{
     self, Align, Button, CentralPanel, Context, Key, Layout, Panel, RichText, ScrollArea, Spinner,
@@ -21,7 +24,7 @@ use taceta::{
     },
     domain::{
         Attachment, AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent,
-        MAX_CHATGPT_WEB_REQUEST_LIMIT, MIN_CHATGPT_WEB_REQUEST_LIMIT, ModelCandidate,
+        MAX_CHATGPT_WEB_REQUEST_LIMIT, MIN_CHATGPT_WEB_REQUEST_LIMIT, InferenceProvider, ModelCandidate,
         ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingCapability,
         ThinkingLevel, ThinkingMode,
     },
@@ -124,8 +127,11 @@ pub struct TacetaApp {
     backend: Arc<dyn InferenceBackend>,
     model_manager: Arc<dyn ModelManager>,
     runtime: Runtime,
-    model_result_tx: std_mpsc::Sender<Result<Vec<ModelDescriptor>, String>>,
-    model_result_rx: std_mpsc::Receiver<Result<Vec<ModelDescriptor>, String>>,
+    model_result_tx: std_mpsc::Sender<(u64, Result<Vec<ModelDescriptor>, String>)>,
+    model_result_rx: std_mpsc::Receiver<(u64, Result<Vec<ModelDescriptor>, String>)>,
+    model_list_epoch: u64,
+    provider_ui: provider_ui::ProviderUiState,
+    agent_ui: agent_ui::AgentUiState,
     model_refresh_pending: bool,
     models: Vec<ModelDescriptor>,
     connection: ConnectionState,
@@ -267,7 +273,10 @@ impl TacetaApp {
                 });
             }
         }
-        if let Some(error) = initial_endpoint_error {
+        if app.state.inference_provider == InferenceProvider::Grok {
+            app.backend = Arc::clone(&app.provider_ui.grok) as Arc<dyn InferenceBackend>;
+            app.refresh_models();
+        } else if let Some(error) = initial_endpoint_error {
             let error = ollama_endpoint_error_message(app.language(), &error);
             app.connection = ConnectionState::Unavailable(error.clone());
             app.notice = Some(Notice {
@@ -310,6 +319,9 @@ impl TacetaApp {
             runtime,
             model_result_tx,
             model_result_rx,
+            model_list_epoch: 0,
+            provider_ui: provider_ui::ProviderUiState::default(),
+            agent_ui: agent_ui::AgentUiState::default(),
             model_refresh_pending: false,
             models: Vec::new(),
             connection: ConnectionState::Connecting,
@@ -356,18 +368,21 @@ impl TacetaApp {
         if self.ollama_endpoint == endpoint {
             return false;
         }
-        self.backend = Arc::new(
-            OllamaClient::new(endpoint.clone()).with_link_service(Arc::clone(&self.link_service)),
-        );
+        if self.state.inference_provider == InferenceProvider::Ollama {
+            self.backend = Arc::new(
+                OllamaClient::new(endpoint.clone()).with_link_service(Arc::clone(&self.link_service)),
+            );
+            self.models.clear();
+            self.connection = ConnectionState::Connecting;
+        }
         self.model_manager = Arc::new(OllamaModelManager::new(endpoint.clone()));
         self.ollama_endpoint = endpoint;
-        self.models.clear();
-        self.connection = ConnectionState::Connecting;
         true
     }
 
     fn synchronize_auto_ollama_endpoint(&mut self) -> Result<bool, OllamaEndpointError> {
-        if self.state.ollama_endpoint_mode != OllamaEndpointMode::Auto {
+        if self.state.inference_provider != InferenceProvider::Ollama
+            || self.state.ollama_endpoint_mode != OllamaEndpointMode::Auto {
             return Ok(false);
         }
         let endpoint = OllamaEndpoint::resolve(OllamaEndpointMode::Auto, "")?;
@@ -427,6 +442,8 @@ impl TacetaApp {
             return;
         }
         self.model_refresh_pending = true;
+        self.model_list_epoch = self.model_list_epoch.wrapping_add(1);
+        let epoch = self.model_list_epoch;
         self.connection = ConnectionState::Connecting;
         let backend = Arc::clone(&self.backend);
         let result_tx = self.model_result_tx.clone();
@@ -435,7 +452,7 @@ impl TacetaApp {
                 .list_models()
                 .await
                 .map_err(|error| error.to_string());
-            let _ = result_tx.send(result);
+            let _ = result_tx.send((epoch, result));
         });
     }
 
@@ -594,7 +611,7 @@ impl TacetaApp {
     }
 
     fn can_unload_model(&self) -> bool {
-        self.generation.is_none()
+        self.state.inference_provider == InferenceProvider::Ollama && !self.is_generating()
             && self.model_pull.is_none()
             && !self.model_refresh_pending
             && self.model_unload_result.is_none()
@@ -629,6 +646,8 @@ impl TacetaApp {
     }
 
     fn drain_background_work(&mut self) {
+        self.drain_provider_work();
+        self.drain_agent_work();
         if let Some(receiver) = &self.model_unload_result {
             let result = match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -655,7 +674,10 @@ impl TacetaApp {
                 });
             }
         }
-        if let Ok(result) = self.model_result_rx.try_recv() {
+        while let Ok((epoch, result)) = self.model_result_rx.try_recv() {
+            if epoch != self.model_list_epoch {
+                continue;
+            }
             self.model_refresh_pending = false;
             match result {
                 Ok(mut models) => {
@@ -944,6 +966,9 @@ impl TacetaApp {
     }
 
     fn safe_backend_error(&self, error: &str) -> String {
+        if self.state.inference_provider == InferenceProvider::Grok {
+            return error.to_owned();
+        }
         let language = self.language();
         error.replace("Ollama", text(language, "ローカルエンジン", "local engine"))
     }
@@ -1091,7 +1116,7 @@ impl TacetaApp {
         }
 
         let language = self.language();
-        if self.generation.is_some() {
+        if self.is_generating() {
             self.notice = Some(Notice {
                 kind: NoticeKind::Warning,
                 text: text(
@@ -1120,7 +1145,11 @@ impl TacetaApp {
     }
 
     fn start_generation(&mut self) {
-        if self.generation.is_some() || self.model_unload_result.is_some() {
+        if self.state.active_conversation().agent_enabled {
+            self.start_agent_run(false);
+            return;
+        }
+        if self.is_generating() || self.model_unload_result.is_some() {
             return;
         }
         match self.synchronize_auto_ollama_endpoint() {
@@ -1177,7 +1206,8 @@ impl TacetaApp {
             });
             return;
         }
-        let web_search_enabled = self.state.active_conversation().web_search_enabled;
+        let web_search_enabled = self.state.active_conversation().web_search_enabled
+            && self.state.inference_provider == InferenceProvider::Ollama;
         if web_search_enabled && !model.tools {
             self.notice = Some(Notice {
                 kind: NoticeKind::Warning,
@@ -1255,6 +1285,10 @@ impl TacetaApp {
     }
 
     fn stop_generation(&mut self) {
+        if self.agent_ui.active.is_some() {
+            self.stop_agent_run();
+            return;
+        }
         let Some(active) = self.generation.take() else {
             return;
         };
@@ -1321,7 +1355,7 @@ impl TacetaApp {
             })
             .collect::<Vec<_>>();
         let active_id = self.state.active_conversation_id;
-        let generating = self.generation.is_some();
+        let generating = self.is_generating();
         self.conversation_bulk_selection.retain(|id| {
             history
                 .iter()
@@ -1676,11 +1710,11 @@ impl TacetaApp {
                     confirmation.title,
                     text(
                         language,
-                        "このチャットと履歴を削除します。この操作は元に戻せません。",
-                        "This chat and its history will be deleted. This cannot be undone.",
+                        "このチャットを削除します。作業モードの原文記録がある場合は、このMac内の復元用フォルダーへ退避します。",
+                        "Delete this chat. Agent event records, if any, are moved to a recovery folder on this Mac.",
                     )
                 ));
-                if self.generation.is_some() {
+                if self.is_generating() {
                     ui.label(
                         RichText::new(text(
                             language,
@@ -1698,7 +1732,7 @@ impl TacetaApp {
                     let palette = theme::palette(ui);
                     if ui
                         .add_enabled(
-                            self.generation.is_none(),
+                            !self.is_generating(),
                             Button::new(
                                 RichText::new(text(language, "削除", "Delete"))
                                     .color(palette.error),
@@ -1712,7 +1746,8 @@ impl TacetaApp {
             });
 
         if delete_requested {
-            if self.state.delete_conversation(confirmation.conversation_id) {
+            if self.archive_agent_chats(&[confirmation.conversation_id])
+                && self.state.delete_conversation(confirmation.conversation_id) {
                 self.screen = Screen::Chat;
                 self.scroll_to_bottom = true;
             }
@@ -1743,13 +1778,13 @@ impl TacetaApp {
             ui.set_width(360.0);
             ui.label(match language {
                 AppShellLanguage::Japanese => format!(
-                    "選択した{selected_count}件のチャットと履歴を削除します。この操作は元に戻せません。"
+                    "選択した{selected_count}件のチャットを削除します。作業モードの原文記録は、このMac内の復元用フォルダーへ退避します。"
                 ),
                 AppShellLanguage::English => format!(
-                    "The selected {selected_count} chats and their histories will be deleted. This cannot be undone."
+                    "Delete the selected {selected_count} chats. Agent event records are moved to a recovery folder on this Mac."
                 ),
             });
-            if self.generation.is_some() {
+            if self.is_generating() {
                 ui.label(
                     RichText::new(text(
                         language,
@@ -1767,7 +1802,7 @@ impl TacetaApp {
                 let palette = theme::palette(ui);
                 if ui
                     .add_enabled(
-                        self.generation.is_none() && selected_count > 0,
+                        !self.is_generating() && selected_count > 0,
                         Button::new(
                             RichText::new(text(language, "削除", "Delete"))
                                 .color(palette.error),
@@ -1781,7 +1816,7 @@ impl TacetaApp {
         });
 
         if delete_requested {
-            if self
+            if self.archive_agent_chats(&confirmation.conversation_ids) && self
                 .state
                 .delete_conversations(&confirmation.conversation_ids)
                 > 0
@@ -1833,7 +1868,11 @@ impl TacetaApp {
                             ),
                             ConnectionState::Ready => (
                                 theme::palette(ui).success,
-                                text(language, "ローカル接続", "Local ready"),
+                                if self.state.inference_provider == InferenceProvider::Grok {
+                                    "Grok"
+                                } else {
+                                    text(language, "ローカル接続", "Local ready")
+                                },
                                 None,
                             ),
                             ConnectionState::Unavailable(error) => (
@@ -2018,7 +2057,7 @@ impl TacetaApp {
     fn show_ollama_endpoint_settings(&mut self, ui: &mut Ui, language: AppShellLanguage) {
         let palette = theme::palette(ui);
         let endpoint_busy =
-            self.generation.is_some() || self.model_pull.is_some() || self.model_refresh_pending
+            self.is_generating() || self.model_pull.is_some() || self.model_refresh_pending
                 || self.model_unload_result.is_some();
         let mut apply_requested = false;
         theme::card(
@@ -2175,6 +2214,9 @@ impl TacetaApp {
                             .weak(),
                         );
                         ui.add_space(20.0);
+
+                        self.show_provider_settings(ui);
+                        self.show_agent_settings(ui);
 
                         let palette = theme::palette(ui);
                         theme::card(
@@ -2503,6 +2545,16 @@ impl TacetaApp {
     }
 
     fn show_model_manager(&mut self, root_ui: &mut Ui) {
+        if self.state.inference_provider != InferenceProvider::Ollama {
+            let language = self.language();
+            CentralPanel::default().show_inside(root_ui, |ui| {
+                ui.label(text(language, "モデル管理はOllamaのモデルが対象です。", "Model management is for Ollama models."));
+                if ui.button(text(language, "Ollamaに切り替える", "Switch to Ollama")).clicked() {
+                    self.select_provider(InferenceProvider::Ollama);
+                }
+            });
+            return;
+        }
         let language = self.language();
         let candidate_list_height = model_candidate_list_height(root_ui.available_height());
         CentralPanel::default().show_inside(root_ui, |ui| {
@@ -2820,6 +2872,10 @@ impl TacetaApp {
     }
 
     fn show_chat(&mut self, root_ui: &mut Ui) {
+        if self.state.active_conversation().agent_enabled {
+            self.show_agent_chat(root_ui);
+            return;
+        }
         let language = self.language();
         let active_generation_target = self
             .generation
@@ -2843,7 +2899,7 @@ impl TacetaApp {
                             .auto_shrink([false, false])
                             .min_scrolled_height(transcript_height)
                             .max_height(transcript_height)
-                            .stick_to_bottom(self.scroll_to_bottom || self.generation.is_some())
+                            .stick_to_bottom(self.scroll_to_bottom || self.is_generating())
                             .show(ui, |ui| {
                                 ui.add_space(18.0);
                                 if messages.is_empty() {
@@ -3057,7 +3113,7 @@ impl TacetaApp {
                                         egui::Stroke::NONE;
                                     let file_clicked = ui
                                         .add_enabled(
-                                            self.generation.is_none(),
+                                            !self.is_generating() && !self.state.active_conversation().agent_enabled,
                                             Button::new("＋")
                                                 .min_size(Vec2::splat(control.row_height))
                                                 .corner_radius(control.row_height / 2.0),
@@ -3101,10 +3157,14 @@ impl TacetaApp {
                                     let web_enabled = self
                                         .state
                                         .active_conversation()
-                                        .web_search_enabled;
+                                        .web_search_enabled
+                                        && self.state.inference_provider == InferenceProvider::Ollama
+                                        && !self.state.active_conversation().agent_enabled;
                                     let web_available = self
                                         .selected_model()
-                                        .is_some_and(|model| model.tools);
+                                        .is_some_and(|model| model.tools)
+                                        && self.state.inference_provider == InferenceProvider::Ollama
+                                        && !self.state.active_conversation().agent_enabled;
                                     let web_label = if web_enabled {
                                         text(language, "Web: ON", "Web: ON")
                                     } else {
@@ -3112,7 +3172,7 @@ impl TacetaApp {
                                     };
                                     if ui
                                         .add_enabled(
-                                            web_available && self.generation.is_none(),
+                                            web_available && !self.is_generating(),
                                             Button::new(web_label)
                                                 .min_size(Vec2::new(0.0, control.row_height))
                                                 .corner_radius(control.row_height / 2.0),
@@ -3142,7 +3202,7 @@ impl TacetaApp {
                                     let mut send_clicked = false;
                                     let mut stop_clicked = false;
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if self.generation.is_some() {
+                                        if self.is_generating() {
                                             let action_fill = if ui.visuals().dark_mode {
                                                 egui::Color32::WHITE
                                             } else {
@@ -3216,7 +3276,7 @@ impl TacetaApp {
                                 },
                             );
                             });
-                        if files_hovered && self.generation.is_none() {
+                        if files_hovered && !self.is_generating() {
                             let overlay = card_response.response.rect.shrink(1.0);
                             ui.painter().rect_filled(
                                 overlay,
@@ -3271,8 +3331,8 @@ impl TacetaApp {
             if self.models.is_empty() {
                 ui.label(text(
                     language,
-                    "ローカルモデルが見つかりません",
-                    "No local models found",
+                    "利用できるモデルがありません。設定から接続してください。",
+                    "No models available. Connect in Settings.",
                 ));
             }
         });
@@ -3525,7 +3585,8 @@ impl eframe::App for TacetaApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.drain_background_work();
 
-        if self.generation.is_some() || self.model_refresh_pending || self.model_pull.is_some()
+        if self.is_generating() || self.provider_ui.login.is_some() || self.agent_ui.is_recovering()
+            || self.model_refresh_pending || self.model_pull.is_some()
             || self.model_unload_result.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -3536,6 +3597,10 @@ impl eframe::App for TacetaApp {
         self.show_sidebar(ui);
         self.show_top_bar(ui);
 
+        if self.screen == Screen::Chat {
+            self.show_agent_controls(ui);
+        }
+
         match self.screen {
             Screen::Chat => {
                 self.show_composer(ui);
@@ -3545,6 +3610,7 @@ impl eframe::App for TacetaApp {
             Screen::Models => self.show_model_manager(ui),
         }
         self.show_conversation_history_dialogs(ui.ctx());
+        self.show_agent_approval(ui.ctx());
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -3559,6 +3625,10 @@ impl eframe::App for TacetaApp {
 
 impl Drop for TacetaApp {
     fn drop(&mut self) {
+        self.abort_agent_on_exit();
+        if let Some(login) = self.provider_ui.login.take() {
+            login.task.abort();
+        }
         if let Some(generation) = self.generation.take() {
             generation.task.abort();
         }
@@ -4047,7 +4117,7 @@ mod model_manager_tests {
     use taceta::backend::BackendFuture;
 
     #[derive(Default)]
-    struct RecordingServices {
+    pub(super) struct RecordingServices {
         operations: Arc<Mutex<Vec<String>>>,
         lists: AtomicUsize,
         pull_dropped: Arc<AtomicBool>,
@@ -4122,7 +4192,7 @@ mod model_manager_tests {
         }
     }
 
-    fn test_app(services: Arc<RecordingServices>) -> TacetaApp {
+    pub(super) fn test_app(services: Arc<RecordingServices>) -> TacetaApp {
         let state = PersistedAppState {
             ollama_endpoint_mode: OllamaEndpointMode::Custom,
             ..Default::default()

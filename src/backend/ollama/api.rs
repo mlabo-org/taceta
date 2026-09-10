@@ -101,6 +101,8 @@ pub(super) struct ChatChunk {
     #[serde(default)]
     pub done: bool,
     #[serde(default)]
+    pub done_reason: Option<String>,
+    #[serde(default)]
     pub prompt_eval_count: Option<u64>,
     #[serde(default)]
     pub eval_count: Option<u64>,

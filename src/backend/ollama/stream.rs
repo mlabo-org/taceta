@@ -9,6 +9,7 @@ pub(super) struct StreamResult {
     pub stats: GenerationStats,
     pub tool_calls: Vec<serde_json::Value>,
     pub content: String,
+    pub done_reason: Option<String>,
 }
 
 pub(super) async fn consume<S, E>(
@@ -54,6 +55,7 @@ where
         },
         tool_calls: Vec::new(),
         content: String::new(),
+        done_reason: None,
     };
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| BackendError::Protocol(e.to_string()))?;
@@ -87,6 +89,7 @@ where
                 }
             }
             if item.done {
+                result.done_reason = item.done_reason;
                 result.stats.prompt_tokens = item.prompt_eval_count;
                 result.stats.completion_tokens = item.eval_count;
                 result.stats.total_duration_ns = item.total_duration;
@@ -116,6 +119,7 @@ where
             }
         }
         if item.done {
+            result.done_reason = item.done_reason;
             result.stats.prompt_tokens = item.prompt_eval_count;
             result.stats.completion_tokens = item.eval_count;
             result.stats.total_duration_ns = item.total_duration;

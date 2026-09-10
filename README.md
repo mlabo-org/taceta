@@ -1,12 +1,15 @@
 # Taceta
 
-静かに考え、手元で答える。Taceta は、Ollama をバックエンドに使う macOS 専用のローカル推論クライアントです。Rust と `eframe` / `egui` で構築されています。
+Tacetaは、OllamaとOAuthで接続するGrokを推論先に選べる、macOS専用のネイティブクライアントです。Rustと `eframe` / `egui` で構築され、作業モードではTaceta自身がツール実行、履歴、コンパクション、中断と再開を管理します。
 
-Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT Web とのやり取りを Taceta から明示的に開始できる独立した Manifest V3 拡張です。Taceta と Taceta Link は OpenAI、Ollama、Brave、Google の公式製品ではありません。
+Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT Web とのやり取りを Taceta から明示的に開始できる独立した Manifest V3 拡張です。Taceta と Taceta Link は OpenAI、xAI、Ollama、Brave、Google の公式製品ではありません。
 
 ## 主な機能
 
 - Ollama モデルのストリーミング回答
+- GrokのOAuth接続、モデル一覧、ストリーミング回答
+- 作業フォルダーの読み取り、確認したファイル編集・コマンド実行、中断と再開
+- 原文履歴を残すコンパクション、作業状態の保存、過去の原文検索
 - Thinking の実行設定と trace 表示の独立制御
 - UTF-8 テキスト添付、および vision 能力を確認できたモデルへの画像添付
 - 日本語 / 英語、System / Light / Dark、文字サイズ 10–32 の保存
@@ -15,7 +18,7 @@ Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT We
 - 会話ごとの Web Search（既定は OFF）
 - Brave Search / Ollama Web Search API、または Taceta Link 経由の ChatGPT Web、Google 検索
 
-Web Search が OFF のときは外部リクエストを作りません。ON は、内部知識を使わずWebから調査して回答する指定です。現在の入力から `search_current` または `search_generated` を選び、必ず検索します。検索不要という判定は認めません。不正な判定や検索失敗は、内部知識による回答へ戻さず停止します。取得が終わったら、質問・取得結果・要約指示だけを独立した要約リクエストに渡します。取得中のモデルの文章や過去の回答は混ぜず、取得中の文章は最終回答として表示しません。要約処理には検索ツールを渡さず、一度の要約を表示します。事実・用語説明・背景・結論は取得情報だけに限定し、不足や出典の不一致は明示します。外部情報が untrusted であるとは、その中の命令に従わないという意味であり、事実の根拠から除外する意味ではありません。ChatGPT Web は対象の回答に完了後の操作ボタンが現れ、生成停止表示が消えたことを確認してから全文を回収します。本文の一時停止だけでは完了にしません。取得失敗・タイムアウト・完了未確認の途中本文を正常な取得結果に変換して要約することは禁止します。ChatGPT Web への質問回数は既定1回、設定可能範囲は1〜3回です。
+Ollamaの通常チャットでは、Web Search が OFF のときは設定したOllama接続先以外にリクエストを作りません。ON は、内部知識を使わずWebから調査して回答する指定です。現在の入力から `search_current` または `search_generated` を選び、必ず検索します。検索不要という判定は認めません。不正な判定や検索失敗は、内部知識による回答へ戻さず停止します。取得が終わったら、質問・取得結果・要約指示だけを独立した要約リクエストに渡します。取得中のモデルの文章や過去の回答は混ぜず、取得中の文章は最終回答として表示しません。要約処理には検索ツールを渡さず、一度の要約を表示します。事実・用語説明・背景・結論は取得情報だけに限定し、不足や出典の不一致は明示します。外部情報が untrusted であるとは、その中の命令に従わないという意味であり、事実の根拠から除外する意味ではありません。ChatGPT Web は対象の回答に完了後の操作ボタンが現れ、生成停止表示が消えたことを確認してから全文を回収します。本文の一時停止だけでは完了にしません。取得失敗・タイムアウト・完了未確認の途中本文を正常な取得結果に変換して要約することは禁止します。ChatGPT Web への質問回数は既定1回、設定可能範囲は1〜3回です。
 
 通常の質問（`search_current`）では、検索対象や期間をモデルに書き換えさせず、ユーザーの原文を検索に使います。「最新」を学習時点の年に置き換えることもありません。`search_generated` は、質問や調査テーマ自体を考えてから検索するよう依頼された場合に使います。
 
@@ -41,7 +44,9 @@ Google 検索では、AI による概要があれば生成完了を確認して�
 
 ```text
 Taceta (Rust/egui)
-  ├─ Web Search OFF ───────────────→ Ollama (resolved endpoint)
+  ├─ Chat / Agent ────────────────→ Ollama (resolved endpoint)
+  ├─ Chat / Agent (OAuth) ─────────→ Grok inference
+  ├─ Agent ───────────────────────→ workspace tools + durable context
   ├─ Brave / Ollama Web Search API ─→ 外部検索 → Ollama (最終回答)
   └─ Taceta Link ──────────────────→ Brave / Chrome
                                       └─ 検索または ChatGPT Web
@@ -51,11 +56,11 @@ Taceta (Rust/egui)
 
 Taceta Link は `browser-extension/` の MV3 拡張、Native Messaging Host `org.mlabo.taceta.link`、ユーザー専用 Unix socket で構成されます。拡張は既存の通常ブラウザーウィンドウを優先して作業用 tab / group を作り、Taceta が所有する exact tab / group だけを追跡します。ブラウザーのウィンドウ全体を閉じることはありません。製品 version、protocol version、固定 extension ID が一致しない場合は fail-closed します。
 
-直接検索では、ChatGPT Web 経路の1回目に現在の入力欄のpromptを正確に送ります。利用者がローカルモデルへ「質問を作ってから検索」と頼んだ場合や、モデル自身が具体的な検索質問を生成した場合は、メタ指示を検索語にせず、現在のpromptと生成された質問を対応付けて送ります。設定で2〜3回を明示的に許可した場合だけ追加調査を行います。固有名詞、version、前提に誤りがあれば訂正するようChatGPTへ明記します。Tacetaは過去の会話履歴、system message、添付ファイル、Thinking trace、Cookie、token、profile、localStorage を直接送信・取得・保存しません。ChatGPT Web の出力と引用元URLは逐次的に受信し、最終回答はローカル Ollama が生成します。
+直接検索では、ChatGPT Web 経路の1回目に現在の入力欄のpromptを正確に送ります。利用者がローカルモデルへ「質問を作ってから検索」と頼んだ場合や、モデル自身が具体的な検索質問を生成した場合は、メタ指示を検索語にせず、現在のpromptと生成された質問を対応付けて送ります。設定で2〜3回を明示的に許可した場合だけ追加調査を行います。固有名詞、version、前提に誤りがあれば訂正するようChatGPTへ明記します。このTaceta Link経路では、過去の会話履歴、system message、添付ファイル、Thinking traceをブラウザーへ付加せず、Cookie、token、profile、localStorageを読み取りません。ChatGPT Web の出力と引用元URLは逐次的に受信し、最終回答はローカル Ollama が生成します。
 
 ## セキュリティとプライバシー
 
-- 通常のチャットと会話履歴はこの Mac のローカルアプリケーションデータに保存します。生成に必要な会話内容と添付は、現在設定されているOllama接続先だけへ送ります。
+- 通常のチャットと会話履歴はこの Mac のローカルアプリケーションデータに保存します。生成に必要な会話内容と添付は選択中の推論先へ送ります。Grokを選ぶとxAIのサーバーへ送り、作業モードでは必要なファイル内容とコマンド結果も含みます。
 - Ollamaの既定接続先は `http://127.0.0.1:11434` です。TacetaはOllamaの設定を自動解決でき、Ollamaとモデルは同梱・再配布しません。
 - Web Search を有効にした場合だけ、設定した検索先へ query、または選択した Web executor の request が送られます。送信前に画面で確認できます。
 - API key が必要な検索 provider の key は macOS Keychain に保存します。Cookie やブラウザーの認証 token を読み出したり、エクスポートしたりしません。
@@ -68,10 +73,34 @@ Taceta Link は OpenAI / ChatGPT の公式拡張ではなく、ChatGPT Web の D
 
 - macOS 13.0 以降（Apple Silicon を主対象）
 - Rust 1.92 以降（ソースからビルドする場合）
-- [Ollama](https://ollama.com/) を別途インストールして起動
+- Ollamaを使う場合は [Ollama](https://ollama.com/) を別途インストールして起動
+- Grokを使う場合はOAuth接続を受け付けるGrokアカウント
 - Taceta Link を使う場合は Brave または Chrome
 
 モデルの取得・削除は Model Manager から利用者が明示的に行います。モデル、Ollama、ブラウザー、検索 API、ChatGPT Web の利用条件は、それぞれの提供元に従います。
+
+## GrokのOAuth接続
+
+設定の「Grokに接続（OAuth）」を押し、開いたブラウザーでログインと同意を完了します。Tacetaは公開されたGrok BuildのOAuth方式を実装し、Grokサーバーへ直接接続します。Grok CLIやCodexを実行基盤として起動する構成ではありません。取得したモデルを選んで送信し、会話画面からOllamaとGrokを切り替えられます。
+
+認証情報はTaceta専用のmacOSキーチェーンに保存し、必要時に更新します。他アプリの認証ファイルやブラウザーCookieを読みません。「Grok接続を解除」はこのTacetaの保存済み認証だけを削除します。
+
+この接続は非公式です。公開client IDはGrok Buildの登録値であり、Taceta専用の登録やサービスによる受理を保証するものではありません。アカウントの利用権とOAuth proxyの受理は、実際のログイン・モデル取得・推論で確認する必要があります。Grokの通常チャットではTaceta LinkによるWeb検索を提供せず、既存の検索経路はOllamaで利用できます。
+
+接続仕様の根拠: [Grok Buildのネットワーク仕様](https://docs.x.ai/build/enterprise)、[公開OAuth設定](https://github.com/xai-org/grok-build/blob/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-login/src/config.rs)、[Responses API](https://docs.x.ai/developers/rest-api-reference/inference/responses)。
+
+## 作業モードとコンパクション
+
+1. 会話上部で「作業」を選び、作業フォルダーを指定します。
+2. ツール対応のOllamaまたはGrokモデルを選び、作業を送信します。
+3. ファイル編集・コマンドの内容が表示されたら、その1回を許可または拒否します。コマンドは作業フォルダーと専用一時領域だけへ書き込み、ネットワークを使用できません。
+4. 停止・上限到達・失敗の後は状態を確認し「再開」で続けます。再起動後も作業が復元され、再開時に推論先を変更できます。
+
+「コンテキストを整理」で手動の圧縮も開始できます。コンパクションは背景を要約し、原文履歴、ユーザーの指示・訂正、作業状態を別々に保持します。要約が指示を置き換えることはありません。過去の原文は履歴検索ツールで取り出せます。Thinking traceは要約入力にも後続の推論入力にも含めません。要約の推論も回数・時間制限に含め、必須の指示だけで入力上限を超える場合や要約に失敗した場合は原文を破壊せず停止します。
+
+作業記録は現在ユーザーの `~/Library/Application Support/Taceta/AgentSessions/` に保存します。会話を削除すると、作業記録は同じ保存領域の復元用フォルダーへ退避します。再開しても、結果不明の編集やコマンドを自動で再実行しません。
+
+Grok OAuthでは選択モデルの通常推論で要約を生成します。APIキー向けの[専用コンパクション](https://docs.x.ai/developers/advanced-api-usage/context-compaction)をOAuth proxyでも使えるとは仮定しません。要約の品質はモデルにも依存し、Codexのサービス側コンパクションとの同等性は未確認です。
 
 ## Ollama接続先
 
@@ -154,13 +183,16 @@ Ollama、ブラウザー、検索 API、ChatGPT Web、モデル、および Rust
 
 # Taceta (English)
 
-Think quietly, answer locally. Taceta is a macOS-only local inference client using Ollama as its backend. It is built with Rust and `eframe` / `egui`.
+Taceta is a native macOS client with Ollama and OAuth-authenticated Grok inference providers. Built with Rust and `eframe` / `egui`, its Agent mode manages tool execution, history, compaction, interruption and resumption within Taceta.
 
-Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly start searches and ChatGPT Web interactions in a logged-in browser. Neither project is an official product of OpenAI, Ollama, Brave, or Google.
+Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly start searches and ChatGPT Web interactions in a logged-in browser. Neither project is an official product of OpenAI, xAI, Ollama, Brave, or Google.
 
 ## Features
 
 - Stream responses from Ollama models
+- Grok OAuth sign-in, model discovery and streaming responses
+- Workspace reads, approved edits and commands, interruption and resumption
+- Compaction with original events, structured work state and history search
 - Independently control Thinking execution and Thinking-trace visibility
 - Attach UTF-8 text, and images only to models with confirmed vision capability
 - Persist Japanese / English, System / Light / Dark, and font size 10–32
@@ -169,7 +201,7 @@ Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly star
 - Per-conversation Web Search, off by default
 - Brave Search / Ollama Web Search APIs, or ChatGPT Web and Google Search through Taceta Link
 
-When Web Search is OFF, Taceta creates no external request. ON requests Web research without using internal factual knowledge. The current input selects either `search_current` or `search_generated`; skipping research is not an option. Invalid routing or failed research stops instead of falling back to internal knowledge. Once retrieval ends, one independent summary request receives only the question, retrieved results, and summary instructions. It receives no search tools, past assistant answers, or research-model prose. Research prose is not displayed as the final answer. Facts, definitions, background, and conclusions must come only from retrieved information; gaps and conflicting sources must be disclosed. Untrusted external content has no instruction authority, but remains usable evidence. ChatGPT Web retrieves the final text only after the target answer exposes its completed-response actions and generation has stopped. A brief pause in text is not completion. Failed, timed-out, or unconfirmed partial responses must never be promoted to successful retrieval or summarized as complete results. ChatGPT Web defaults to one request and can be limited from one to three.
+For regular Ollama chat, Web Search OFF sends no request beyond the configured Ollama endpoint. ON requests Web research without using internal factual knowledge. The current input selects either `search_current` or `search_generated`; skipping research is not an option. Invalid routing or failed research stops instead of falling back to internal knowledge. Once retrieval ends, one independent summary request receives only the question, retrieved results, and summary instructions. It receives no search tools, past assistant answers, or research-model prose. Research prose is not displayed as the final answer. Facts, definitions, background, and conclusions must come only from retrieved information; gaps and conflicting sources must be disclosed. Untrusted external content has no instruction authority, but remains usable evidence. ChatGPT Web retrieves the final text only after the target answer exposes its completed-response actions and generation has stopped. A brief pause in text is not completion. Failed, timed-out, or unconfirmed partial responses must never be promoted to successful retrieval or summarized as complete results. ChatGPT Web defaults to one request and can be limited from one to three.
 
 For an existing question (`search_current`), Taceta searches the user's original input instead of a model-written query, preserving the subject and time range. It never replaces “latest” with a year from training. `search_generated` is reserved for requests to invent a question or research topic before searching.
 
@@ -193,7 +225,9 @@ Configure language, theme, model management, Web Search, the model location, and
 
 ```text
 Taceta (Rust/egui)
-  ├─ Web Search OFF ───────────────→ Ollama (resolved endpoint)
+  ├─ Chat / Agent ────────────────→ Ollama (resolved endpoint)
+  ├─ Chat / Agent (OAuth) ─────────→ Grok inference
+  ├─ Agent ───────────────────────→ workspace tools + durable context
   ├─ Brave / Ollama Web Search API ─→ external search → Ollama (final answer)
   └─ Taceta Link ──────────────────→ Brave / Chrome
                                       └─ search or ChatGPT Web
@@ -203,11 +237,11 @@ Taceta (Rust/egui)
 
 Taceta Link consists of the MV3 extension in `browser-extension/`, the Native Messaging Host `org.mlabo.taceta.link`, and a per-user Unix socket. The extension prefers an existing normal browser window, creates a working tab/group, and tracks only the exact tab/group created by Taceta. It never closes the browser window. A product-version, protocol-version, or fixed-extension-ID mismatch fails closed.
 
-For a direct search request, the first ChatGPT Web request sends the current composer prompt exactly. If the user instead asks the local model to invent a question before searching, or the model itself produces a concrete `web_search` query, the first request carries both the current prompt and that concrete query so the meta-instruction is not mistaken for the search topic. Only when two or three requests are explicitly selected do later requests attach another local-model query to the original prompt as an unverified additional research angle. ChatGPT is instructed to correct mistaken names, versions, and premises. The “local model angle” status shown in Taceta is a temporary progress label identifying the source of the query; it is not ChatGPT's internal reasoning or conversation history. Taceta does not directly read, send, or store earlier conversation history, system messages, attachments, Thinking traces, cookies, tokens, profiles, or local storage. ChatGPT Web output is received incrementally, while local Ollama remains responsible for the final answer. This experimental route can break when the web UI or service conditions change.
+For a direct search request, the first ChatGPT Web request sends the current composer prompt exactly. If the user instead asks the local model to invent a question before searching, or the model itself produces a concrete `web_search` query, the first request carries both the current prompt and that concrete query so the meta-instruction is not mistaken for the search topic. Only when two or three requests are explicitly selected do later requests attach another local-model query to the original prompt as an unverified additional research angle. ChatGPT is instructed to correct mistaken names, versions, and premises. The “local model angle” status shown in Taceta is a temporary progress label identifying the source of the query; it is not ChatGPT's internal reasoning or conversation history. This Taceta Link route adds no earlier conversation history, system messages, attachments or Thinking traces to browser requests and reads no cookies, tokens, profiles or local storage. ChatGPT Web output is received incrementally, while local Ollama remains responsible for the final answer. This experimental route can break when the web UI or service conditions change.
 
 ## Security and privacy
 
-- Normal chats and conversation history are stored in this Mac's local application data. Conversation context and attachments needed for generation are sent only to the currently configured Ollama endpoint.
+- Normal chats and conversation history are stored in this Mac's local application data. Conversation context and attachments are sent to the selected inference provider. Selecting Grok sends them to xAI, including file content and command results needed for Agent tasks.
 - Ollama's default endpoint is `http://127.0.0.1:11434`. Taceta can resolve Ollama's configuration automatically and does not bundle or redistribute Ollama or models.
 - Only when Web Search is enabled, the configured search provider receives a query or request. The UI asks for confirmation before sending.
 - Where a search provider requires an API key, it is stored in the macOS Keychain. Browser cookies and authentication tokens are never read or exported.
@@ -220,10 +254,34 @@ Taceta Link is not an official OpenAI / ChatGPT extension. It is an unofficial, 
 
 - macOS 13.0 or later (Apple Silicon is the primary target)
 - Rust 1.92 or later when building from source
-- [Ollama](https://ollama.com/) installed and running separately
+- For Ollama inference, [Ollama](https://ollama.com/) installed and running separately
+- For Grok inference, an account accepted by the Grok OAuth service
 - Brave or Chrome for Taceta Link
 
 Users explicitly retrieve and remove models through Taceta's Model Manager. Ollama, browsers, search APIs, ChatGPT Web, and models remain subject to their respective provider terms and conditions.
+
+## Connect Grok with OAuth
+
+In Settings, choose “Connect Grok (OAuth)” and complete browser sign-in and consent. Taceta implements Grok Build's public OAuth flow and connects directly to the Grok server. It does not launch Grok CLI or Codex as its execution harness. Choose a returned model and send a message; the conversation view also switches providers while retaining your Ollama settings.
+
+Credentials stay in a Taceta-only macOS Keychain entry and refresh when needed. Taceta does not read another app's auth files or browser cookies. “Disconnect Grok” removes only this Taceta's saved credentials.
+
+This is unofficial. The public client ID belongs to Grok Build, not separately to Taceta. Account eligibility and proxy acceptance require actual sign-in, model discovery and inference. Regular Grok chat does not offer Taceta Link Web Search; existing search routes remain available with Ollama.
+
+Sources: [Grok Build networking](https://docs.x.ai/build/enterprise), [public OAuth configuration](https://github.com/xai-org/grok-build/blob/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-login/src/config.rs), [Responses API](https://docs.x.ai/developers/rest-api-reference/inference/responses).
+
+## Agent mode and compaction
+
+1. Select Agent above the conversation and choose a workspace.
+2. Select a tool-capable Ollama or Grok model and submit the task.
+3. Review each proposed edit or command and approve or deny that one action. Commands can write only to the workspace and their scratch area, and cannot access the network.
+4. After interruption, a limit or failure, inspect the state and choose Resume. Saved tasks recover after restart. The inference provider can change on resume.
+
+“Compact context” starts manual compaction through the same path. Compaction summarizes background while retaining original events, user instructions and corrections, and structured work state separately. Summaries never replace instructions. The model can search and read original history. Thinking traces enter neither compaction nor later inference. Compaction calls count toward run limits. If mandatory instructions exceed the context limit or summarization fails, the run stops without destroying history.
+
+Records are stored under the current user's `~/Library/Application Support/Taceta/AgentSessions/`. Deleting a chat moves its Agent records to a recovery folder in the same storage area. Resumption does not automatically repeat an edit or command whose outcome is unknown.
+
+Grok OAuth creates summaries through normal inference with the selected model. Taceta does not assume that the API-key [native compaction endpoint](https://docs.x.ai/developers/advanced-api-usage/context-compaction) is supported by the OAuth proxy. Summary quality depends on the model; equivalence with Codex's service-side compaction is not established.
 
 ## Ollama endpoint
 
