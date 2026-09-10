@@ -74,20 +74,20 @@ Taceta Link は OpenAI / ChatGPT の公式拡張ではなく、ChatGPT Web の D
 - macOS 13.0 以降（Apple Silicon を主対象）
 - Rust 1.92 以降（ソースからビルドする場合）
 - Ollamaを使う場合は [Ollama](https://ollama.com/) を別途インストールして起動
-- Grokを使う場合はOAuth接続を受け付けるGrokアカウント
+- Grokを使う場合は公式Grok CLIとOAuth接続を受け付けるGrokアカウント
 - Taceta Link を使う場合は Brave または Chrome
 
 モデルの取得・削除は Model Manager から利用者が明示的に行います。モデル、Ollama、ブラウザー、検索 API、ChatGPT Web の利用条件は、それぞれの提供元に従います。
 
 ## GrokのOAuth接続
 
-設定の「Grokに接続（OAuth）」を押し、開いたブラウザーでログインと同意を完了します。Tacetaは公開されたGrok BuildのOAuth方式を実装し、Grokサーバーへ直接接続します。Grok CLIやCodexを実行基盤として起動する構成ではありません。取得したモデルを選んで送信し、会話画面からOllamaとGrokを切り替えられます。
+設定の「Grokに接続（OAuth）」を押し、開いたブラウザーでログインと同意を完了します。Grok接続は `grok-codex-bridge` の認証・モデル取得・Responses通信のソースを移植しています。認証取得と更新には公式Grok CLIを使い、推論はTacetaからGrokサーバーへ直接送ります。取得したモデルを選んで送信し、会話画面からOllamaとGrokを切り替えられます。
 
-認証情報はTaceta専用のmacOSキーチェーンに保存し、必要時に更新します。他アプリの認証ファイルやブラウザーCookieを読みません。「Grok接続を解除」はこのTacetaの保存済み認証だけを削除します。
+公式Grok CLIは別途必要です。Tacetaは認証用の `GROK_HOME` と `GROK_AUTH_PATH` を `~/Library/Application Support/Taceta/grok` に設定し、このアプリ専用の認証情報を使います。「Grok接続を解除」はこの保存先の認証だけを削除します。CLIの通常の認証情報やブラウザーCookieを流用しません。
 
-この接続は非公式です。公開client IDはGrok Buildの登録値であり、Taceta専用の登録やサービスによる受理を保証するものではありません。アカウントの利用権とOAuth proxyの受理は、実際のログイン・モデル取得・推論で確認する必要があります。Grokの通常チャットではTaceta LinkによるWeb検索を提供せず、既存の検索経路はOllamaで利用できます。
+各回答には、送信時に指定したモデルと、サーバーが応答に付けたモデル名を保存して表示します。サーバーからモデル名が通知されない場合は、その旨を表示します。モデル自身が本文で名乗った名前は、この記録に使いません。
 
-接続仕様の根拠: [Grok Buildのネットワーク仕様](https://docs.x.ai/build/enterprise)、[公開OAuth設定](https://github.com/xai-org/grok-build/blob/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-login/src/config.rs)、[Responses API](https://docs.x.ai/developers/rest-api-reference/inference/responses)。
+この接続は非公式です。アカウントの利用権は実際のログイン・モデル取得・推論で確認します。Grokの通常チャットではTaceta LinkによるWeb検索を提供せず、既存の検索経路はOllamaで利用できます。移植元と実装の境界は[設計文書](docs/architecture.md)、移植元のライセンスは[MIT通知](docs/licenses/grok-codex-bridge-MIT.txt)を参照してください。
 
 ## 作業モードとコンパクション
 
@@ -255,20 +255,20 @@ Taceta Link is not an official OpenAI / ChatGPT extension. It is an unofficial, 
 - macOS 13.0 or later (Apple Silicon is the primary target)
 - Rust 1.92 or later when building from source
 - For Ollama inference, [Ollama](https://ollama.com/) installed and running separately
-- For Grok inference, an account accepted by the Grok OAuth service
+- For Grok inference, the official Grok CLI and an account accepted by the Grok OAuth service
 - Brave or Chrome for Taceta Link
 
 Users explicitly retrieve and remove models through Taceta's Model Manager. Ollama, browsers, search APIs, ChatGPT Web, and models remain subject to their respective provider terms and conditions.
 
 ## Connect Grok with OAuth
 
-In Settings, choose “Connect Grok (OAuth)” and complete browser sign-in and consent. Taceta implements Grok Build's public OAuth flow and connects directly to the Grok server. It does not launch Grok CLI or Codex as its execution harness. Choose a returned model and send a message; the conversation view also switches providers while retaining your Ollama settings.
+In Settings, choose “Connect Grok (OAuth)” and complete browser sign-in and consent. Taceta adopts the authentication, model discovery and Responses transport source from `grok-codex-bridge`. The official Grok CLI acquires and refreshes credentials; Taceta sends inference directly to the Grok server. Choose a returned model and send a message; the conversation view also switches providers while retaining your Ollama settings.
 
-Credentials stay in a Taceta-only macOS Keychain entry and refresh when needed. Taceta does not read another app's auth files or browser cookies. “Disconnect Grok” removes only this Taceta's saved credentials.
+The official Grok CLI is a separate prerequisite. Taceta sets its authentication subprocesses' `GROK_HOME` and `GROK_AUTH_PATH` to the app-owned location under `~/Library/Application Support/Taceta/grok`. “Disconnect Grok” removes credentials only from this location. The CLI's regular credentials and browser cookies are not reused.
 
-This is unofficial. The public client ID belongs to Grok Build, not separately to Taceta. Account eligibility and proxy acceptance require actual sign-in, model discovery and inference. Regular Grok chat does not offer Taceta Link Web Search; existing search routes remain available with Ollama.
+Each answer preserves and displays the requested model and the model name reported in the server response. An absent server model is shown explicitly. Generated self-identification text is not used for this record.
 
-Sources: [Grok Build networking](https://docs.x.ai/build/enterprise), [public OAuth configuration](https://github.com/xai-org/grok-build/blob/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-login/src/config.rs), [Responses API](https://docs.x.ai/developers/rest-api-reference/inference/responses).
+This connection is unofficial. Account eligibility requires actual sign-in, model discovery and inference. Regular Grok chat does not offer Taceta Link Web Search; existing search routes remain available with Ollama. See the [architecture](docs/architecture.md) for source provenance and ownership, and the [MIT notice](docs/licenses/grok-codex-bridge-MIT.txt) for the adopted source license.
 
 ## Agent mode and compaction
 

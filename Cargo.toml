@@ -14,17 +14,22 @@ syntect = { version = "=5.3.0", default-features = false, features = ["default-f
 serde = { version = "1.0", features = ["derive"] }
 base64 = "0.22"
 bytes = "1.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+eventsource-stream = "0.2.3"
 futures-util = "0.3"
 rfd = "0.15"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "form", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["http2", "json", "stream", "form", "rustls"] }
 serde_json = "1.0"
 sys-locale = "0.3"
 thiserror = "2.0"
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "fs", "net"] }
 libc = "0.2"
 sha2 = "0.10"
-rand = "0.9"
+tracing = "0.1"
 zeroize = "1.9"
-security-framework = "3.7"
 uuid = { version = "1.18", features = ["v4", "serde"] }
 url = "2.5"
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tempfile = "3"

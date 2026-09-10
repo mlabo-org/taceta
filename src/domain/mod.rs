@@ -49,6 +49,15 @@ pub struct ChatMessage {
     /// become input to a later model turn.
     #[serde(default)]
     pub interrupted: bool,
+    /// Per-answer inference metadata, kept out of future model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_identity: Option<ModelIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelIdentity {
+    pub requested_model: String,
+    pub reported_model: Option<String>,
 }
 
 impl ChatMessage {
@@ -61,6 +70,7 @@ impl ChatMessage {
             attachments: Vec::new(),
             citations: Vec::new(),
             interrupted: false,
+            model_identity: None,
         }
     }
     pub fn new_user(content: impl Into<String>) -> Self {
@@ -197,6 +207,10 @@ pub struct GenerationStats {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GenerationEvent {
+    ModelIdentity {
+        requested_model: String,
+        reported_model: Option<String>,
+    },
     ThinkingDelta(String),
     ContentDelta(String),
     ReplaceContent(String),

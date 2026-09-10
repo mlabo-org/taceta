@@ -1,200 +1,457 @@
-use super::super::tests::{Fixture, MemoryStore, Reply, saved_token};
-use super::*;
-use serde_json::json;
-use std::{collections::HashMap, sync::atomic::Ordering};
-use tokio::sync::mpsc;
+use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Barrier};
 
-fn auth(base: &str, store: Arc<MemoryStore>) -> AuthManager {
-    AuthManager::new(
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap(),
-        AuthEndpoints {
-            authorize: format!("{base}/authorize"),
-            token: format!("{base}/token"),
-            userinfo: format!("{base}/userinfo"),
-        },
-        store,
+use super::*;
+
+fn write_auth(path: &Path, records: &str, mode: u32) {
+    fs::write(path, records).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn write_helper(path: &Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn record(token: &str, expires_at: &str) -> String {
+    format!(
+        r#"{{"https://auth.x.ai::current-client":{{"key":"{token}","auth_mode":"oidc","create_time":"2026-08-01T00:00:00Z","user_id":"user-1","expires_at":"{expires_at}","oidc_issuer":"https://auth.x.ai"}}}}"#
     )
 }
 
 #[test]
-fn pkce_and_callback_bind_method_path_host_and_unique_state() {
-    assert_eq!(
-        challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+fn reads_one_private_current_session_and_reloads_changed_file() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("auth.json");
+    write_auth(
+        &path,
+        &record("first-secret", "2099-01-01T00:00:00Z"),
+        0o600,
     );
-    let base = Url::parse("http://127.0.0.1:40000/callback").unwrap();
-    let valid =
-        "GET /callback?code=fixture-code&state=expected HTTP/1.1\r\nHost: 127.0.0.1:40000\r\n\r\n";
-    assert!(
-        matches!(callback_code(valid, &base, "127.0.0.1:40000", "expected"), Ok(Callback::Code(code)) if code == "fixture-code")
+    let store = CredentialStore::new(path.clone()).unwrap();
+    let first = store.load().unwrap();
+    assert_eq!(first.token(), "first-secret");
+
+    write_auth(
+        &path,
+        &record("second-secret-longer", "2099-01-01T00:00:00Z"),
+        0o600,
     );
-    for invalid in [
-        valid.replace("state=expected", "state=wrong"),
-        valid.replace("state=expected", "state=expected&state=expected"),
-        valid.replace("GET ", "POST "),
-        valid.replace("/callback?", "/other?"),
-        valid.replace("Host: 127.0.0.1:40000", "Host: example.com"),
-    ] {
-        assert!(callback_code(&invalid, &base, "127.0.0.1:40000", "expected").is_err());
-    }
+    let second = store.load().unwrap();
+    assert_eq!(second.token(), "second-secret-longer");
 }
 
-#[tokio::test]
-async fn loopback_login_exchanges_bound_code_and_only_saves_own_store() {
-    let mut fixture = Fixture::start(vec![
-        Reply::json(json!({"access_token": "fixture-new-access", "refresh_token": "fixture-new-refresh", "expires_in": 3600, "token_type": "Bearer"})),
-        Reply::json(json!({"sub": "official-login-subject"})),
-    ]).await;
-    let store = Arc::new(MemoryStore::default());
-    saved_token(&store, false);
-    let manager = auth(&fixture.base, store.clone());
-    let (events, mut receiver) = mpsc::unbounded_channel();
-    let driver = async {
-        let Some(GrokLoginEvent::OpenBrowser(url)) = receiver.recv().await else {
-            panic!("missing browser event");
-        };
-        let url = Url::parse(&url).unwrap();
-        let parameters: HashMap<String, String> = url.query_pairs().into_owned().collect();
-        assert_eq!(parameters["client_id"], CLIENT_ID);
-        assert_eq!(parameters["code_challenge_method"], "S256");
-        assert!(!parameters["scope"].contains("conversation"));
-        let redirect = Url::parse(&parameters["redirect_uri"]).unwrap();
-        assert_eq!(redirect.host_str(), Some("127.0.0.1"));
-        let mut socket = TcpStream::connect(("127.0.0.1", redirect.port().unwrap()))
-            .await
-            .unwrap();
-        let request = format!(
-            "GET /callback?code=fixture-code&state={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
-            parameters["state"],
-            redirect.port().unwrap()
-        );
-        socket.write_all(request.as_bytes()).await.unwrap();
-        let mut result = String::new();
-        socket.read_to_string(&mut result).await.unwrap();
-        assert!(result.starts_with("HTTP/1.1 200"));
-        let token_request = fixture.requests.recv().await.unwrap();
-        let form: HashMap<String, String> = url::form_urlencoded::parse(&token_request.body)
-            .into_owned()
-            .collect();
-        assert_eq!(token_request.path, "/token");
-        assert_eq!(form["grant_type"], "authorization_code");
-        assert_eq!(form["code"], "fixture-code");
-        assert_eq!(form["redirect_uri"], parameters["redirect_uri"]);
-        assert_eq!(
-            challenge(&form["code_verifier"]),
-            parameters["code_challenge"]
-        );
-        assert!(!form.contains_key("client_secret"));
-        // Keep the event receiver alive through the final save.
-        while receiver.recv().await.is_some() {}
-    };
-    let (result, ()) = tokio::join!(manager.sign_in(events), driver);
-    result.unwrap();
-    fixture.task.await.unwrap();
-    let saved = store.load().unwrap().unwrap();
-    assert_eq!(saved.access_token, "fixture-new-access");
-    assert_eq!(saved.refresh_token.as_deref(), Some("fixture-new-refresh"));
-    assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+#[test]
+fn rejects_group_readable_auth_file() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("auth.json");
+    write_auth(&path, &record("secret", "2099-01-01T00:00:00Z"), 0o640);
+    let store = CredentialStore::new(path).unwrap();
+    assert!(matches!(
+        store.load(),
+        Err(CredentialError::UnsafeAuthPermissions)
+    ));
 }
 
-#[tokio::test]
-async fn concurrent_requests_refresh_once_and_rotate_the_saved_token() {
-    let mut fixture = Fixture::start(vec![Reply::json(json!({"access_token": "fixture-new", "refresh_token": "fixture-rotated", "expires_in": 3600}))]).await;
-    let store = Arc::new(MemoryStore::default());
-    saved_token(&store, true);
-    let manager = auth(&fixture.base, store.clone());
-    let (first, second) = tokio::join!(manager.session_credential(), manager.session_credential());
-    assert_eq!(first.unwrap().token(), "fixture-new");
-    assert_eq!(second.unwrap().token(), "fixture-new");
-    fixture.task.await.unwrap();
-    let request = fixture.requests.recv().await.unwrap();
-    let form: HashMap<String, String> = url::form_urlencoded::parse(&request.body)
-        .into_owned()
-        .collect();
-    assert_eq!(form["grant_type"], "refresh_token");
-    assert_eq!(form["refresh_token"], "fixture-refresh-old");
-    assert_eq!(store.saves.load(Ordering::SeqCst), 2); // initial + one refresh
-    assert_eq!(
-        store.load().unwrap().unwrap().refresh_token.as_deref(),
-        Some("fixture-rotated")
+#[test]
+fn rejects_expired_and_ambiguous_session_credentials() {
+    assert!(matches!(
+        parse_auth_map(&record("secret", "2020-01-01T00:00:00Z")),
+        Err(CredentialError::ExpiredSessionCredential)
+    ));
+    let ambiguous = r#"{
+        "https://auth.x.ai::client-a":{"key":"a","auth_mode":"oidc","create_time":"2026-01-01T00:00:00Z","user_id":"user-a","expires_at":"2099-01-01T00:00:00Z"},
+        "https://auth.x.ai::client-b":{"key":"b","auth_mode":"external","create_time":"2026-01-01T00:00:00Z","user_id":"user-b","expires_at":"2099-01-01T00:00:00Z","oidc_issuer":"https://auth.x.ai"}
+    }"#;
+    assert!(matches!(
+        parse_auth_map(ambiguous),
+        Err(CredentialError::AmbiguousSessionCredential)
+    ));
+}
+
+#[test]
+fn expired_credential_waits_for_official_file_replacement() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("auth.json");
+    write_auth(&path, &record("expired", "2020-01-01T00:00:00Z"), 0o600);
+    let store = CredentialStore::new(path.clone()).unwrap();
+
+    let replacement_path = temporary.path().join("auth.json.renewed");
+    let renew = thread::spawn(move || {
+        thread::sleep(StdDuration::from_millis(25));
+        write_auth(
+            &replacement_path,
+            &record("renewed", "2099-01-01T00:00:00Z"),
+            0o600,
+        );
+        fs::rename(replacement_path, path).unwrap();
+    });
+
+    let credential = store
+        .load_with_renewal_grace(StdDuration::from_secs(1))
+        .unwrap();
+    renew.join().unwrap();
+    assert_eq!(credential.token(), "renewed");
+}
+
+#[test]
+fn expired_credential_adopts_official_helper_replacement() {
+    let temporary = tempfile::tempdir().unwrap();
+    let auth_home = temporary.path();
+    let path = auth_home.join("auth.json");
+    let helper = auth_home.join("bin/grok");
+    let invocation = auth_home.join("invocation");
+    fs::create_dir(auth_home.join("bin")).unwrap();
+    write_auth(&path, &record("expired", "2020-01-01T00:00:00Z"), 0o600);
+    write_helper(
+        &helper,
+        &format!(
+            "helper_dir=$(dirname \"$0\")\nauth_path=\"$helper_dir/../auth.json\"\nprintf '%s' \"$1\" > \"{}\"\nprintf '%s' '{}' > \"$auth_path.tmp\"\nchmod 600 \"$auth_path.tmp\"\nmv \"$auth_path.tmp\" \"$auth_path\"",
+            invocation.display(),
+            record("renewed", "2099-01-01T00:00:00Z")
+        ),
     );
-}
 
-#[tokio::test]
-async fn refresh_errors_preserve_credentials_and_do_not_echo_provider_secrets() {
-    for reply in [
-        Reply {
-            status: "400 Bad Request",
-            content_type: "application/json",
-            body:
-                br#"{"error":"invalid_grant","error_description":"fixture-secret-must-not-escape"}"#
-                    .to_vec(),
-        },
-        Reply {
-            status: "200 OK",
-            content_type: "application/json",
-            body: b"invalid token JSON fixture-secret-must-not-escape".to_vec(),
-        },
-    ] {
-        let fixture = Fixture::start(vec![reply]).await;
-        let store = Arc::new(MemoryStore::default());
-        saved_token(&store, true);
-        let manager = auth(&fixture.base, store.clone());
-        let error = manager.session_credential().await.err().unwrap();
-        assert!(!error.contains("fixture-secret"));
-        assert_eq!(
-            store.load().unwrap().unwrap().access_token,
-            "fixture-access-old"
-        );
-        assert_eq!(store.saves.load(Ordering::SeqCst), 1);
-        fixture.task.await.unwrap();
-    }
-}
-
-#[tokio::test]
-async fn dropping_login_closes_loopback_and_signout_invalidates_late_save() {
-    let store = Arc::new(MemoryStore::default());
-    saved_token(&store, false);
-    let manager = Arc::new(auth("http://127.0.0.1:1", store.clone()));
-    let (events, mut receiver) = mpsc::unbounded_channel();
-    let task_manager = manager.clone();
-    let task = tokio::spawn(async move { task_manager.sign_in(events).await });
-    let Some(GrokLoginEvent::OpenBrowser(url)) = receiver.recv().await else {
-        panic!("missing browser event");
-    };
-    let url = Url::parse(&url).unwrap();
-    let redirect = url
-        .query_pairs()
-        .find(|(key, _)| key == "redirect_uri")
+    let credential = CredentialStore::new(path)
         .unwrap()
-        .1
-        .into_owned();
-    let redirect = Url::parse(&redirect).unwrap();
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    assert!(
-        TcpStream::connect(("127.0.0.1", redirect.port().unwrap()))
-            .await
-            .is_err()
+        .load_with_renewal_grace(StdDuration::from_secs(1))
+        .unwrap();
+    assert_eq!(credential.token(), "renewed");
+    assert_eq!(fs::read_to_string(invocation).unwrap(), "models");
+}
+
+#[test]
+fn failed_official_helper_preserves_expired_error() {
+    let temporary = tempfile::tempdir().unwrap();
+    let auth_home = temporary.path();
+    let path = auth_home.join("auth.json");
+    let helper = auth_home.join("bin/grok");
+    fs::create_dir(auth_home.join("bin")).unwrap();
+    write_auth(&path, &record("expired", "2020-01-01T00:00:00Z"), 0o600);
+    write_helper(&helper, "exit 7");
+
+    assert!(matches!(
+        CredentialStore::new(path)
+            .unwrap()
+            .load_with_renewal_grace(StdDuration::from_secs(1)),
+        Err(CredentialError::ExpiredSessionCredential)
+    ));
+}
+
+#[test]
+fn concurrent_renewal_waiters_share_one_successful_helper_run() {
+    let temporary = tempfile::tempdir().unwrap();
+    let auth_home = temporary.path();
+    let path = auth_home.join("auth.json");
+    let helper = auth_home.join("bin/grok");
+    let count = auth_home.join("refresh-count");
+    fs::create_dir(auth_home.join("bin")).unwrap();
+    write_auth(&path, &record("expired", "2020-01-01T00:00:00Z"), 0o600);
+    write_helper(
+        &helper,
+        &format!(
+            "sleep 0.1\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nprintf '%s' '{}' > '{}.tmp'\nchmod 600 '{}.tmp'\nmv '{}.tmp' '{}'",
+            count.display(),
+            count.display(),
+            count.display(),
+            record("renewed", "2099-01-01T00:00:00Z"),
+            path.display(),
+            path.display(),
+            path.display(),
+            path.display(),
+        ),
+    );
+
+    let store = Arc::new(CredentialStore::new(path).unwrap());
+    let barrier = Arc::new(Barrier::new(4));
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            // Use the provider's renewal budget: an unrelated parallel
+            // filesystem/helper test must not consume a one-second mock
+            // deadline before this helper can publish its replacement.
+            store.load_with_renewal_grace(StdDuration::from_secs(60))
+        }));
+    }
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    for result in results {
+        assert_eq!(result.unwrap().token(), "renewed");
+    }
+    assert_eq!(fs::read_to_string(count).unwrap(), "1");
+}
+
+#[test]
+fn concurrent_renewal_waiters_share_one_failed_helper_run() {
+    let temporary = tempfile::tempdir().unwrap();
+    let auth_home = temporary.path();
+    let path = auth_home.join("auth.json");
+    let helper = auth_home.join("bin/grok");
+    let count = auth_home.join("refresh-count");
+    fs::create_dir(auth_home.join("bin")).unwrap();
+    write_auth(&path, &record("expired", "2020-01-01T00:00:00Z"), 0o600);
+    write_helper(
+        &helper,
+        &format!(
+            "sleep 0.1\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nexit 7",
+            count.display(),
+            count.display(),
+            count.display(),
+        ),
+    );
+
+    let store = Arc::new(CredentialStore::new(path).unwrap());
+    let barrier = Arc::new(Barrier::new(4));
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            store.load_with_renewal_grace(StdDuration::from_secs(1))
+        }));
+    }
+    for worker in workers {
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(CredentialError::ExpiredSessionCredential)
+        ));
+    }
+    assert_eq!(fs::read_to_string(count).unwrap(), "1");
+}
+
+#[test]
+fn official_helper_is_not_attempted_for_non_expiry_errors() {
+    let current_record = record("current", "2099-01-01T00:00:00Z");
+    let cases = [
+        ("malformed", Some("not-json"), None),
+        ("current", Some(current_record.as_str()), Some("current")),
+    ];
+
+    for (name, contents, expected_token) in cases {
+        let temporary = tempfile::tempdir().unwrap();
+        let auth_home = temporary.path();
+        let path = auth_home.join("auth.json");
+        let helper = auth_home.join("bin/grok");
+        let marker = auth_home.join("attempted");
+        fs::create_dir(auth_home.join("bin")).unwrap();
+        write_helper(&helper, &format!("touch \"{}\"", marker.display()));
+        if let Some(contents) = contents {
+            write_auth(&path, contents, 0o600);
+        }
+
+        let result = CredentialStore::new(path)
+            .unwrap()
+            .load_with_renewal_grace(StdDuration::from_millis(1));
+        match expected_token {
+            Some(token) => assert_eq!(result.unwrap().token(), token, "{name}"),
+            None => assert!(result.is_err(), "{name}"),
+        }
+        assert!(!marker.exists(), "{name}");
+    }
+}
+
+#[test]
+fn ensure_launches_official_oauth_once_and_reloads_credential() {
+    let temporary = tempfile::tempdir().unwrap();
+    let auth_home = temporary.path();
+    let path = auth_home.join("auth.json");
+    let helper = auth_home.join("bin/grok");
+    let invocation = auth_home.join("invocation");
+    fs::create_dir(auth_home.join("bin")).unwrap();
+    write_helper(
+        &helper,
+        &format!(
+            "if [ \"$1\" = models ]; then exit 7; fi\nhelper_dir=$(dirname \"$0\")\nauth_path=\"$helper_dir/../auth.json\"\nprintf '%s %s' \"$1\" \"$2\" > \"{}\"\nprintf '%s' '{}' > \"$auth_path.tmp\"\nchmod 600 \"$auth_path.tmp\"\nmv \"$auth_path.tmp\" \"$auth_path\"",
+            invocation.display(),
+            record("renewed", "2099-01-01T00:00:00Z")
+        ),
+    );
+
+    let credential = CredentialStore::new(path)
+        .unwrap()
+        .ensure_with_official_login()
+        .unwrap();
+    assert_eq!(credential.token(), "renewed");
+    assert_eq!(fs::read_to_string(invocation).unwrap(), "login --oauth");
+}
+
+#[test]
+fn missing_credential_uses_silent_refresh_before_browser_login() {
+    let temporary = tempfile::tempdir().unwrap();
+    let auth_home = temporary.path();
+    let path = auth_home.join("auth.json");
+    let helper = auth_home.join("bin/grok");
+    let invocation = auth_home.join("invocation");
+    fs::create_dir(auth_home.join("bin")).unwrap();
+    write_helper(
+        &helper,
+        &format!(
+            "helper_dir=$(dirname \"$0\")\nauth_path=\"$helper_dir/../auth.json\"\nprintf '%s' \"$1\" > \"{}\"\nprintf '%s' '{}' > \"$auth_path.tmp\"\nchmod 600 \"$auth_path.tmp\"\nmv \"$auth_path.tmp\" \"$auth_path\"",
+            invocation.display(),
+            record("renewed", "2099-01-01T00:00:00Z")
+        ),
+    );
+
+    let credential = CredentialStore::new(path)
+        .unwrap()
+        .ensure_with_official_login()
+        .unwrap();
+    assert_eq!(credential.token(), "renewed");
+    assert_eq!(fs::read_to_string(invocation).unwrap(), "models");
+}
+
+#[test]
+fn ensure_does_not_launch_login_for_unsafe_or_malformed_auth() {
+    let cases = [("malformed", "not-json", 0o600), ("unsafe", "{}", 0o640)];
+    for (name, contents, mode) in cases {
+        let temporary = tempfile::tempdir().unwrap();
+        let auth_home = temporary.path();
+        let path = auth_home.join("auth.json");
+        let helper = auth_home.join("bin/grok");
+        let marker = auth_home.join("attempted");
+        fs::create_dir(auth_home.join("bin")).unwrap();
+        write_auth(&path, contents, mode);
+        write_helper(&helper, &format!("touch \"{}\"", marker.display()));
+
+        assert!(
+            CredentialStore::new(path)
+                .unwrap()
+                .ensure_with_official_login()
+                .is_err(),
+            "{name}"
+        );
+        assert!(!marker.exists(), "{name}");
+    }
+}
+
+#[test]
+fn official_helper_uses_only_tacetas_isolated_credential_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let auth_home = temporary.path().join("taceta");
+    let auth_path = auth_home.join("auth.json");
+    let helper = temporary.path().join("grok");
+    write_helper(
+        &helper,
+        &format!(
+            "if [ \"$1\" = models ]; then exit 7; fi\n\
+             printf '%s\\n%s\\n%s\\n' \"$GROK_HOME\" \"$GROK_AUTH_PATH\" \"${{GROK_AUTH+present}}\" > \"$GROK_HOME/invocation\"\n\
+             printf '%s' '{}' > \"$GROK_AUTH_PATH\"\n\
+             chmod 600 \"$GROK_AUTH_PATH\"",
+            record("isolated", "2099-01-01T00:00:00Z"),
+        ),
+    );
+    let store = CredentialStore::with_official_cli(auth_path.clone(), helper).unwrap();
+    let credential = store.ensure_with_official_login().unwrap();
+    assert_eq!(credential.token(), "isolated");
+    assert_eq!(credential.user_id(), "user-1");
+    assert_eq!(
+        fs::read_to_string(auth_home.join("invocation")).unwrap(),
+        format!("{}\n{}\n\n", auth_home.display(), auth_path.display()),
     );
     assert_eq!(
-        store.load().unwrap().unwrap().access_token,
-        "fixture-access-old"
+        fs::metadata(&auth_home).unwrap().permissions().mode() & 0o777,
+        0o700
     );
-    let old_epoch = manager.epoch();
+}
+
+#[test]
+fn normal_credential_access_never_starts_interactive_login() {
+    let temporary = tempfile::tempdir().unwrap();
+    let auth_path = temporary.path().join("auth.json");
+    let helper = temporary.path().join("grok");
+    let invocation = temporary.path().join("invocation");
+    write_helper(
+        &helper,
+        "printf '%s' \"$1\" >> \"$GROK_HOME/invocation\"\nexit 7",
+    );
+    let store = CredentialStore::with_official_cli(auth_path, helper).unwrap();
+    assert!(matches!(
+        store.load_with_renewal_grace(StdDuration::from_millis(300)),
+        Err(CredentialError::ReadAuth(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert_eq!(fs::read_to_string(invocation).unwrap(), "models");
+}
+
+#[tokio::test]
+async fn signout_stops_pending_login_and_reacquires_without_the_old_cache() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("auth.json");
+    let helper = temporary.path().join("grok");
+    let started = temporary.path().join("started");
+    write_helper(
+        &helper,
+        "if [ \"$1\" = models ]; then exit 7; fi\nprintf started > \"$GROK_HOME/started\"\nwhile :; do sleep 0.05; done",
+    );
+    let manager = Arc::new(AuthManager::with_store(
+        CredentialStore::with_official_cli(path.clone(), helper.clone()).unwrap(),
+    ));
+    let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let worker = Arc::clone(&manager);
+    let pending = tokio::spawn(async move { worker.sign_in(events).await });
+    tokio::time::timeout(StdDuration::from_secs(3), async {
+        while !started.exists() {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let epoch = manager.epoch();
     manager.sign_out().unwrap();
-    let late = Credentials {
-        access_token: "late".into(),
-        refresh_token: None,
-        expires_at: None,
-        user_id: None,
-        principal_type: None,
-        principal_id: None,
-    };
-    assert!(manager.save_if_current(&late, old_epoch, false).is_err());
+    assert!(manager.epoch() > epoch);
+    assert!(pending.await.unwrap().is_err());
     assert!(!manager.is_signed_in().unwrap());
-    assert_eq!(store.deletes.load(Ordering::SeqCst), 1);
+    assert!(!path.exists());
+
+    for token in ["first-login", "fresh-login"] {
+        write_helper(
+            &helper,
+            &format!(
+                "if [ \"$1\" = models ]; then exit 7; fi\nprintf '%s' '{}' > \"$GROK_AUTH_PATH\"\nchmod 600 \"$GROK_AUTH_PATH\"",
+                record(token, "2099-01-01T00:00:00Z"),
+            ),
+        );
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        manager.sign_in(events).await.unwrap();
+        assert!(manager.is_signed_in().unwrap());
+        assert_eq!(manager.session_credential().await.unwrap().token(), token);
+        manager.sign_out().unwrap();
+        assert!(!manager.is_signed_in().unwrap());
+        assert!(!path.exists());
+    }
+}
+
+#[tokio::test]
+async fn dropping_login_cancels_its_official_helper() {
+    let temporary = tempfile::tempdir().unwrap();
+    let helper = temporary.path().join("grok");
+    let started = temporary.path().join("started");
+    write_helper(
+        &helper,
+        "if [ \"$1\" = models ]; then exit 7; fi\nprintf started > \"$GROK_HOME/started\"\nwhile :; do sleep 0.05; done",
+    );
+    let manager = Arc::new(AuthManager::with_store(
+        CredentialStore::with_official_cli(temporary.path().join("auth.json"), helper).unwrap(),
+    ));
+    let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let worker = Arc::clone(&manager);
+    let pending = tokio::spawn(async move { worker.sign_in(events).await });
+    tokio::time::timeout(StdDuration::from_secs(3), async {
+        while !started.exists() {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let epoch = manager.epoch();
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    assert!(manager.epoch() > epoch);
+    assert!(manager.store().unwrap().helper.lock().unwrap().is_none());
+    assert!(!manager.is_signed_in().unwrap());
 }

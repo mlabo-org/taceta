@@ -879,6 +879,14 @@ impl TacetaApp {
         event: GenerationEvent,
     ) {
         match event {
+            GenerationEvent::ModelIdentity { requested_model, reported_model } => {
+                self.update_assistant(conversation_id, assistant_id, |message| {
+                    message.model_identity = Some(taceta::domain::ModelIdentity {
+                        requested_model,
+                        reported_model,
+                    });
+                });
+            }
             GenerationEvent::ThinkingDelta(delta) => {
                 self.update_assistant(conversation_id, assistant_id, |message| {
                     message.thinking.push_str(&delta);
@@ -2961,6 +2969,22 @@ impl TacetaApp {
                         });
                     }
                     Role::Assistant => {
+                        if let Some(identity) = &message.model_identity {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(format!(
+                                    "{}: {}",
+                                    text(language, "指定", "Requested"),
+                                    identity.requested_model,
+                                )).small().weak());
+                                ui.label(RichText::new(format!(
+                                    "{}: {}",
+                                    text(language, "応答モデル", "Response model"),
+                                    identity.reported_model.as_deref().unwrap_or_else(||
+                                        text(language, "サーバーから通知なし", "Not reported by server")),
+                                )).small().weak());
+                            });
+                            ui.add_space(5.0);
+                        }
                         if self.state.show_thinking_trace && !message.thinking.is_empty() {
                             theme::card(palette.thinking, palette.border, 10, 12).show(ui, |ui| {
                                 ui.label(
@@ -4388,6 +4412,72 @@ mod model_manager_tests {
             "Test answer"
         );
         assert!(app.state.draft.is_empty());
+    }
+
+    #[test]
+    fn model_switch_sends_each_selection_and_persists_each_response_identity() {
+        struct ModelRouteRecorder {
+            requests: Arc<Mutex<Vec<ChatRequest>>>,
+        }
+        impl InferenceBackend for ModelRouteRecorder {
+            fn list_models(&self) -> BackendFuture<Vec<ModelDescriptor>> {
+                Box::pin(async { Ok(vec![model("grok-4.5"), model("grok-4.6")]) })
+            }
+
+            fn stream_chat(
+                &self,
+                request: ChatRequest,
+                events: mpsc::UnboundedSender<GenerationEvent>,
+            ) -> BackendFuture<()> {
+                let requests = Arc::clone(&self.requests);
+                Box::pin(async move {
+                    let requested_model = request.model.clone();
+                    requests.lock().unwrap().push(request);
+                    events.send(GenerationEvent::ModelIdentity {
+                        reported_model: Some(format!("{requested_model}-build")),
+                        requested_model,
+                    }).unwrap();
+                    events.send(GenerationEvent::ContentDelta("Recorded answer".into())).unwrap();
+                    Ok(())
+                })
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        app.backend = Arc::new(ModelRouteRecorder { requests: Arc::clone(&requests) });
+        app.state.inference_provider = InferenceProvider::Grok;
+        app.models = vec![model("grok-4.5"), model("grok-4.6")];
+        let conversation_id = app.state.active_conversation().id;
+        for selected in ["grok-4.5", "grok-4.6"] {
+            app.state.selected_model = Some(selected.into());
+            app.state.draft = "Describe yourself briefly.".into();
+            app.start_generation();
+            wait_until(|| {
+                app.drain_background_work();
+                app.generation.is_none()
+            });
+        }
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.iter().map(|request| request.model.as_str()).collect::<Vec<_>>(),
+            ["grok-4.5", "grok-4.6"]);
+        assert_eq!(requests[0].messages.len(), 1);
+        assert_eq!(requests[1].messages.len(), 3);
+        assert_eq!(requests[1].messages[1].content, "Recorded answer");
+        assert!(requests.iter().all(|request| request.messages.iter()
+            .all(|message| message.role != Role::System)));
+
+        let restored: PersistedAppState = serde_json::from_str(
+            &serde_json::to_string(&app.state).unwrap()).unwrap();
+        assert_eq!(restored.active_conversation().id, conversation_id);
+        let identities = restored.active_conversation().messages.iter()
+            .filter_map(|message| message.model_identity.as_ref()).collect::<Vec<_>>();
+        assert_eq!(identities.len(), 2);
+        assert_eq!(identities[0].requested_model, "grok-4.5");
+        assert_eq!(identities[0].reported_model.as_deref(), Some("grok-4.5-build"));
+        assert_eq!(identities[1].requested_model, "grok-4.6");
+        assert_eq!(identities[1].reported_model.as_deref(), Some("grok-4.6-build"));
     }
 
     #[test]
