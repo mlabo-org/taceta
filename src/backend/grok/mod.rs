@@ -35,6 +35,14 @@ use metadata::{ApiKind, ModelInfo, parse_models};
 use responses::OutputDelta;
 
 const OAUTH_API_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
+// The OAuth proxy gates compatibility using the reference client's release
+// version, separately from the origin application's identity. This adapter
+// implements the wire contract inspected at xai-org/grok-build commit
+// 37949780c144e37df692e3d669051a21fec24f20; its
+// crates/codegen/xai-grok-version/Cargo.toml declares version 1.0.24.
+// Keep this tied to the implemented reference contract, not a fetched latest
+// release. Taceta's own version remains in its User-Agent.
+const GROK_BUILD_COMPATIBILITY_VERSION: &str = "1.0.24";
 const CANCELLED: &str = "Grok generation was cancelled.";
 
 pub enum GrokLoginEvent {
@@ -138,6 +146,7 @@ impl GrokClient {
             .header("X-XAI-Token-Auth", "xai-grok-cli")
             .header("x-authenticateresponse", "authenticate-response")
             .header("x-grok-client-identifier", "taceta")
+            .header("x-grok-client-version", GROK_BUILD_COMPATIBILITY_VERSION)
             .header("x-grok-client-mode", "interactive")
             .header("x-grok-session-id", &self.inner.session)
             .header("x-grok-conv-id", &self.inner.session)
@@ -147,9 +156,6 @@ impl GrokClient {
                 "x-grok-turn-idx",
                 self.inner.turn.fetch_add(1, Ordering::Relaxed).to_string(),
             );
-        // x-grok-client-version denotes Grok CLI's installed build version in
-        // the public source. Taceta does not claim that unrelated version. A
-        // proxy that requires it returns a visible connection rejection.
         if let Some(model) = model {
             request = request.header("x-grok-model-override", model);
         }
@@ -542,7 +548,7 @@ fn reject_status(status: reqwest::StatusCode) -> Result<(), String> {
     Err(match status.as_u16() {
         401 => "Grok rejected Taceta's credential. Connect to Grok again.".into(),
         403 => "Grok did not allow this account or public OAuth client to use the requested service.".into(),
-        426 => "Grok rejected this client's compatibility version. Taceta cannot use the service with the current public contract.".into(),
+        426 => "Grok returned HTTP 426 (Upgrade Required). The proxy requires a supported client compatibility version.".into(),
         429 => "Grok's usage limit was reached. Retry after your account's limit resets.".into(),
         code => format!("The Grok service rejected the request (HTTP {code})."),
     })
