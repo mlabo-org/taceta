@@ -82,6 +82,13 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub(super) async fn start(replies: Vec<Reply>) -> Self {
+        Self::start_with_required_version(replies, None).await
+    }
+
+    async fn start_with_required_version(
+        replies: Vec<Reply>,
+        required_version: Option<&'static str>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (tx, requests) = mpsc::unbounded_channel();
@@ -122,6 +129,18 @@ impl Fixture {
                     assert!(size > 0, "fixture request closed before body");
                     bytes.extend_from_slice(&chunk[..size]);
                 }
+                let reply = if matches!(path.as_str(), "/v1/responses" | "/v1/chat/completions")
+                    && required_version.is_some_and(|version| {
+                        headers.get("x-grok-client-version").map(String::as_str) != Some(version)
+                    }) {
+                    Reply {
+                        status: "426 Upgrade Required",
+                        content_type: "application/json",
+                        body: br#"{"error":{"code":"unsupported_client_version"}}"#.to_vec(),
+                    }
+                } else {
+                    reply
+                };
                 tx.send(RecordedRequest {
                     path,
                     headers,
@@ -336,11 +355,14 @@ async fn failed_truncated_and_cancelled_streams_never_return_tools() {
 #[tokio::test]
 async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract() {
     let call = json!({"type": "function_call", "id": "item", "call_id": "read-1", "name": "read_file", "arguments": "{\"path\":\"README.md\"}"});
-    let mut fixture = Fixture::start(vec![
+    // Required reference version comes from Grok Build 37949780's published
+    // xai-grok-version package, independently of Taceta's package version.
+    let mut fixture = Fixture::start_with_required_version(vec![
+        Reply::json(json!({})),
         Reply::json(json!({"data": [{"id": "account-current", "apiBackend": "responses", "contextWindow": 131072}]})),
         Reply { status: "200 OK", content_type: "text/event-stream", body: event(completed("", vec![call])) },
         Reply { status: "200 OK", content_type: "text/event-stream", body: event(completed("The file says hello.", Vec::new())) },
-    ]).await;
+    ], Some("1.0.24")).await;
     let store = Arc::new(MemoryStore::default());
     saved_token(&store, false);
     let client = GrokClient::configured(
@@ -356,6 +378,23 @@ async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract
         0,
         "constructor must not access credentials"
     );
+    // Reproduce the omitted-header request using the same authenticated POST
+    // builder as inference, with fixture credentials only.
+    let mut omitted_version = client
+        .request(reqwest::Method::POST, "/responses", Some("account-current"))
+        .await
+        .unwrap()
+        .json(&json!({"model": "account-current", "input": [], "stream": true, "store": false}))
+        .build()
+        .unwrap();
+    omitted_version
+        .headers_mut()
+        .remove("x-grok-client-version");
+    let rejected = client.inner.http.execute(omitted_version).await.unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::UPGRADE_REQUIRED);
+    let explanation = reject_status(rejected.status()).unwrap_err();
+    assert!(explanation.contains("HTTP 426"));
+    assert!(!explanation.contains("cannot use"));
     let models = client.list_models().await.unwrap();
     assert_eq!(models[0].name, "account-current");
     let tool = ToolDefinition {
@@ -401,6 +440,13 @@ async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract
         .unwrap();
     assert_eq!(final_turn.content, "The file says hello.");
     fixture.task.await.unwrap();
+    let rejected_request = fixture.requests.recv().await.unwrap();
+    assert_eq!(rejected_request.path, "/v1/responses");
+    assert!(
+        !rejected_request
+            .headers
+            .contains_key("x-grok-client-version")
+    );
     let models_request = fixture.requests.recv().await.unwrap();
     let first = fixture.requests.recv().await.unwrap();
     let second = fixture.requests.recv().await.unwrap();
@@ -413,7 +459,8 @@ async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract
         first.headers["user-agent"],
         concat!("Taceta/", env!("CARGO_PKG_VERSION"))
     );
-    assert!(!first.headers.contains_key("x-grok-client-version"));
+    assert_eq!(first.headers["x-grok-client-version"], "1.0.24");
+    assert_eq!(second.headers["x-grok-client-version"], "1.0.24");
     assert_ne!(
         first.headers["x-grok-req-id"],
         second.headers["x-grok-req-id"]

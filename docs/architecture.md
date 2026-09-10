@@ -24,6 +24,8 @@ Web ON + Send は現在入力のローカル判定を許可し、検索が必要
 
 `backend/grok` は、公開Grok Build方式のOAuth認証、Taceta専用キーチェーン、トークン更新、モデル一覧、ストリーミング推論を所有します。ログインは設定画面から明示的に開始し、PKCE、state、一時的なloopback callbackを使用します。モデル一覧の通信形式に従いChat CompletionsまたはResponsesを使い、失敗時に別のサービスへ切り替えません。公開client IDのTacetaでの受理とアカウントの利用権は、実サービスでの確認が必要です。Grokを選択した送信はクラウド推論であり、会話と必要な作業内容をxAIへ送ります。
 
+OAuth proxyの互換性チェックには、実装の参照元であるGrok Build `1.0.24` を `x-grok-client-version` として送ります。この値は[参照commitの版定義](https://github.com/xai-org/grok-build/blob/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-version/Cargo.toml)に対応し、[公開samplerが送るヘッダー](https://github.com/xai-org/grok-build/blob/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-sampler/src/client.rs#L554-L608)に合わせています。TacetaのUser-Agentとclient identifierはTaceta自身を示します。互換性値はソース内で固定し、通信契約の対応なしに最新リリースへ追随させません。HTTP 426の表示は互換性更新の要求を伝え、Tacetaの利用禁止やアカウント拒否とは判定しません。
+
 `agent` がTaceta自身の作業実行を所有し、`AgentModel` を介してOllamaまたはGrokへ接続します。UIは作業フォルダー、モデル、指示、上限を渡し、進捗・承認要求・保存済み状態を表示します。ファイル読み取り、編集、検索、コマンド実行は作業フォルダーに束縛され、編集とコマンドには個別の承認が必要です。コマンドの書き込み先は作業フォルダーと専用一時領域に限り、ネットワークは許可しません。停止・時間上限・アプリ終了では子プロセスも終了します。Taceta Linkと外部CLIはこの実行経路を所有しません。
 
 ## コンパクションと再開
@@ -61,6 +63,8 @@ The app detects the macOS default browser and supports Brave and Chrome initiall
 ## Grok connection and Agent execution
 
 `backend/grok` owns the public Grok Build OAuth flow, Taceta-only Keychain storage, token refresh, model discovery and streaming inference. Sign-in starts explicitly in Settings and uses PKCE, state and a temporary loopback callback. Model metadata selects Chat Completions or Responses; failures do not select another service. Taceta acceptance of the public client ID and account eligibility require live service confirmation. Sending with Grok selected uses cloud inference and sends conversation and required task content to xAI.
+
+For the OAuth proxy's compatibility check, requests send `x-grok-client-version: 1.0.24`, the Grok Build release used as this adapter's implementation reference. This follows the [reference commit's version declaration](https://github.com/xai-org/grok-build/blob/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-version/Cargo.toml) and [public sampler header](https://github.com/xai-org/grok-build/blob/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-sampler/src/client.rs#L554-L608). User-Agent and client identifier identify Taceta itself. The compatibility value stays pinned in source and does not follow release updates without corresponding protocol support. HTTP 426 reports a compatibility upgrade requirement; it does not establish that Taceta or the account is prohibited.
 
 `agent` owns task execution within Taceta and connects to Ollama or Grok through `AgentModel`. The UI supplies workspace, model, instructions and limits, and displays progress, approval requests and saved state. Reads, edits, search and commands are bound to the chosen workspace. Each edit and command requires its own approval. Commands may write only to that workspace and their scratch area, with networking denied. Cancellation, time limits and app shutdown terminate child processes. Taceta Link and external CLIs do not own this execution path.
 
