@@ -39,6 +39,8 @@ install -m 0755 "$HOST_BINARY" "$MACOS_DIR/taceta-link-host"
 mkdir -p "$RESOURCES_DIR/TacetaLink"
 cp -R browser-extension/. "$RESOURCES_DIR/TacetaLink/"
 install -m 0644 "$ICON_SOURCE" "$RESOURCES_DIR/Taceta.icns"
+mkdir -p "$RESOURCES_DIR/Licenses"
+install -m 0644 "$REPO_ROOT/docs/licenses/grok-codex-bridge-MIT.txt" "$RESOURCES_DIR/Licenses/grok-codex-bridge-MIT.txt"
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

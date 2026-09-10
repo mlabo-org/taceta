@@ -165,8 +165,8 @@ impl TacetaApp {
             }
         });
         ui.label(RichText::new(text(language,
-            "公開されたGrok BuildのOAuth方式を利用する非公式の接続です。認証情報はTaceta専用のmacOSキーチェーンに保存します。",
-            "An unofficial connection using Grok Build's public OAuth flow. Credentials are kept in Taceta's own macOS Keychain entry.")).small().weak());
+            "認証には公式Grok CLIを使います。認証情報はこのMacのTaceta専用フォルダーに保存します。",
+            "Authentication uses the official Grok CLI. Credentials are stored in Taceta's own folder on this Mac.")).small().weak());
         ui.add_space(20.0);
     }
 

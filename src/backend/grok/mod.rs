@@ -1,51 +1,36 @@
-//! Independent Grok OAuth and Responses transport. Conversation state and all
-//! tool execution remain owned by Taceta; no Grok CLI process is launched.
+//! Taceta's domain adapter around the MIT grok-codex-bridge connection source.
+//! OAuth belongs to the official Grok CLI; inference and tool execution stay in Taceta.
+mod adapter;
 mod auth;
-mod completions;
-mod metadata;
-mod responses;
+mod catalog;
+mod protocol;
+mod transport;
 
 use crate::{
-    agent::{
-        AgentMessage, AgentModel, AgentRequest, AgentRole, AgentTurn, ModelDelta, ToolDefinition,
-    },
+    agent::{AgentModel, AgentRequest, AgentTurn, ModelDelta},
     backend::{BackendError, BackendFuture, InferenceBackend},
-    domain::{
-        AttachmentPayload, ChatRequest, GenerationEvent, GenerationStats, ModelDescriptor, Role,
-        ThinkingMode,
-    },
+    domain::{ChatRequest, GenerationEvent, GenerationStats, ModelDescriptor},
 };
-use futures_util::StreamExt;
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
-    pin::Pin,
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
-};
+use adapter::{ModelInfo, OutputDelta};
+use auth::AuthManager;
+use futures_util::{Stream, StreamExt, stream};
+use protocol::{NormalizedResponsesRequest, TextStreamEventKind, ValidatedTextStreamEvent};
+use std::{future::Future, pin::Pin, sync::{Arc, RwLock}, time::{Duration, Instant}};
 use tokio::sync::mpsc::UnboundedSender;
-use uuid::Uuid;
+use transport::{GrokError, ResponsesTransportRequest};
 
-use auth::{AuthEndpoints, AuthManager, CredentialStore, KeychainStore};
-use metadata::{ApiKind, ModelInfo, parse_models};
-use responses::OutputDelta;
-
-const OAUTH_API_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
-// The OAuth proxy gates compatibility using the reference client's release
-// version, separately from the origin application's identity. This adapter
-// implements the wire contract inspected at xai-org/grok-build commit
-// 37949780c144e37df692e3d669051a21fec24f20; its
-// crates/codegen/xai-grok-version/Cargo.toml declares version 1.0.24.
-// Keep this tied to the implemented reference contract, not a fetched latest
-// release. Taceta's own version remains in its User-Agent.
-const GROK_BUILD_COMPATIBILITY_VERSION: &str = "1.0.24";
-// Reused from the working MIT grok-codex-bridge transport. These identify the
-// proxy protocol; Taceta keeps its own product identity in User-Agent and UI.
-const PROXY_CLIENT_IDENTIFIER: &str = "grok-shell";
-const PROXY_CLIENT_MODE: &str = "headless";
 const CANCELLED: &str = "Grok generation was cancelled.";
+// Copied from grok-codex-bridge src/server.rs. Retries end before any useful
+// downstream output; the prepared body and all routing identities stay fixed.
+const EARLY_STREAM_RETRY_LIMIT: usize = 3;
+const EARLY_STREAM_RETRY_BACKOFF: [Duration; EARLY_STREAM_RETRY_LIMIT] = [
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+];
+const EARLY_STREAM_RETRY_WALL_CLOCK: Duration = Duration::from_secs(60);
+
+type TextEvents = Pin<Box<dyn Stream<Item = Result<ValidatedTextStreamEvent, GrokError>> + Send>>;
 
 pub enum GrokLoginEvent {
     OpenBrowser(String),
@@ -58,310 +43,127 @@ pub struct GrokClient {
 }
 
 struct Inner {
-    http: reqwest::Client,
+    transport: transport::GrokClient,
     auth: AuthManager,
-    api_base: String,
-    models: RwLock<HashMap<String, ModelInfo>>,
+    models: RwLock<Vec<ModelInfo>>,
 }
 
 impl Default for GrokClient {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl GrokClient {
     /// Construction never reads credentials, starts login, or sends a request.
     pub fn new() -> Self {
-        Self::configured(
-            AuthEndpoints::default(),
-            OAUTH_API_BASE.into(),
-            Arc::new(KeychainStore),
-        )
-    }
-
-    fn configured(
-        endpoints: AuthEndpoints,
-        api_base: String,
-        store: Arc<dyn CredentialStore>,
-    ) -> Self {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(15))
-            .read_timeout(Duration::from_secs(120))
-            .user_agent(concat!("Taceta/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("Taceta's HTTP client configuration is valid");
         Self {
             inner: Arc::new(Inner {
-                auth: AuthManager::new(http.clone(), endpoints, store),
-                http,
-                api_base,
-                models: RwLock::new(HashMap::new()),
+                transport: transport::GrokClient::production()
+                    .expect("the static Grok HTTP client configuration is valid"),
+                auth: AuthManager::new(),
+                models: RwLock::new(Vec::new()),
             }),
         }
     }
 
     pub async fn sign_in(&self, events: UnboundedSender<GrokLoginEvent>) -> Result<(), String> {
         self.inner.auth.sign_in(events).await?;
-        self.inner
-            .models
-            .write()
-            .map_err(|_| "Grok model access failed.")?
-            .clear();
-        Ok(())
+        self.clear_models()
     }
 
-    /// Removes only Taceta's own Keychain item; it does not revoke another
-    /// application's grant or access a browser's session.
     pub fn sign_out(&self) -> Result<(), String> {
         self.inner.auth.sign_out()?;
-        self.inner
-            .models
-            .write()
-            .map_err(|_| "Grok model access failed.")?
-            .clear();
+        self.clear_models()
+    }
+
+    pub fn is_signed_in(&self) -> Result<bool, String> { self.inner.auth.is_signed_in() }
+
+    fn clear_models(&self) -> Result<(), String> {
+        self.inner.models.write().map_err(|_| "Grok model access failed.")?.clear();
         Ok(())
-    }
-
-    pub fn is_signed_in(&self) -> Result<bool, String> {
-        self.inner.auth.is_signed_in()
-    }
-
-    async fn request(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        model: Option<&str>,
-    ) -> Result<reqwest::RequestBuilder, String> {
-        let credential = self.inner.auth.session_credential().await?;
-        let mut request = self.authenticated(
-            self.inner
-                .http
-                .request(method, format!("{}{path}", self.inner.api_base)),
-            &credential,
-        );
-        if let Some(model) = model {
-            request = request.header("x-grok-model-override", model);
-        }
-        Ok(request)
-    }
-
-    fn authenticated(
-        &self,
-        builder: reqwest::RequestBuilder,
-        credential: &auth::SessionCredential,
-    ) -> reqwest::RequestBuilder {
-        builder
-            .bearer_auth(credential.token())
-            .header("X-XAI-Token-Auth", "xai-grok-cli")
-            .header("x-authenticateresponse", "authenticate-response")
-            .header("x-userid", credential.user_id())
-            .header("x-grok-user-id", credential.user_id())
-            .header("x-grok-client-mode", PROXY_CLIENT_MODE)
-            .header("x-grok-client-identifier", PROXY_CLIENT_IDENTIFIER)
-            .header("x-grok-client-version", GROK_BUILD_COMPATIBILITY_VERSION)
     }
 
     async fn fetch_models(&self) -> Result<Vec<ModelDescriptor>, String> {
         let epoch = self.inner.auth.epoch();
-        let response = self
-            .request(reqwest::Method::GET, "/models", None)
-            .await?
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await
-            .map_err(|_| "Unable to contact the Grok model service.".to_string())?;
-        reject_status(response.status())?;
-        let bytes = read_bounded(response, 2 * 1024 * 1024).await?;
-        let value: Value =
-            serde_json::from_slice(&bytes).map_err(|_| "Grok returned an invalid model list.")?;
-        let models = parse_models(&value)?;
-        let descriptors = models
-            .iter()
-            .map(|model| model.descriptor.clone())
-            .collect();
-        let mut cache = self
-            .inner
-            .models
-            .write()
-            .map_err(|_| "Grok model access failed.")?;
+        let credential = self.inner.auth.session_credential().await?;
+        let fetched = self.inner.transport.fetch_models(&credential).await.map_err(|e| e.to_string())?;
+        let models = fetched.models.into_iter().zip(fetched.entries)
+            .map(|(id, entry)| ModelInfo::from_admitted(id, &entry)).collect::<Vec<_>>();
+        let descriptors = models.iter().map(|model| model.descriptor.clone()).collect();
+        let mut cached = self.inner.models.write().map_err(|_| "Grok model access failed.")?;
         if epoch != self.inner.auth.epoch() {
             return Err("Grok connection changed while models were loading.".into());
         }
-        *cache = models
-            .into_iter()
-            .map(|model| (model.descriptor.name.clone(), model))
-            .collect();
+        *cached = models;
         Ok(descriptors)
     }
 
     async fn model(&self, name: &str) -> Result<ModelInfo, String> {
-        let cached = self
-            .inner
-            .models
-            .read()
-            .map_err(|_| "Grok model access failed.")?
-            .get(name)
-            .cloned();
-        if let Some(model) = cached {
-            return Ok(model);
-        }
+        let cached = self.inner.models.read().map_err(|_| "Grok model access failed.")?
+            .iter().find(|model| model.descriptor.name == name).cloned();
+        if let Some(model) = cached { return Ok(model); }
         self.fetch_models().await?;
-        self.inner.models.read().map_err(|_| "Grok model access failed.")?.get(name).cloned()
+        self.inner.models.read().map_err(|_| "Grok model access failed.")?
+            .iter().find(|model| model.descriptor.name == name).cloned()
             .ok_or_else(|| "The selected model is not in this account's Grok inference catalog. Refresh the model list.".into())
     }
 
-    async fn response(
-        &self,
-        body: Value,
-        model: &str,
-        api: ApiKind,
-    ) -> Result<reqwest::Response, String> {
-        let conversation_id = request_conversation_id(&body);
-        let response = self
-            .request(reqwest::Method::POST, api.path(), Some(model))
-            .await?
-            .header("Accept", "text/event-stream")
-            .header("x-grok-conv-id", conversation_id.to_string())
-            .header("x-grok-session-id", conversation_id.to_string())
-            .header("x-grok-req-id", Uuid::new_v4().to_string())
-            .header("x-grok-agent-id", Uuid::new_v4().to_string())
-            // Like the bridge, Taceta sends the complete input history. Each
-            // request is the first wire turn, not a server-side continuation.
-            .header("x-grok-turn-idx", "1")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| "Unable to start a response from the Grok service.".to_string())?;
-        reject_status(response.status())?;
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !content_type
-            .split(';')
-            .next()
-            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream"))
-        {
-            return Err("Grok did not return the requested inference event stream.".into());
-        }
-        Ok(response)
+    async fn response(&self, request: &NormalizedResponsesRequest) -> Result<TextEvents, String> {
+        let credential = self.inner.auth.session_credential().await?;
+        start_responses(&self.inner.transport, credential, request).await
     }
 
-    async fn agent_turn(
-        &self,
-        request: AgentRequest,
-        events: UnboundedSender<ModelDelta>,
-    ) -> Result<AgentTurn, String> {
+    async fn chat(&self, request: ChatRequest, events: UnboundedSender<GenerationEvent>) -> Result<(), String> {
+        let work = async {
+            if request.web_search_provider.is_some() || request.web_authorization.is_some()
+                || request.tools.as_ref().is_some_and(|tools| !tools.is_null() && !tools.as_array().is_some_and(Vec::is_empty)) {
+                return Err("Web search is not available in Grok chat. Use Taceta's agent tools through the explicit agent workflow.".into());
+            }
+            let model = self.model(&request.model).await?;
+            let input = adapter::chat_input(&request, model.descriptor.vision)?;
+            let normalized = adapter::request(&model, input, &[], request.thinking)?;
+            let started = Instant::now();
+            let upstream = self.response(&normalized).await?;
+            events.send(GenerationEvent::ModelIdentity {
+                requested_model: request.model.clone(), reported_model: None,
+            }).map_err(|_| CANCELLED.to_string())?;
+            let result = adapter::consume(upstream, &[], |delta| {
+                let event = match delta {
+                    OutputDelta::Content(text) => GenerationEvent::ContentDelta(text),
+                    OutputDelta::Thinking(text) => GenerationEvent::ThinkingDelta(text),
+                    OutputDelta::ReportedModel(model) => GenerationEvent::ModelIdentity {
+                        requested_model: request.model.clone(), reported_model: Some(model),
+                    },
+                };
+                events.send(event).map_err(|_| CANCELLED.to_string())
+            }).await?;
+            events.send(GenerationEvent::ReplaceContent(result.content))
+                .map_err(|_| CANCELLED.to_string())?;
+            events.send(GenerationEvent::Completed(GenerationStats {
+                prompt_tokens: result.prompt_tokens,
+                completion_tokens: result.completion_tokens,
+                total_duration_ns: u64::try_from(started.elapsed().as_nanos()).ok(),
+            })).map_err(|_| CANCELLED.to_string())
+        };
+        tokio::select! { _ = events.closed() => Err(CANCELLED.into()), result = work => result }
+    }
+
+    async fn agent_turn(&self, request: AgentRequest, events: UnboundedSender<ModelDelta>) -> Result<AgentTurn, String> {
         let work = async {
             let model = self.model(&request.model).await?;
             if !request.tools.is_empty() && !model.descriptor.tools {
                 return Err("The selected Grok model does not support function tools.".into());
             }
-            let input = match model.api {
-                ApiKind::Responses => responses::agent_input(&request.messages)?,
-                ApiKind::ChatCompletions => completions::agent_input(&request.messages)?,
-            };
-            let body = payload(
-                &request.model,
-                &model,
-                input,
-                &request.tools,
-                request.thinking,
-                request.context_length,
-            )?;
-            let response = self.response(body, &request.model, model.api).await?;
-            let allowed: std::collections::HashSet<_> = request
-                .tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect();
-            let (result, _) = consume(model.api, response, |delta| {
-                events
-                    .send(match delta {
-                        OutputDelta::Content(text) => ModelDelta::Content(text),
-                        OutputDelta::Thinking(text) => ModelDelta::Thinking(text),
-                    })
-                    .map_err(|_| CANCELLED.to_string())
-            })
-            .await?;
-            if result
-                .tool_calls
-                .iter()
-                .any(|call| !allowed.contains(call.name.as_str()))
-            {
-                return Err("Grok requested a function that Taceta did not offer. No pending tools were executed.".into());
-            }
-            Ok(result)
-        };
-        tokio::select! { _ = events.closed() => Err(CANCELLED.into()), result = work => result }
-    }
-
-    async fn chat(
-        &self,
-        request: ChatRequest,
-        events: UnboundedSender<GenerationEvent>,
-    ) -> Result<(), String> {
-        let work = async {
-            if request.web_search_provider.is_some()
-                || request.web_authorization.is_some()
-                || request.tools.as_ref().is_some_and(|tools| {
-                    !tools.is_null() && !tools.as_array().is_some_and(Vec::is_empty)
-                })
-            {
-                return Err("Web search is not available in Grok chat. Use Taceta's agent tools through the explicit agent workflow.".into());
-            }
-            let model = self.model(&request.model).await?;
-            let input = chat_input(&request, model.descriptor.vision, model.api)?;
-            let body = payload(
-                &request.model,
-                &model,
-                input,
-                &[],
-                request.thinking,
-                request.context_length,
-            )?;
-            let started = Instant::now();
-            let response = self.response(body, &request.model, model.api).await?;
-            let endpoint = format!(
-                "{}{}",
-                response.url().origin().ascii_serialization(),
-                response.url().path()
-            );
-            let (result, reported_model) = consume(model.api, response, |delta| {
-                events
-                    .send(match delta {
-                        OutputDelta::Content(text) => GenerationEvent::ContentDelta(text),
-                        OutputDelta::Thinking(text) => GenerationEvent::ThinkingDelta(text),
-                    })
-                    .map_err(|_| CANCELLED.to_string())
-            })
-            .await?;
-            if !result.tool_calls.is_empty() {
-                return Err(
-                    "Grok returned function calls in a chat that did not offer tools.".into(),
-                );
-            }
-            if std::env::var("TACETA_GROK_CONNECTION_TRACE").as_deref() == Ok("1") {
-                eprintln!(
-                    "taceta_grok_connection {}",
-                    json!({
-                        "endpoint": endpoint,
-                        "requested_model": request.model,
-                        "reported_model": reported_model,
-                        "user_id_headers_set": true,
-                    })
-                );
-            }
-            events
-                .send(GenerationEvent::Completed(GenerationStats {
-                    prompt_tokens: result.prompt_tokens,
-                    completion_tokens: result.completion_tokens,
-                    total_duration_ns: u64::try_from(started.elapsed().as_nanos()).ok(),
-                }))
-                .map_err(|_| CANCELLED.to_string())
+            let input = adapter::agent_input(&request.messages)?;
+            let normalized = adapter::request(&model, input, &request.tools, request.thinking)?;
+            let upstream = self.response(&normalized).await?;
+            adapter::consume(upstream, &request.tools, |delta| {
+                let delta = match delta {
+                    OutputDelta::Content(text) => ModelDelta::Content(text),
+                    OutputDelta::Thinking(text) => ModelDelta::Thinking(text),
+                    OutputDelta::ReportedModel(_) => return Ok(()),
+                };
+                events.send(delta).map_err(|_| CANCELLED.to_string())
+            }).await
         };
         tokio::select! { _ = events.closed() => Err(CANCELLED.into()), result = work => result }
     }
@@ -372,274 +174,96 @@ impl InferenceBackend for GrokClient {
         let client = self.clone();
         Box::pin(async move { client.fetch_models().await.map_err(BackendError::Grok) })
     }
-
-    fn stream_chat(
-        &self,
-        request: ChatRequest,
-        events: UnboundedSender<GenerationEvent>,
-    ) -> BackendFuture<()> {
+    fn stream_chat(&self, request: ChatRequest, events: UnboundedSender<GenerationEvent>) -> BackendFuture<()> {
         let client = self.clone();
-        Box::pin(async move {
-            client
-                .chat(request, events)
-                .await
-                .map_err(BackendError::Grok)
-        })
+        Box::pin(async move { client.chat(request, events).await.map_err(BackendError::Grok) })
     }
 }
 
 impl AgentModel for GrokClient {
-    fn turn(
-        &self,
-        request: AgentRequest,
-        events: UnboundedSender<ModelDelta>,
-    ) -> Pin<Box<dyn Future<Output = Result<AgentTurn, String>> + Send>> {
+    fn turn(&self, request: AgentRequest, events: UnboundedSender<ModelDelta>) -> Pin<Box<dyn Future<Output = Result<AgentTurn, String>> + Send>> {
         let client = self.clone();
         Box::pin(async move { client.agent_turn(request, events).await })
     }
 }
 
-fn chat_input(request: &ChatRequest, vision: bool, api: ApiKind) -> Result<Vec<Value>, String> {
-    let mut input = Vec::new();
-    for message in request
-        .messages
-        .iter()
-        .filter(|message| !message.interrupted)
-    {
-        let role = match message.role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
+/// Direct adaptation of the Grok branch in src/server.rs: prepare once, retry
+/// only before a useful event, then hand the same validated stream to Taceta.
+async fn start_responses(client: &transport::GrokClient, credential: Arc<auth::SessionCredential>, normalized: &NormalizedResponsesRequest) -> Result<TextEvents, String> {
+    let routing = normalized.grok_routing_metadata().map_err(|e| e.to_string())?;
+    let prepared = (ResponsesTransportRequest {
+        body: normalized, conversation_id: routing.conversation_id(),
+        request_id: routing.request_id(), agent_id: routing.agent_id(), turn_index: routing.turn_index(),
+    }).prepare().map_err(|e| e.to_string())?;
+    let mut early_retries = 0;
+    let retry_started = Instant::now();
+    let (prelude, upstream) = 'attempt: loop {
+        let upstream = match client.post_prepared_responses(
+            Arc::clone(&credential), &prepared, routing.conversation_id(),
+            routing.request_id(), routing.agent_id(), routing.turn_index(),
+        ).await {
+            Ok(stream) => stream,
+            Err(error) if grok_error_is_transient(&error) && early_retries < EARLY_STREAM_RETRY_LIMIT => {
+                let Some(delay) = grok_retry_delay(&error, early_retries, retry_started) else { return Err(error.to_string()); };
+                early_retries += 1;
+                tokio::time::sleep(delay).await;
+                continue 'attempt;
+            }
+            Err(error) => return Err(error.to_string()),
         };
-        let mut text = message.content.clone();
-        let mut images = Vec::new();
-        for attachment in &message.attachments {
-            match &attachment.payload {
-                AttachmentPayload::Text(body) => {
-                    text.push_str(&format!("\n\n[Attachment: {}]\n{body}", attachment.name));
+        let mut upstream = upstream.validated_text_events();
+        let mut prelude = Vec::new();
+        loop {
+            match upstream.next().await {
+                Some(Ok(event)) => {
+                    let commits_downstream = event_commits_downstream(&event);
+                    prelude.push(event);
+                    if commits_downstream { break 'attempt (prelude, upstream); }
                 }
-                AttachmentPayload::Image { media_type, base64 } => {
-                    if !vision || !matches!(message.role, Role::User) {
-                        return Err("Image input is not confirmed for the selected Grok model and message role.".into());
-                    }
-                    if !matches!(media_type.as_str(), "image/png" | "image/jpeg")
-                        || base64.is_empty()
-                    {
-                        return Err("This image format is not supported by Grok chat.".into());
-                    }
-                    let url = format!("data:{media_type};base64,{base64}");
-                    images.push(match api {
-                        ApiKind::Responses => json!({"type": "input_image", "image_url": url}),
-                        ApiKind::ChatCompletions => {
-                            json!({"type": "image_url", "image_url": {"url": url}})
-                        }
-                    });
+                Some(Err(error)) if matches!(error, GrokError::Stream(_)) && early_retries < EARLY_STREAM_RETRY_LIMIT => {
+                    let Some(delay) = grok_retry_delay(&error, early_retries, retry_started) else { return Err(error.to_string()); };
+                    early_retries += 1;
+                    tokio::time::sleep(delay).await;
+                    continue 'attempt;
                 }
+                Some(Err(error)) => return Err(error.to_string()),
+                None => return Err("Grok upstream ended before producing a response.".into()),
             }
         }
-        // message.thinking is intentionally never serialized.
-        if images.is_empty() {
-            input.push(json!({"role": role, "content": text}));
-        } else {
-            let kind = match api {
-                ApiKind::Responses => "input_text",
-                ApiKind::ChatCompletions => "text",
-            };
-            let mut parts = vec![json!({"type": kind, "text": text})];
-            parts.extend(images);
-            input.push(json!({"role": role, "content": parts}));
-        }
-    }
-    Ok(input)
-}
-
-fn request_conversation_id(body: &Value) -> Uuid {
-    // Reuse the working bridge's full-history routing rule: the opening
-    // instruction/message pair anchors the conversation; later turns do not.
-    let mut anchor = Vec::with_capacity(2);
-    if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
-        anchor.push(json!({"type": "message", "role": "developer",
-            "content": [{"type": "input_text", "text": instructions}]}));
-    }
-    if let Some(first) = body
-        .get("input")
-        .or_else(|| body.get("messages"))
-        .and_then(Value::as_array)
-        .and_then(|input| input.first())
-    {
-        anchor.push(first.clone());
-    }
-    if anchor.is_empty() {
-        return Uuid::new_v4();
-    }
-    let digest = Sha256::digest(Value::Array(anchor).to_string().as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x50;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes)
-}
-
-fn record_reported_model(
-    current: &mut Option<String>,
-    value: Option<&Value>,
-) -> Result<(), String> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(());
     };
-    let model = value
-        .as_str()
-        .ok_or("Grok returned an invalid response model identifier.")?;
-    if current.as_deref().is_some_and(|prior| prior != model) {
-        return Err("Grok reported conflicting model identifiers within one response.".into());
-    }
-    *current = Some(model.to_owned());
-    Ok(())
+    Ok(Box::pin(stream::iter(prelude.into_iter().map(Ok)).chain(upstream)))
 }
 
-fn payload(
-    name: &str,
-    model: &ModelInfo,
-    input: Vec<Value>,
-    tools: &[ToolDefinition],
-    thinking: ThinkingMode,
-    context: u32,
-) -> Result<Value, String> {
-    let mut body = json!({"model": name, "stream": true, "store": false});
-    match model.api {
-        ApiKind::Responses => {
-            body["input"] = Value::Array(input);
-            body["max_output_tokens"] = json!(model.max_output(context));
-            if !tools.is_empty() {
-                body["tools"] = Value::Array(responses::tools(tools)?);
-            }
-            if let Some(reasoning) = model.reasoning(thinking)? {
-                body["reasoning"] = reasoning;
-            }
-        }
-        ApiKind::ChatCompletions => {
-            body["messages"] = Value::Array(input);
-            body["max_tokens"] = json!(model.max_output(context));
-            body["stream_options"] = json!({"include_usage": true});
-            if !tools.is_empty() {
-                body["tools"] = Value::Array(completions::tools(tools)?);
-            }
-            if let Some(reasoning) = model.reasoning(thinking)? {
-                body["reasoning_effort"] = reasoning["effort"].clone();
-            }
-        }
-    }
-    Ok(body)
+fn grok_error_is_transient(error: &GrokError) -> bool {
+    matches!(error, GrokError::Transport(_) | GrokError::RateLimited { .. } | GrokError::UpstreamStatus(502..=504))
 }
 
-async fn consume(
-    api: ApiKind,
-    response: reqwest::Response,
-    emit: impl FnMut(OutputDelta) -> Result<(), String>,
-) -> Result<(AgentTurn, Option<String>), String> {
-    match api {
-        ApiKind::Responses => responses::consume(response.bytes_stream(), emit).await,
-        ApiKind::ChatCompletions => completions::consume(response.bytes_stream(), emit).await,
-    }
+fn grok_retry_delay(error: &GrokError, retry_index: usize, started: Instant) -> Option<Duration> {
+    let default = EARLY_STREAM_RETRY_BACKOFF[retry_index];
+    let requested = match error {
+        GrokError::RateLimited { retry_after_seconds: Some(seconds) } => Duration::from_secs(*seconds),
+        _ => default,
+    };
+    (started.elapsed().saturating_add(requested) <= EARLY_STREAM_RETRY_WALL_CLOCK).then_some(requested)
 }
 
-fn validate_agent_messages(messages: &[AgentMessage]) -> Result<(), String> {
-    let mut pending: HashMap<&str, &str> = HashMap::new();
-    let mut ids = HashSet::new();
-    for message in messages {
-        if matches!(message.role, AgentRole::Tool) {
-            let id = message
-                .tool_call_id
-                .as_deref()
-                .filter(|id| !id.is_empty())
-                .ok_or("A Grok tool result has no call ID.")?;
-            let name = pending
-                .remove(id)
-                .ok_or("A Grok tool result has no matching pending call.")?;
-            if message
-                .tool_name
-                .as_deref()
-                .is_some_and(|actual| actual != name)
-                || !message.tool_calls.is_empty()
-            {
-                return Err("A Grok tool result does not match its function call.".into());
-            }
-            continue;
-        }
-        if !pending.is_empty() {
-            return Err(
-                "Grok conversation contains a function call without its tool result.".into(),
-            );
-        }
-        if message.tool_call_id.is_some()
-            || message.tool_name.is_some()
-            || (!matches!(message.role, AgentRole::Assistant) && !message.tool_calls.is_empty())
-        {
-            return Err("Grok conversation has invalid tool message metadata.".into());
-        }
-        for call in &message.tool_calls {
-            if call.id.is_empty()
-                || call.name.is_empty()
-                || !call.arguments.is_object()
-                || !ids.insert(call.id.as_str())
-            {
-                return Err(
-                    "Grok conversation contains an invalid or repeated function call.".into(),
-                );
-            }
-            pending.insert(&call.id, &call.name);
-        }
-    }
-    if !pending.is_empty() {
-        return Err("Grok conversation ends before a pending tool result.".into());
-    }
-    Ok(())
-}
-
-fn validate_tools(tools: &[ToolDefinition]) -> Result<(), String> {
-    if tools.len() > responses::MAX_TOOL_CALLS {
-        return Err("Grok supports at most 128 tools in one request.".into());
-    }
-    let mut names = HashSet::new();
-    for tool in tools {
-        if tool.name.is_empty() || !names.insert(tool.name.as_str()) || !tool.parameters.is_object()
-        {
-            return Err("The Grok tool definitions are invalid or contain repeated names.".into());
-        }
-    }
-    Ok(())
-}
-
-fn reject_status(status: reqwest::StatusCode) -> Result<(), String> {
-    if status.is_success() {
-        return Ok(());
-    }
-    Err(match status.as_u16() {
-        401 => "Grok rejected Taceta's credential. Connect to Grok again.".into(),
-        403 => "Grok did not allow this account or public OAuth client to use the requested service.".into(),
-        426 => "Grok returned HTTP 426 (Upgrade Required). The proxy requires a supported client compatibility version.".into(),
-        429 => "Grok's usage limit was reached. Retry after your account's limit resets.".into(),
-        code => format!("The Grok service rejected the request (HTTP {code})."),
-    })
-}
-
-async fn read_bounded(response: reqwest::Response, maximum: usize) -> Result<Vec<u8>, String> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > maximum as u64)
-    {
-        return Err("Grok returned a response exceeding Taceta's size limit.".into());
-    }
-    let mut stream = response.bytes_stream();
-    let mut bytes = zeroize::Zeroizing::new(Vec::new());
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "The Grok service response was interrupted.")?;
-        if bytes.len().saturating_add(chunk.len()) > maximum {
-            return Err("Grok returned a response exceeding Taceta's size limit.".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(std::mem::take(&mut *bytes))
+fn event_commits_downstream(event: &ValidatedTextStreamEvent) -> bool {
+    matches!(event.kind(),
+        TextStreamEventKind::OutputTextDelta { .. }
+            | TextStreamEventKind::OutputTextDone { .. }
+            | TextStreamEventKind::OutputItemDone { .. }
+            | TextStreamEventKind::FunctionCallArgumentsDelta { .. }
+            | TextStreamEventKind::FunctionCallArgumentsDone { .. }
+            | TextStreamEventKind::FunctionCallItemDone { .. }
+            | TextStreamEventKind::ReasoningSummaryTextDelta { .. }
+            | TextStreamEventKind::ReasoningSummaryTextDone { .. }
+            | TextStreamEventKind::ReasoningTextDelta { .. }
+            | TextStreamEventKind::ReasoningTextDone { .. }
+            | TextStreamEventKind::ReasoningItemDone { .. }
+            | TextStreamEventKind::ResponseFailed { .. }
+            | TextStreamEventKind::ResponseIncomplete { .. }
+            | TextStreamEventKind::ResponseCompleted { .. }
+    )
 }
 
 #[cfg(test)]

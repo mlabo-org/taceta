@@ -1,784 +1,209 @@
 use super::*;
 use crate::{
     agent::{AgentMessage, AgentRole, AgentToolCall, ToolDefinition},
-    domain::{Attachment, ChatMessage, ThinkingCapability, ThinkingLevel, ThinkingMode},
+    domain::{Attachment, AttachmentPayload, ChatMessage, ModelIdentity, ThinkingLevel, ThinkingMode},
 };
-use auth::{CredentialStore, Credentials};
+use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::{get, post}, Json, Router};
 use bytes::Bytes;
-use std::sync::{
-    Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-    sync::mpsc,
-};
+use serde_json::{Value, json};
+use std::sync::Mutex;
+use tokio::net::TcpListener;
+use url::Url;
 
-#[derive(Default)]
-pub(super) struct MemoryStore {
-    bytes: Mutex<Option<Vec<u8>>>,
-    pub(super) reads: AtomicUsize,
-    pub(super) saves: AtomicUsize,
-    pub(super) deletes: AtomicUsize,
+// Loopback fixture server copied from grok-codex-bridge src/grok.rs tests.
+async fn start(router: Router) -> (Url, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    (Url::parse(&format!("http://{address}/v1/")).unwrap(), task)
 }
 
-impl CredentialStore for MemoryStore {
-    fn load(&self) -> Result<Option<Credentials>, String> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
-        self.bytes
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|bytes| {
-                serde_json::from_slice(bytes).map_err(|_| "fixture credential invalid".into())
-            })
-            .transpose()
-    }
-    fn save(&self, token: &Credentials) -> Result<(), String> {
-        self.saves.fetch_add(1, Ordering::SeqCst);
-        *self.bytes.lock().unwrap() = Some(serde_json::to_vec(token).unwrap());
-        Ok(())
-    }
-    fn delete(&self) -> Result<(), String> {
-        self.deletes.fetch_add(1, Ordering::SeqCst);
-        *self.bytes.lock().unwrap() = None;
-        Ok(())
+fn chat_request(model: &str, messages: Vec<ChatMessage>) -> ChatRequest {
+    ChatRequest {
+        model: model.into(), messages, thinking: ThinkingMode::Default, context_length: 32_768,
+        tools: None, web_search_provider: None, max_search_results: 5,
+        chatgpt_web_request_limit: 1, fetch_search_pages: false, web_authorization: None,
     }
 }
 
-pub(super) fn saved_token(store: &MemoryStore, expired: bool) {
-    store
-        .save(&Credentials {
-            access_token: "fixture-access-old".into(),
-            refresh_token: Some("fixture-refresh-old".into()),
-            expires_at: Some(if expired { 0 } else { auth::now() + 3600 }),
-            user_id: Some("fixture-user".into()),
-            principal_type: None,
-            principal_id: None,
-        })
-        .unwrap();
+fn admitted(id: &str) -> ModelInfo {
+    ModelInfo::from_admitted(id.into(), &json!({"model": id, "apiBackend": "responses"}))
 }
 
-pub(super) struct RecordedRequest {
-    pub(super) path: String,
-    pub(super) headers: HashMap<String, String>,
-    pub(super) body: Vec<u8>,
-}
-pub(super) struct Reply {
-    pub(super) status: &'static str,
-    pub(super) content_type: &'static str,
-    pub(super) body: Vec<u8>,
-}
-impl Reply {
-    pub(super) fn json(value: Value) -> Self {
-        Self {
-            status: "200 OK",
-            content_type: "application/json",
-            body: serde_json::to_vec(&value).unwrap(),
-        }
-    }
-}
-
-pub(super) struct Fixture {
-    pub(super) base: String,
-    pub(super) requests: mpsc::UnboundedReceiver<RecordedRequest>,
-    pub(super) task: tokio::task::JoinHandle<()>,
-}
-
-impl Fixture {
-    pub(super) async fn start(replies: Vec<Reply>) -> Self {
-        Self::start_with_required_version(replies, None).await
-    }
-
-    async fn start_with_required_version(
-        replies: Vec<Reply>,
-        required_version: Option<&'static str>,
-    ) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let (tx, requests) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
-            for reply in replies {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut bytes = Vec::new();
-                let mut chunk = [0u8; 4096];
-                let end = loop {
-                    let size = socket.read(&mut chunk).await.unwrap();
-                    assert!(size > 0, "fixture request closed before headers");
-                    bytes.extend_from_slice(&chunk[..size]);
-                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                        break end + 4;
-                    }
-                };
-                let header_text = std::str::from_utf8(&bytes[..end]).unwrap();
-                let path = header_text
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap()
-                    .to_owned();
-                let headers: HashMap<_, _> = header_text
-                    .lines()
-                    .skip(1)
-                    .filter_map(|line| line.split_once(':'))
-                    .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
-                    .collect();
-                let length = headers
-                    .get("content-length")
-                    .map(|value| value.parse::<usize>().unwrap())
-                    .unwrap_or(0);
-                while bytes.len() - end < length {
-                    let size = socket.read(&mut chunk).await.unwrap();
-                    assert!(size > 0, "fixture request closed before body");
-                    bytes.extend_from_slice(&chunk[..size]);
-                }
-                let reply = if matches!(path.as_str(), "/v1/responses" | "/v1/chat/completions")
-                    && required_version.is_some_and(|version| {
-                        headers.get("x-grok-client-version").map(String::as_str) != Some(version)
-                    }) {
-                    Reply {
-                        status: "426 Upgrade Required",
-                        content_type: "application/json",
-                        body: br#"{"error":{"code":"unsupported_client_version"}}"#.to_vec(),
-                    }
-                } else {
-                    reply
-                };
-                tx.send(RecordedRequest {
-                    path,
-                    headers,
-                    body: bytes[end..end + length].to_vec(),
-                })
-                .unwrap();
-                let headers = format!(
-                    "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    reply.status,
-                    reply.content_type,
-                    reply.body.len()
-                );
-                socket.write_all(headers.as_bytes()).await.unwrap();
-                socket.write_all(&reply.body).await.unwrap();
-            }
-        });
-        Self {
-            base,
-            requests,
-            task,
-        }
-    }
-}
-
-fn message(role: AgentRole, content: &str) -> AgentMessage {
-    AgentMessage {
-        role,
-        content: content.into(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-        tool_name: None,
-    }
-}
-
-fn event(value: Value) -> Vec<u8> {
-    format!("data: {value}\r\n\r\n").into_bytes()
-}
-fn completed(content: &str, calls: Vec<Value>) -> Value {
-    let mut output = vec![
-        json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": content}]}),
-    ];
-    output.extend(calls);
-    json!({"type": "response.completed", "response": {"status": "completed", "output": output, "usage": {"input_tokens": 30, "output_tokens": 9}}})
-}
-
-#[test]
-fn metadata_uses_advertised_protocol_and_thinking_options() {
-    let models = parse_models(&json!({"data": [
-        {"id": "future-code", "apiBackend": "responses", "contextWindow": 200000, "supportsReasoningEffort": true,
-            "reasoningEfforts": ["low", {"value": "medium", "id": "balanced"}, "high", "xhigh"], "maxCompletionTokens": 512},
-        {"modelId": "partial", "api_backend": "responses", "_meta": {"supportsReasoningEffort": true, "reasoningEfforts": ["high"], "totalContextTokens": 60000}, "supportsTools": false},
-        {"id": "unverified", "apiBackend": "responses", "supportsReasoningEffort": true},
-        {"id": "other-wire", "apiBackend": "messages"}, {"id": "missing-wire"},
-        {"id": "hidden", "apiBackend": "responses", "hidden": true}
-    ]})).unwrap();
-    assert_eq!(models.len(), 4);
-    assert_eq!(models[0].descriptor.name, "future-code");
-    assert_eq!(models[0].descriptor.context_length, Some(200000));
-    assert_eq!(models[0].descriptor.thinking, ThinkingCapability::Levels);
-    assert!(models[0].descriptor.tools);
-    assert!(!models[0].descriptor.vision);
-    assert_eq!(models[0].max_output(8192), 512);
-    assert_eq!(
-        models[0]
-            .reasoning(ThinkingMode::Level(ThinkingLevel::Medium))
-            .unwrap(),
-        Some(json!({"effort": "medium"}))
-    );
-    assert!(models[0].reasoning(ThinkingMode::Off).is_err());
-    assert_eq!(
-        models[1].descriptor.thinking,
-        ThinkingCapability::Unverified
-    );
-    assert!(!models[1].descriptor.tools);
-    assert_eq!(models[1].descriptor.context_length, Some(60000));
-    assert!(
-        models[2]
-            .reasoning(ThinkingMode::Level(ThinkingLevel::Low))
-            .is_err()
-    );
-    assert!(
-        models[2]
-            .reasoning(ThinkingMode::Default)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(models[3].api, ApiKind::ChatCompletions);
+fn sse(events: &[Value], trailing_boundary: bool) -> Vec<Bytes> {
+    let mut body = events.iter().map(|event| format!("data: {event}")).collect::<Vec<_>>().join("\n\n");
+    if trailing_boundary { body.push_str("\n\n"); }
+    // Deliberately split inside UTF-8/data framing, matching a transport stream.
+    body.as_bytes().chunks(11).map(Bytes::copy_from_slice).collect()
 }
 
 #[tokio::test]
-async fn split_sse_produces_complete_calls_then_serializes_paired_results() {
-    let call_a = json!({"type": "function_call", "id": "item-a", "call_id": "call-a", "name": "read_file", "arguments": "{\"path\":\"日本.txt\"}"});
-    let call_b = json!({"type": "function_call", "id": "item-b", "call_id": "call-b", "name": "run_command", "arguments": "{\"command\":\"pwd\"}"});
-    let mut bytes = b": keepalive\r\n\r\n".to_vec();
-    for value in [
-        json!({"type": "response.reasoning_summary_text.delta", "delta": "秘密の思考"}),
-        json!({"type": "response.output_text.delta", "delta": "確認"}),
-        json!({"type": "response.output_item.added", "output_index": 1, "item": {"type": "function_call", "id": "item-a", "call_id": "call-a", "name": "read_file", "arguments": ""}}),
-        json!({"type": "response.output_item.added", "output_index": 2, "item": {"type": "function_call", "id": "item-b", "call_id": "call-b", "name": "run_command", "arguments": ""}}),
-        json!({"type": "response.function_call_arguments.delta", "item_id": "item-a", "delta": "{\"path\":\"日"}),
-        json!({"type": "response.function_call_arguments.delta", "item_id": "item-b", "delta": "{\"command\":\"pwd\"}"}),
-        json!({"type": "response.function_call_arguments.delta", "item_id": "item-a", "delta": "本.txt\"}"}),
-        json!({"type": "response.function_call_arguments.done", "item_id": "item-a", "arguments": "{\"path\":\"日本.txt\"}"}),
-        json!({"type": "response.output_item.done", "output_index": 2, "item": call_b.clone()}),
-        completed("確認します", vec![call_a, call_b]),
-    ] {
-        bytes.extend(event(value));
+async fn bridge_model_switch_uses_exact_catalog_slug_and_transport_contract() {
+    type Captures = Arc<Mutex<Vec<(HeaderMap, Value)>>>;
+    async fn models(headers: HeaderMap) -> impl IntoResponse {
+        assert_eq!(headers["authorization"], "Bearer fixture-token");
+        assert_eq!(headers["x-userid"], "fixture-user");
+        assert_eq!(headers["x-grok-user-id"], "fixture-user");
+        Json(json!({"data": [
+            {"id":"display-45", "model":"grok-4.5", "apiBackend":"responses"},
+            {"id":"display-46", "modelId":"grok-4.6", "api_backend":"responses", "baseUrl":"https://cli-chat-proxy.grok.com/v1/"}
+        ]}))
     }
-    let chunks = bytes
-        .chunks(1)
-        .map(|chunk| Ok::<_, ()>(Bytes::copy_from_slice(chunk)))
-        .collect::<Vec<_>>();
-    let mut visible = String::new();
+    async fn response(State(captures): State<Captures>, headers: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
+        let selected = body["model"].as_str().unwrap().to_owned();
+        captures.lock().unwrap().push((headers, body));
+        let created = json!({"type":"response.created", "response":{"id":"resp_fixture", "model":format!("{selected}-build")}});
+        let completed = json!({"type":"response.completed", "response":{"id":"resp_fixture", "model":format!("{selected}-build"), "status":"completed", "output":[{"type":"message", "id":"msg_fixture", "content":[{"type":"output_text", "text":"ready"}]}]}});
+        ([("content-type", "text/event-stream")], format!("data: {created}\n\ndata: {completed}"))
+    }
+    let captures = Captures::default();
+    let router = Router::new().route("/v1/models", get(models))
+        .route("/v1/responses", post(response)).with_state(captures.clone());
+    let (base, task) = start(router).await;
+    let transport = transport::GrokClient::for_test(base).unwrap();
+    let credential = Arc::new(auth::SessionCredential::for_test("fixture-token", "fixture-user"));
+    let fetched = transport.fetch_models(&credential).await.unwrap();
+    assert_eq!(fetched.models, ["grok-4.5", "grok-4.6"]);
+    let mut messages = vec![ChatMessage::new_system("Existing user instructions."), ChatMessage::new_user("日本語で応答して。")];
+    for (id, entry) in fetched.models.into_iter().zip(fetched.entries) {
+        let model = ModelInfo::from_admitted(id.clone(), &entry);
+        let chat = chat_request(&id, messages.clone());
+        let request = adapter::request(&model, adapter::chat_input(&chat, false).unwrap(), &[], ThinkingMode::Default).unwrap();
+        let events = start_responses(&transport, credential.clone(), &request).await.unwrap();
+        let mut reported = Vec::new();
+        let turn = adapter::consume(events, &[], |event| {
+            if let OutputDelta::ReportedModel(model) = event { reported.push(model); }
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(turn.content, "ready");
+        assert_eq!(reported, [format!("{id}-build")]);
+        messages.push(ChatMessage::new_assistant("ready"));
+        messages.push(ChatMessage::new_user("次の質問です。"));
+    }
+    let captured = captures.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for ((headers, body), expected) in captured.iter().zip(["grok-4.5", "grok-4.6"]) {
+        assert_eq!(body["model"], expected);
+        assert_eq!(headers["x-grok-model-override"], expected);
+        assert_eq!(headers["x-xai-token-auth"], "xai-grok-cli");
+        assert_eq!(headers["x-authenticateresponse"], "authenticate-response");
+        assert_eq!(headers["x-userid"], "fixture-user");
+        assert_eq!(headers["x-grok-user-id"], "fixture-user");
+        assert_eq!(headers["x-grok-client-identifier"], "grok-shell");
+        assert_eq!(headers["x-grok-client-mode"], "headless");
+        assert_eq!(headers["x-grok-client-version"], "1.0.5");
+        assert_eq!(headers["x-grok-turn-idx"], "1");
+        assert_eq!(headers["x-grok-session-id"], headers["x-grok-conv-id"]);
+        assert_eq!(headers["accept"], "text/event-stream");
+        assert_eq!(body["instructions"], "Existing user instructions.");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+    }
+    assert_eq!(captured[0].0["x-grok-conv-id"], captured[1].0["x-grok-conv-id"]);
+    assert_ne!(captured[0].0["x-grok-req-id"], captured[1].0["x-grok-req-id"]);
+    assert_ne!(captured[0].0["x-grok-agent-id"], captured[1].0["x-grok-agent-id"]);
+    assert_eq!(captured[1].1["input"][1]["content"], "ready");
+    assert_eq!(captured[1].1["input"].as_array().unwrap().len(), 3);
+    task.abort();
+}
+
+#[tokio::test]
+async fn bridge_stream_projects_thinking_tools_terminal_output_and_raw_model() {
+    let call = json!({"type":"function_call", "id":"fc_1", "call_id":"call_1", "name":"read_file", "arguments":"{\"path\":\"src/main.rs\"}"});
+    let message = json!({"type":"message", "id":"msg_1", "role":"assistant", "content":[{"type":"output_text", "text":"確認します。"}]});
+    let reasoning = json!({"type":"reasoning", "id":"rs_1", "summary":[{"type":"summary_text", "text":"調べます。"}]});
+    let events = vec![
+        json!({"type":"response.created", "response":{"id":"resp_1", "model":"grok-4.6-build"}}),
+        json!({"type":"response.output_item.added", "output_index":0, "item":{"type":"reasoning", "id":"rs_1"}}),
+        json!({"type":"response.reasoning_summary_text.delta", "item_id":"rs_1", "output_index":0, "summary_index":0, "delta":"調べます。"}),
+        json!({"type":"response.reasoning_summary_text.done", "item_id":"rs_1", "output_index":0, "summary_index":0, "text":"調べます。"}),
+        json!({"type":"response.output_item.done", "output_index":0, "item":reasoning.clone()}),
+        json!({"type":"response.output_item.added", "output_index":1, "item":{"type":"message", "id":"msg_1", "role":"assistant", "content":[]}}),
+        json!({"type":"response.output_text.delta", "item_id":"msg_1", "output_index":1, "content_index":0, "delta":"確認"}),
+        json!({"type":"response.output_text.delta", "item_id":"msg_1", "output_index":1, "content_index":0, "delta":"します。"}),
+        json!({"type":"response.output_text.done", "item_id":"msg_1", "output_index":1, "content_index":0, "text":"確認します。"}),
+        json!({"type":"response.output_item.done", "output_index":1, "item":message.clone()}),
+        json!({"type":"response.output_item.added", "output_index":2, "item":{"type":"function_call", "id":"fc_1", "call_id":"call_1", "name":"read_file", "arguments":""}}),
+        json!({"type":"response.function_call_arguments.delta", "item_id":"fc_1", "output_index":2, "delta":"{\"path\":\"src/main.rs\"}"}),
+        json!({"type":"response.function_call_arguments.done", "item_id":"fc_1", "output_index":2, "arguments":"{\"path\":\"src/main.rs\"}"}),
+        json!({"type":"response.output_item.done", "output_index":2, "item":call.clone()}),
+        json!({"type":"response.completed", "response":{"id":"resp_1", "model":"grok-4.6-build", "status":"completed", "output":[reasoning, message, call], "usage":{"input_tokens":12, "output_tokens":34}}}),
+    ];
+    let tools = vec![ToolDefinition { name:"read_file".into(), description:"Read file".into(), parameters:json!({"type":"object", "properties":{"path":{"type":"string"}}, "required":["path"]}) }];
+    let mut text = String::new();
     let mut thinking = String::new();
-    let (result, _) = responses::consume(futures_util::stream::iter(chunks), |delta| {
-        match delta {
-            OutputDelta::Content(text) => visible.push_str(&text),
-            OutputDelta::Thinking(text) => thinking.push_str(&text),
-        }
+    let mut models = Vec::new();
+    let turn = adapter::consume(transport::fixture_events(sse(&events, false)), &tools, |event| {
+        match event { OutputDelta::Content(delta) => text.push_str(&delta), OutputDelta::Thinking(delta) => thinking.push_str(&delta), OutputDelta::ReportedModel(model) => models.push(model) }
         Ok(())
-    })
-    .await
-    .unwrap();
-    assert_eq!(visible, "確認します");
-    assert_eq!(thinking, "秘密の思考");
-    assert_eq!(result.tool_calls.len(), 2);
-    assert_eq!(result.tool_calls[0].arguments, json!({"path": "日本.txt"}));
-    assert_eq!(result.prompt_tokens, Some(30));
-    let mut assistant = message(AgentRole::Assistant, &result.content);
-    assistant.tool_calls = result.tool_calls;
-    let mut first = message(AgentRole::Tool, "file contents");
-    first.tool_call_id = Some("call-a".into());
-    first.tool_name = Some("read_file".into());
-    let mut second = message(AgentRole::Tool, "/project");
-    second.tool_call_id = Some("call-b".into());
-    second.tool_name = Some("run_command".into());
-    let input = responses::agent_input(&[
-        message(AgentRole::User, "inspect"),
-        assistant,
-        first,
-        second,
-    ])
-    .unwrap();
-    assert_eq!(input[2]["call_id"], "call-a");
-    assert_eq!(input[3]["call_id"], "call-b");
-    assert_eq!(
-        input[4],
-        json!({"type": "function_call_output", "call_id": "call-a", "output": "file contents"})
-    );
-    assert!(
-        !serde_json::to_string(&input)
-            .unwrap()
-            .contains("秘密の思考")
-    );
-}
-
-#[tokio::test]
-async fn failed_truncated_and_cancelled_streams_never_return_tools() {
-    for value in [
-        json!({"type": "response.incomplete"}),
-        json!({"type": "response.failed"}),
-        json!({"type": "error", "message": "provider details are not exposed"}),
-    ] {
-        let result = responses::consume(
-            futures_util::stream::iter(vec![Ok::<_, ()>(Bytes::from(event(value)))]),
-            |_| Ok(()),
-        )
-        .await;
-        assert!(result.is_err());
-    }
-    let truncated = event(json!({"type": "response.output_text.delta", "delta": "partial"}));
-    let error = responses::consume(
-        futures_util::stream::iter(vec![Ok::<_, ()>(Bytes::from(truncated.clone()))]),
-        |_| Ok(()),
-    )
-    .await
-    .err()
-    .unwrap();
-    assert!(error.contains("before response.completed"));
-    let disconnected = responses::consume(
-        futures_util::stream::iter(vec![Ok(Bytes::from(truncated.clone())), Err(())]),
-        |_| Ok(()),
-    )
-    .await
-    .err()
-    .unwrap();
-    assert!(disconnected.contains("disconnected"));
-    let cancelled = responses::consume(
-        futures_util::stream::iter(vec![Ok::<_, ()>(Bytes::from(truncated))]),
-        |_| Err(CANCELLED.into()),
-    )
-    .await
-    .err()
-    .unwrap();
-    assert_eq!(cancelled, CANCELLED);
-    let malformed = completed(
-        "",
-        vec![
-            json!({"type": "function_call", "call_id": "x", "name": "read_file", "arguments": "{\"path\":"}),
-        ],
-    );
-    assert!(
-        responses::consume(
-            futures_util::stream::iter(vec![Ok::<_, ()>(Bytes::from(event(malformed)))]),
-            |_| Ok(())
-        )
-        .await
-        .is_err()
-    );
-}
-
-#[tokio::test]
-async fn oauth_models_agent_response_and_next_tool_turn_use_taceta_wire_contract() {
-    let call = json!({"type": "function_call", "id": "item", "call_id": "read-1", "name": "read_file", "arguments": "{\"path\":\"README.md\"}"});
-    let mut first_response = completed("", vec![call]);
-    first_response["response"]["model"] = json!("server-responses-id");
-    // Required reference version comes from Grok Build 37949780's published
-    // xai-grok-version package, independently of Taceta's package version.
-    let mut fixture = Fixture::start_with_required_version(vec![
-        Reply::json(json!({"sub": "official-personal-subject"})),
-        Reply::json(json!({})),
-        Reply::json(json!({"data": [{"id": "account-current", "apiBackend": "responses", "contextWindow": 131072}]})),
-        Reply { status: "200 OK", content_type: "text/event-stream", body: event(first_response) },
-        Reply { status: "200 OK", content_type: "text/event-stream", body: event(completed("The file says hello.", Vec::new())) },
-    ], Some("1.0.24")).await;
-    let store = Arc::new(MemoryStore::default());
-    saved_token(&store, false);
-    let client = GrokClient::configured(
-        AuthEndpoints {
-            authorize: format!("{}/authorize", fixture.base),
-            token: format!("{}/token", fixture.base),
-            userinfo: format!("{}/userinfo", fixture.base),
-        },
-        format!("{}/v1", fixture.base),
-        store.clone(),
-    );
-    assert_eq!(
-        store.reads.load(Ordering::SeqCst),
-        0,
-        "constructor must not access credentials"
-    );
-    // A pre-repair token-only entry must acquire its real ID from official
-    // userinfo before even the first proxy request. This is the user's upgrade
-    // path; no fabricated identity or forced new login may fill the gap.
-    *store.bytes.lock().unwrap() = Some(
-        serde_json::to_vec(&json!({
-            "access_token": "fixture-access-old",
-            "refresh_token": "fixture-refresh-old",
-            "expires_at": auth::now() + 3600,
-        }))
-        .unwrap(),
-    );
-    // Reproduce the omitted-header request using the same authenticated POST
-    // builder as inference, with fixture credentials only.
-    let mut omitted_version = client
-        .request(reqwest::Method::POST, "/responses", Some("account-current"))
-        .await
-        .unwrap()
-        .json(&json!({"model": "account-current", "input": [], "stream": true, "store": false}))
-        .build()
-        .unwrap();
-    omitted_version
-        .headers_mut()
-        .remove("x-grok-client-version");
-    let rejected = client.inner.http.execute(omitted_version).await.unwrap();
-    assert_eq!(rejected.status(), reqwest::StatusCode::UPGRADE_REQUIRED);
-    let explanation = reject_status(rejected.status()).unwrap_err();
-    assert!(explanation.contains("HTTP 426"));
-    assert!(!explanation.contains("cannot use"));
-    let models = client.list_models().await.unwrap();
-    assert_eq!(models[0].name, "account-current");
-    let tool = ToolDefinition {
-        name: "read_file".into(),
-        description: "Read a file".into(),
-        parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
-    };
-    let (events, _receiver) = mpsc::unbounded_channel();
-    let result = client
-        .turn(
-            AgentRequest {
-                model: models[0].name.clone(),
-                messages: vec![message(AgentRole::User, "Read README.md")],
-                tools: vec![tool],
-                thinking: ThinkingMode::Default,
-                context_length: 8192,
-            },
-            events.clone(),
-        )
-        .await
-        .unwrap();
-    let mut assistant = message(AgentRole::Assistant, &result.content);
-    assistant.tool_calls = result.tool_calls;
-    let mut output = message(AgentRole::Tool, "hello");
-    output.tool_call_id = Some("read-1".into());
-    output.tool_name = Some("read_file".into());
-    let final_turn = client
-        .turn(
-            AgentRequest {
-                model: models[0].name.clone(),
-                messages: vec![
-                    message(AgentRole::User, "Read README.md"),
-                    assistant,
-                    output,
-                ],
-                tools: Vec::new(),
-                thinking: ThinkingMode::Default,
-                context_length: 8192,
-            },
-            events,
-        )
-        .await
-        .unwrap();
-    assert_eq!(final_turn.content, "The file says hello.");
-    fixture.task.await.unwrap();
-    let identity_request = fixture.requests.recv().await.unwrap();
-    assert_eq!(identity_request.path, "/userinfo");
-    assert_eq!(
-        identity_request.headers["authorization"],
-        "Bearer fixture-access-old"
-    );
-    assert_eq!(
-        store.load().unwrap().unwrap().user_id.as_deref(),
-        Some("official-personal-subject")
-    );
-    let rejected_request = fixture.requests.recv().await.unwrap();
-    assert_eq!(rejected_request.path, "/v1/responses");
-    assert!(
-        !rejected_request
-            .headers
-            .contains_key("x-grok-client-version")
-    );
-    let models_request = fixture.requests.recv().await.unwrap();
-    let first = fixture.requests.recv().await.unwrap();
-    let second = fixture.requests.recv().await.unwrap();
-    assert_eq!(models_request.path, "/v1/models");
-    assert_eq!(first.path, "/v1/responses");
-    assert_eq!(first.headers["authorization"], "Bearer fixture-access-old");
-    assert_eq!(first.headers["x-xai-token-auth"], "xai-grok-cli");
-    for request in [&models_request, &first, &second] {
-        assert_eq!(request.headers["x-userid"], "official-personal-subject");
-        assert_eq!(
-            request.headers["x-grok-user-id"],
-            "official-personal-subject"
-        );
-        assert_eq!(request.headers["x-grok-client-identifier"], "grok-shell");
-        assert_eq!(request.headers["x-grok-client-mode"], "headless");
-    }
-    assert_eq!(
-        first.headers["user-agent"],
-        concat!("Taceta/", env!("CARGO_PKG_VERSION"))
-    );
-    assert_eq!(first.headers["x-grok-client-version"], "1.0.24");
-    assert_eq!(second.headers["x-grok-client-version"], "1.0.24");
-    assert_ne!(
-        first.headers["x-grok-req-id"],
-        second.headers["x-grok-req-id"]
-    );
-    assert_eq!(first.headers["x-grok-turn-idx"], "1");
-    assert_eq!(second.headers["x-grok-turn-idx"], "1");
-    assert_eq!(
-        first.headers["x-grok-conv-id"],
-        second.headers["x-grok-conv-id"]
-    );
-    assert_eq!(
-        first.headers["x-grok-conv-id"],
-        first.headers["x-grok-session-id"]
-    );
-    assert_ne!(
-        first.headers["x-grok-agent-id"],
-        second.headers["x-grok-agent-id"]
-    );
-    let first_body: Value = serde_json::from_slice(&first.body).unwrap();
-    let second_body: Value = serde_json::from_slice(&second.body).unwrap();
-    assert_eq!(first_body["store"], false);
-    assert_eq!(first_body["tools"][0]["type"], "function");
-    assert_eq!(
-        first_body["max_output_tokens"],
-        crate::agent::reserved_output_tokens(8192)
-    );
-    assert!(
-        second_body.get("tools").is_none(),
-        "summary turns may omit tool definitions"
-    );
-    assert_eq!(second_body["input"][1]["call_id"], "read-1");
-    assert_eq!(second_body["input"][2]["type"], "function_call_output");
-    assert_eq!(second_body["input"][2]["call_id"], "read-1");
-    assert!(second_body.get("previous_response_id").is_none());
+    }).await.unwrap();
+    assert_eq!(turn.content, "確認します。");
+    assert_eq!(text, turn.content);
+    assert_eq!(thinking, "調べます。");
+    assert_eq!(models, ["grok-4.6-build"]);
+    assert_eq!(turn.tool_calls, [AgentToolCall { id:"call_1".into(), name:"read_file".into(), arguments:json!({"path":"src/main.rs"}) }]);
+    assert_eq!(turn.prompt_tokens, Some(12));
+    assert_eq!(turn.completion_tokens, Some(34));
 }
 
 #[test]
-fn invalid_tool_histories_are_rejected_before_transport() {
-    let mut assistant = message(AgentRole::Assistant, "");
-    assistant.tool_calls = vec![AgentToolCall {
-        id: "a".into(),
-        name: "read_file".into(),
-        arguments: json!({"path": "x"}),
-    }];
-    assert!(responses::agent_input(&[assistant]).is_err());
-    let mut output = message(AgentRole::Tool, "x");
-    output.tool_call_id = Some("unknown".into());
-    assert!(responses::agent_input(&[output]).is_err());
-}
+fn bridge_request_projection_preserves_full_history_and_excludes_thinking() {
+    let model = ModelInfo::from_admitted("grok-4.6".into(), &json!({"supportsVision":true, "supportsReasoningEffort":true, "reasoningEfforts":["low", "medium", "high"]}));
+    let mut user = ChatMessage::new_user("Original prompt.");
+    user.attachments.push(Attachment { name:"note.txt".into(), payload:AttachmentPayload::Text("Attached text.".into()) });
+    user.attachments.push(Attachment { name:"pixel.png".into(), payload:AttachmentPayload::Image { media_type:"image/png".into(), base64:"aGVsbG8=".into() } });
+    let mut assistant = ChatMessage::new_assistant("Prior final answer.");
+    assistant.thinking = "PRIVATE_THINKING_MARKER".into();
+    assistant.model_identity = Some(ModelIdentity { requested_model:"DO_NOT_REPLAY_MODEL".into(), reported_model:Some("DO_NOT_REPLAY_RESPONSE".into()) });
+    let mut interrupted = ChatMessage::new_assistant("INTERRUPTED_MARKER");
+    interrupted.interrupted = true;
+    let chat = chat_request("grok-4.6", vec![ChatMessage::new_system("Existing instructions: keep  two spaces."), user, assistant, interrupted, ChatMessage::new_user("Next prompt.")]);
+    let body = adapter::request(&model, adapter::chat_input(&chat, true).unwrap(), &[], ThinkingMode::Level(ThinkingLevel::High)).unwrap().to_xai_value();
+    assert_eq!(body["instructions"], "Existing instructions: keep  two spaces.");
+    assert_eq!(body["input"][0]["content"][0]["text"], "Original prompt.\n\n[Attachment: note.txt]\nAttached text.");
+    assert_eq!(body["input"][0]["content"][1]["image_url"], "data:image/png;base64,aGVsbG8=");
+    assert_eq!(body["input"][1]["content"], "Prior final answer.");
+    assert_eq!(body["input"][2]["content"][0]["text"], "Next prompt.");
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["input"].as_array().unwrap().len(), 3);
+    let encoded = body.to_string();
+    for marker in ["PRIVATE_THINKING_MARKER", "DO_NOT_REPLAY_MODEL", "DO_NOT_REPLAY_RESPONSE", "INTERRUPTED_MARKER"] { assert!(!encoded.contains(marker)); }
 
-#[test]
-fn ordinary_chat_excludes_thinking_and_interrupted_messages_and_gates_images() {
-    let mut user = ChatMessage {
-        id: Uuid::new_v4(),
-        role: Role::User,
-        content: "hello".into(),
-        thinking: String::new(),
-        attachments: Vec::new(),
-        citations: Vec::new(),
-        interrupted: false,
-    };
-    user.thinking = "private-thinking".into();
-    user.attachments.push(Attachment {
-        name: "note.txt".into(),
-        payload: AttachmentPayload::Text("attachment text".into()),
-    });
-    let interrupted = ChatMessage {
-        id: Uuid::new_v4(),
-        role: Role::Assistant,
-        content: "unfinished-response".into(),
-        thinking: String::new(),
-        attachments: Vec::new(),
-        citations: Vec::new(),
-        interrupted: true,
-    };
-    let mut request = ChatRequest {
-        model: "account-current".into(),
-        messages: vec![user, interrupted],
-        thinking: ThinkingMode::Default,
-        context_length: 8192,
-        tools: None,
-        web_search_provider: None,
-        max_search_results: 3,
-        chatgpt_web_request_limit: 1,
-        fetch_search_pages: true,
-        web_authorization: None,
-    };
-    let input = chat_input(&request, false, ApiKind::Responses).unwrap();
-    let wire = serde_json::to_string(&input).unwrap();
-    assert!(wire.contains("attachment text"));
-    assert!(!wire.contains("private-thinking"));
-    assert!(!wire.contains("unfinished-response"));
-    request.messages[0].attachments.push(Attachment {
-        name: "image.png".into(),
-        payload: AttachmentPayload::Image {
-            media_type: "image/png".into(),
-            base64: "fixture-base64".into(),
-        },
-    });
-    assert!(chat_input(&request, false, ApiKind::Responses).is_err());
-    assert_eq!(
-        chat_input(&request, true, ApiKind::Responses).unwrap()[0]["content"][1]["type"],
-        "input_image"
-    );
-}
-
-#[tokio::test]
-async fn catalog_default_chat_completions_handles_tools_final_thinking_and_failure_boundaries() {
-    let first_chunks = [
-        json!({"model": "server-chat-completions-id", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "調べます", "reasoning_content": "separate thinking"}, "finish_reason": null}]}),
-        json!({"choices": [{"index": 0, "delta": {"tool_calls": [
-            {"index": 0, "id": "read-a", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\""}},
-            {"index": 1, "id": "read-b", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}
-        ]}, "finish_reason": null}]}),
-        json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "a.txt\"}"}}]}, "finish_reason": null}]}),
-        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
-        json!({"choices": [], "usage": {"prompt_tokens": 45, "completion_tokens": 18}}),
+    let call = AgentToolCall { id:"call_1".into(), name:"read_file".into(), arguments:json!({"line":12.0}) };
+    let messages = vec![
+        AgentMessage::text(AgentRole::System, "Exact agent instructions."),
+        AgentMessage::text(AgentRole::User, "Read source."),
+        AgentMessage { role:AgentRole::Assistant, content:String::new(), tool_calls:vec![call], tool_call_id:None, tool_name:None },
+        AgentMessage { role:AgentRole::Tool, content:"file contents".into(), tool_calls:vec![], tool_call_id:Some("call_1".into()), tool_name:Some("read_file".into()) },
+        AgentMessage::text(AgentRole::User, "Continue."),
     ];
-    let mut first_bytes: Vec<u8> = first_chunks.into_iter().flat_map(event).collect();
-    first_bytes.extend_from_slice(b"data: [DONE]\r\n\r\n");
-    let final_event = json!({"choices": [{"index": 0, "delta": {"content": "Both files were read."}, "finish_reason": "stop"}]});
-    let mut final_bytes = event(final_event.clone());
-    final_bytes.extend_from_slice(b"data: [DONE]\n\n");
-    let mut fixture = Fixture::start(vec![
-        Reply::json(json!({"access_token": "fixture-refreshed-access", "refresh_token": "fixture-rotated-refresh", "expires_in": 3600, "id_token": "new-id-token-is-not-an-identity-replacement"})),
-        Reply::json(
-            json!({"data": [{"id": "catalog-default", "contextWindow": 64000,
-            "supportsReasoningEffort": true, "reasoningEfforts": ["low", "medium", "high"]}]}),
-        ),
-        Reply {
-            status: "200 OK",
-            content_type: "text/event-stream",
-            body: first_bytes,
-        },
-        Reply {
-            status: "200 OK",
-            content_type: "text/event-stream",
-            body: final_bytes,
-        },
-    ])
-    .await;
-    let store = Arc::new(MemoryStore::default());
-    saved_token(&store, true);
-    let mut prior = store.load().unwrap().unwrap();
-    prior.user_id = Some("official-team-principal".into());
-    prior.principal_type = Some("Team".into());
-    prior.principal_id = Some("official-team-principal".into());
-    store.save(&prior).unwrap();
-    let client = GrokClient::configured(
-        AuthEndpoints {
-            authorize: format!("{}/authorize", fixture.base),
-            token: format!("{}/token", fixture.base),
-            userinfo: format!("{}/userinfo", fixture.base),
-        },
-        format!("{}/v1", fixture.base),
-        store.clone(),
-    );
-    let (events, mut receiver) = mpsc::unbounded_channel();
-    let tool = || ToolDefinition {
-        name: "read_file".into(),
-        description: "Read a file".into(),
-        parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
-    };
-    let first = client
-        .turn(
-            AgentRequest {
-                model: "catalog-default".into(),
-                messages: vec![message(AgentRole::User, "Read both")],
-                tools: vec![tool()],
-                thinking: ThinkingMode::Level(ThinkingLevel::Medium),
-                context_length: 8192,
-            },
-            events.clone(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(first.content, "調べます");
-    assert_eq!(first.tool_calls.len(), 2);
-    assert_eq!(first.tool_calls[0].arguments, json!({"path": "a.txt"}));
-    assert_eq!(first.tool_calls[1].id, "read-b");
-    assert_eq!(first.prompt_tokens, Some(45));
-    let mut saw_thinking = false;
-    while let Ok(delta) = receiver.try_recv() {
-        if let ModelDelta::Thinking(text) = delta {
-            saw_thinking |= text == "separate thinking";
-        }
+    let tool = ToolDefinition { name:"read_file".into(), description:"Read source".into(), parameters:json!({"type":"object", "properties":{"line":{"type":"integer"}}}) };
+    let body = adapter::request(&admitted("grok-4.5"), adapter::agent_input(&messages).unwrap(), &[tool], ThinkingMode::Default).unwrap().to_xai_value();
+    assert_eq!(body["model"], "grok-4.5");
+    assert_eq!(body["instructions"], "Exact agent instructions.");
+    assert_eq!(body["input"][1]["type"], "function_call");
+    assert_eq!(body["input"][1]["call_id"], "call_1");
+    assert_eq!(body["input"][1]["arguments"], "{\"line\":12}");
+    assert_eq!(body["input"][2], json!({"type":"function_call_output", "call_id":"call_1", "output":"file contents"}));
+    assert_eq!(body["tools"][0]["name"], "read_file");
+    assert_eq!(body["tool_choice"], "auto");
+    assert!(body.get("reasoning").is_none());
+}
+
+#[tokio::test]
+async fn bridge_stream_preserves_reference_eof_and_failure_behavior() {
+    let events = vec![
+        json!({"type":"response.created", "response":{"id":"resp_eof"}}),
+        json!({"type":"response.output_text.delta", "item_id":"msg_eof", "output_index":0, "delta":"streamed answer"}),
+    ];
+    let turn = adapter::consume(transport::fixture_events(sse(&events, false)), &[], |_| Ok(())).await.unwrap();
+    assert_eq!(turn.content, "streamed answer");
+    for terminal in ["response.failed", "response.incomplete"] {
+        let mut failed = events.clone();
+        failed.push(json!({"type":terminal, "response":{"id":"resp_eof"}}));
+        assert!(adapter::consume(transport::fixture_events(sse(&failed, false)), &[], |_| Ok(())).await.is_err());
     }
-    assert!(saw_thinking);
-    let mut assistant = message(AgentRole::Assistant, &first.content);
-    assistant.tool_calls = first.tool_calls;
-    let mut a = message(AgentRole::Tool, "A");
-    a.tool_call_id = Some("read-a".into());
-    a.tool_name = Some("read_file".into());
-    let mut b = message(AgentRole::Tool, "B");
-    b.tool_call_id = Some("read-b".into());
-    b.tool_name = Some("read_file".into());
-    let last = client
-        .turn(
-            AgentRequest {
-                model: "catalog-default".into(),
-                messages: vec![message(AgentRole::User, "Read both"), assistant, a, b],
-                tools: vec![tool()],
-                thinking: ThinkingMode::Default,
-                context_length: 8192,
-            },
-            events,
-        )
-        .await
-        .unwrap();
-    assert_eq!(last.content, "Both files were read.");
-    fixture.task.await.unwrap();
-    let refresh_request = fixture.requests.recv().await.unwrap();
-    assert_eq!(refresh_request.path, "/token");
-    assert_eq!(refresh_request.headers["x-grok-client-version"], "1.0.24");
-    let refresh: HashMap<String, String> = url::form_urlencoded::parse(&refresh_request.body)
-        .into_owned()
-        .collect();
-    assert_eq!(refresh["grant_type"], "refresh_token");
-    assert_eq!(refresh["principal_type"], "Team");
-    assert_eq!(refresh["principal_id"], "official-team-principal");
-    let saved = store.load().unwrap().unwrap();
-    assert_eq!(saved.user_id.as_deref(), Some("official-team-principal"));
-    assert_eq!(saved.principal_type.as_deref(), Some("Team"));
-    assert_eq!(
-        saved.principal_id.as_deref(),
-        Some("official-team-principal")
-    );
-    assert_eq!(
-        saved.refresh_token.as_deref(),
-        Some("fixture-rotated-refresh")
-    );
-    let catalog = fixture.requests.recv().await.unwrap();
-    let first = fixture.requests.recv().await.unwrap();
-    let second = fixture.requests.recv().await.unwrap();
-    for request in [&catalog, &first, &second] {
-        assert_eq!(
-            request.headers["authorization"],
-            "Bearer fixture-refreshed-access"
-        );
-        assert_eq!(request.headers["x-userid"], "official-team-principal");
-        assert_eq!(request.headers["x-grok-user-id"], "official-team-principal");
-        assert_eq!(request.headers["x-grok-client-identifier"], "grok-shell");
-        assert_eq!(request.headers["x-grok-client-mode"], "headless");
-    }
-    assert_eq!(first.path, "/v1/chat/completions");
-    assert_eq!(second.path, "/v1/chat/completions");
-    let first: Value = serde_json::from_slice(&first.body).unwrap();
-    let second: Value = serde_json::from_slice(&second.body).unwrap();
-    assert!(first.get("input").is_none());
-    assert_eq!(first["tools"][0]["function"]["name"], "read_file");
-    assert_eq!(first["reasoning_effort"], "medium");
-    assert_eq!(first["stream_options"]["include_usage"], true);
-    assert_eq!(
-        first["max_tokens"],
-        crate::agent::reserved_output_tokens(8192)
-    );
-    assert_eq!(first["store"], false);
-    assert_eq!(second["messages"][1]["tool_calls"][0]["id"], "read-a");
-    assert_eq!(second["messages"][2]["tool_call_id"], "read-a");
-    assert_eq!(second["messages"][3]["tool_call_id"], "read-b");
-    assert!(
-        !serde_json::to_string(&second)
-            .unwrap()
-            .contains("separate thinking")
-    );
-    for bytes in [
-        event(final_event), // successful finish_reason without [DONE] is incomplete
-        b"data: [DONE]\n\n".to_vec(), // [DONE] without finish_reason is incomplete
-        event(json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]})),
-        event(json!({"error": {"message": "provider failure"}})),
-    ] {
-        let chunks = bytes
-            .chunks(1)
-            .map(|chunk| Ok::<_, ()>(Bytes::copy_from_slice(chunk)))
-            .collect::<Vec<_>>();
-        assert!(
-            completions::consume(futures_util::stream::iter(chunks), |_| Ok(()))
-                .await
-                .is_err()
-        );
-    }
+    assert!(adapter::consume(transport::fixture_events(vec![Bytes::from_static(b"data: not-json\n\n")]), &[], |_| Ok(())).await.is_err());
 }
