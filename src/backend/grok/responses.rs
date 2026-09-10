@@ -48,7 +48,7 @@ pub(super) fn tools(definitions: &[ToolDefinition]) -> Result<Vec<Value>, String
 pub(super) async fn consume<S, E>(
     mut stream: S,
     mut emit: impl FnMut(OutputDelta) -> Result<(), String>,
-) -> Result<AgentTurn, String>
+) -> Result<(AgentTurn, Option<String>), String>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
@@ -135,6 +135,7 @@ struct PendingCall {
 struct ResponseState {
     content: String,
     calls: HashMap<String, PendingCall>,
+    reported_model: Option<String>,
 }
 
 impl ResponseState {
@@ -143,7 +144,13 @@ impl ResponseState {
         event: Value,
         hint: Option<&str>,
         emit: &mut impl FnMut(OutputDelta) -> Result<(), String>,
-    ) -> Result<Option<AgentTurn>, String> {
+    ) -> Result<Option<(AgentTurn, Option<String>)>, String> {
+        super::record_reported_model(
+            &mut self.reported_model,
+            event
+                .get("response")
+                .and_then(|response| response.get("model")),
+        )?;
         let kind = event
             .get("type")
             .and_then(Value::as_str)
@@ -257,7 +264,7 @@ impl ResponseState {
         &self,
         response: &Value,
         emit: &mut impl FnMut(OutputDelta) -> Result<(), String>,
-    ) -> Result<AgentTurn, String> {
+    ) -> Result<(AgentTurn, Option<String>), String> {
         if response.get("status").and_then(Value::as_str) != Some("completed")
             || response.get("error").is_some_and(|error| !error.is_null())
         {
@@ -358,16 +365,19 @@ impl ResponseState {
             emit(OutputDelta::Content(suffix.into()))?;
         }
         let usage = response.get("usage");
-        Ok(AgentTurn {
-            content,
-            tool_calls,
-            prompt_tokens: usage
-                .and_then(|usage| usage.get("input_tokens"))
-                .and_then(Value::as_u64),
-            completion_tokens: usage
-                .and_then(|usage| usage.get("output_tokens"))
-                .and_then(Value::as_u64),
-        })
+        Ok((
+            AgentTurn {
+                content,
+                tool_calls,
+                prompt_tokens: usage
+                    .and_then(|usage| usage.get("input_tokens"))
+                    .and_then(Value::as_u64),
+                completion_tokens: usage
+                    .and_then(|usage| usage.get("output_tokens"))
+                    .and_then(Value::as_u64),
+            },
+            self.reported_model.clone(),
+        ))
     }
 }
 

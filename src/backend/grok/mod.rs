@@ -17,14 +17,12 @@ use crate::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -43,6 +41,10 @@ const OAUTH_API_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 // Keep this tied to the implemented reference contract, not a fetched latest
 // release. Taceta's own version remains in its User-Agent.
 const GROK_BUILD_COMPATIBILITY_VERSION: &str = "1.0.24";
+// Reused from the working MIT grok-codex-bridge transport. These identify the
+// proxy protocol; Taceta keeps its own product identity in User-Agent and UI.
+const PROXY_CLIENT_IDENTIFIER: &str = "grok-shell";
+const PROXY_CLIENT_MODE: &str = "headless";
 const CANCELLED: &str = "Grok generation was cancelled.";
 
 pub enum GrokLoginEvent {
@@ -60,8 +62,6 @@ struct Inner {
     auth: AuthManager,
     api_base: String,
     models: RwLock<HashMap<String, ModelInfo>>,
-    session: String,
-    turn: AtomicU64,
 }
 
 impl Default for GrokClient {
@@ -98,8 +98,6 @@ impl GrokClient {
                 http,
                 api_base,
                 models: RwLock::new(HashMap::new()),
-                session: Uuid::new_v4().to_string(),
-                turn: AtomicU64::new(0),
             }),
         }
     }
@@ -136,30 +134,33 @@ impl GrokClient {
         path: &str,
         model: Option<&str>,
     ) -> Result<reqwest::RequestBuilder, String> {
-        let token = self.inner.auth.access_token().await?;
-        let request_id = Uuid::new_v4().to_string();
-        let mut request = self
-            .inner
-            .http
-            .request(method, format!("{}{path}", self.inner.api_base))
-            .bearer_auth(token.as_str())
-            .header("X-XAI-Token-Auth", "xai-grok-cli")
-            .header("x-authenticateresponse", "authenticate-response")
-            .header("x-grok-client-identifier", "taceta")
-            .header("x-grok-client-version", GROK_BUILD_COMPATIBILITY_VERSION)
-            .header("x-grok-client-mode", "interactive")
-            .header("x-grok-session-id", &self.inner.session)
-            .header("x-grok-conv-id", &self.inner.session)
-            .header("x-grok-agent-id", &self.inner.session)
-            .header("x-grok-req-id", request_id)
-            .header(
-                "x-grok-turn-idx",
-                self.inner.turn.fetch_add(1, Ordering::Relaxed).to_string(),
-            );
+        let credential = self.inner.auth.session_credential().await?;
+        let mut request = self.authenticated(
+            self.inner
+                .http
+                .request(method, format!("{}{path}", self.inner.api_base)),
+            &credential,
+        );
         if let Some(model) = model {
             request = request.header("x-grok-model-override", model);
         }
         Ok(request)
+    }
+
+    fn authenticated(
+        &self,
+        builder: reqwest::RequestBuilder,
+        credential: &auth::SessionCredential,
+    ) -> reqwest::RequestBuilder {
+        builder
+            .bearer_auth(credential.token())
+            .header("X-XAI-Token-Auth", "xai-grok-cli")
+            .header("x-authenticateresponse", "authenticate-response")
+            .header("x-userid", credential.user_id())
+            .header("x-grok-user-id", credential.user_id())
+            .header("x-grok-client-mode", PROXY_CLIENT_MODE)
+            .header("x-grok-client-identifier", PROXY_CLIENT_IDENTIFIER)
+            .header("x-grok-client-version", GROK_BUILD_COMPATIBILITY_VERSION)
     }
 
     async fn fetch_models(&self) -> Result<Vec<ModelDescriptor>, String> {
@@ -217,10 +218,18 @@ impl GrokClient {
         model: &str,
         api: ApiKind,
     ) -> Result<reqwest::Response, String> {
+        let conversation_id = request_conversation_id(&body);
         let response = self
             .request(reqwest::Method::POST, api.path(), Some(model))
             .await?
             .header("Accept", "text/event-stream")
+            .header("x-grok-conv-id", conversation_id.to_string())
+            .header("x-grok-session-id", conversation_id.to_string())
+            .header("x-grok-req-id", Uuid::new_v4().to_string())
+            .header("x-grok-agent-id", Uuid::new_v4().to_string())
+            // Like the bridge, Taceta sends the complete input history. Each
+            // request is the first wire turn, not a server-side continuation.
+            .header("x-grok-turn-idx", "1")
             .json(&body)
             .send()
             .await
@@ -269,7 +278,7 @@ impl GrokClient {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect();
-            let result = consume(model.api, response, |delta| {
+            let (result, _) = consume(model.api, response, |delta| {
                 events
                     .send(match delta {
                         OutputDelta::Content(text) => ModelDelta::Content(text),
@@ -316,7 +325,12 @@ impl GrokClient {
             )?;
             let started = Instant::now();
             let response = self.response(body, &request.model, model.api).await?;
-            let result = consume(model.api, response, |delta| {
+            let endpoint = format!(
+                "{}{}",
+                response.url().origin().ascii_serialization(),
+                response.url().path()
+            );
+            let (result, reported_model) = consume(model.api, response, |delta| {
                 events
                     .send(match delta {
                         OutputDelta::Content(text) => GenerationEvent::ContentDelta(text),
@@ -328,6 +342,17 @@ impl GrokClient {
             if !result.tool_calls.is_empty() {
                 return Err(
                     "Grok returned function calls in a chat that did not offer tools.".into(),
+                );
+            }
+            if std::env::var("TACETA_GROK_CONNECTION_TRACE").as_deref() == Ok("1") {
+                eprintln!(
+                    "taceta_grok_connection {}",
+                    json!({
+                        "endpoint": endpoint,
+                        "requested_model": request.model,
+                        "reported_model": reported_model,
+                        "user_id_headers_set": true,
+                    })
                 );
             }
             events
@@ -428,6 +453,50 @@ fn chat_input(request: &ChatRequest, vision: bool, api: ApiKind) -> Result<Vec<V
     Ok(input)
 }
 
+fn request_conversation_id(body: &Value) -> Uuid {
+    // Reuse the working bridge's full-history routing rule: the opening
+    // instruction/message pair anchors the conversation; later turns do not.
+    let mut anchor = Vec::with_capacity(2);
+    if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
+        anchor.push(json!({"type": "message", "role": "developer",
+            "content": [{"type": "input_text", "text": instructions}]}));
+    }
+    if let Some(first) = body
+        .get("input")
+        .or_else(|| body.get("messages"))
+        .and_then(Value::as_array)
+        .and_then(|input| input.first())
+    {
+        anchor.push(first.clone());
+    }
+    if anchor.is_empty() {
+        return Uuid::new_v4();
+    }
+    let digest = Sha256::digest(Value::Array(anchor).to_string().as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn record_reported_model(
+    current: &mut Option<String>,
+    value: Option<&Value>,
+) -> Result<(), String> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let model = value
+        .as_str()
+        .ok_or("Grok returned an invalid response model identifier.")?;
+    if current.as_deref().is_some_and(|prior| prior != model) {
+        return Err("Grok reported conflicting model identifiers within one response.".into());
+    }
+    *current = Some(model.to_owned());
+    Ok(())
+}
+
 fn payload(
     name: &str,
     model: &ModelInfo,
@@ -467,7 +536,7 @@ async fn consume(
     api: ApiKind,
     response: reqwest::Response,
     emit: impl FnMut(OutputDelta) -> Result<(), String>,
-) -> Result<AgentTurn, String> {
+) -> Result<(AgentTurn, Option<String>), String> {
     match api {
         ApiKind::Responses => responses::consume(response.bytes_stream(), emit).await,
         ApiKind::ChatCompletions => completions::consume(response.bytes_stream(), emit).await,

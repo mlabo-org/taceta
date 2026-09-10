@@ -16,7 +16,7 @@ use tokio::{
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{GrokLoginEvent, read_bounded};
+use super::{GROK_BUILD_COMPATIBILITY_VERSION, GrokLoginEvent, read_bounded};
 
 // Public Grok Build registration, not a Taceta registration or client secret.
 // Protocol provenance: xai-org/grok-build, commit
@@ -34,12 +34,39 @@ pub(super) struct Credentials {
     pub(super) access_token: String,
     pub(super) refresh_token: Option<String>,
     pub(super) expires_at: Option<u64>,
+    #[serde(default)]
+    pub(super) user_id: Option<String>,
+    #[serde(default)]
+    pub(super) principal_type: Option<String>,
+    #[serde(default)]
+    pub(super) principal_id: Option<String>,
 }
 
 impl Drop for Credentials {
     fn drop(&mut self) {
         self.access_token.zeroize();
         self.refresh_token.zeroize();
+        self.user_id.zeroize();
+        self.principal_type.zeroize();
+        self.principal_id.zeroize();
+    }
+}
+
+// The working bridge's proxy contract is a token AND its authenticated user ID.
+// Keep that complete pair together; an old token-only Keychain entry must first
+// acquire its identity from the official OAuth service.
+pub(super) struct SessionCredential {
+    token: Zeroizing<String>,
+    user_id: Zeroizing<String>,
+}
+
+impl SessionCredential {
+    pub(super) fn token(&self) -> &str {
+        self.token.as_str()
+    }
+
+    pub(super) fn user_id(&self) -> &str {
+        self.user_id.as_str()
     }
 }
 
@@ -95,6 +122,7 @@ impl CredentialStore for KeychainStore {
 pub(super) struct AuthEndpoints {
     pub(super) authorize: String,
     pub(super) token: String,
+    pub(super) userinfo: String,
 }
 
 impl Default for AuthEndpoints {
@@ -102,6 +130,7 @@ impl Default for AuthEndpoints {
         Self {
             authorize: "https://auth.x.ai/oauth2/authorize".into(),
             token: "https://auth.x.ai/oauth2/token".into(),
+            userinfo: "https://auth.x.ai/oauth2/userinfo".into(),
         }
     }
 }
@@ -183,12 +212,12 @@ impl AuthManager {
         Ok(())
     }
 
-    pub(super) async fn access_token(&self) -> Result<Zeroizing<String>, String> {
+    pub(super) async fn session_credential(&self) -> Result<SessionCredential, String> {
         // The store is reread after acquiring this lock so every simultaneous
         // request observes the first request's rotated refresh token.
         let _refresh = self.refresh.lock().await;
         let epoch = self.epoch();
-        let token = self
+        let mut token = self
             .load()?
             .ok_or("Connect to Grok before using this provider.")?;
         if token.access_token.is_empty() {
@@ -196,27 +225,55 @@ impl AuthManager {
         }
         if token
             .expires_at
-            .is_none_or(|expiry| expiry > now().saturating_add(60))
+            .is_some_and(|expiry| expiry <= now().saturating_add(60))
         {
-            return Ok(Zeroizing::new(token.access_token.clone()));
-        }
-        let refresh = token
-            .refresh_token
-            .as_deref()
-            .filter(|token| !token.is_empty())
-            .ok_or("Grok sign-in has expired. Connect to Grok again.")?;
-        let mut updated = self
-            .exchange(&[
+            preserve_token_principal(&mut token);
+            let refresh = token
+                .refresh_token
+                .as_deref()
+                .filter(|token| !token.is_empty())
+                .ok_or("Grok sign-in has expired. Connect to Grok again.")?;
+            let mut form = vec![
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh),
                 ("client_id", CLIENT_ID),
-            ])
-            .await?;
-        if updated.refresh_token.is_none() {
-            updated.refresh_token = token.refresh_token.clone();
+            ];
+            if let Some(kind) = token.principal_type.as_deref() {
+                form.push(("principal_type", kind));
+            }
+            if let Some(id) = token.principal_id.as_deref() {
+                form.push(("principal_id", id));
+            }
+            let mut updated = self.exchange(&form).await?;
+            if updated.refresh_token.is_none() {
+                updated.refresh_token = token.refresh_token.clone();
+            }
+            // Grok Build's oidc/refresh.rs deliberately reuses the identity
+            // chosen at login, including principal selection, across rotation.
+            updated.user_id = token.user_id.clone();
+            updated.principal_type = token.principal_type.clone();
+            updated.principal_id = token.principal_id.clone();
+            // Preserve a rotated refresh token even if the subsequent one-time
+            // identity lookup for an old token-only entry cannot finish.
+            self.save_if_current(&updated, epoch, false)?;
+            token = updated;
         }
-        self.save_if_current(&updated, epoch, false)?;
-        Ok(Zeroizing::new(updated.access_token.clone()))
+        if token
+            .user_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            self.complete_identity(&mut token).await?;
+            self.save_if_current(&token, epoch, false)?;
+        }
+        let user_id = token
+            .user_id
+            .as_deref()
+            .ok_or("Grok did not provide an account identity.")?;
+        Ok(SessionCredential {
+            token: Zeroizing::new(token.access_token.clone()),
+            user_id: Zeroizing::new(user_id.to_owned()),
+        })
     }
 
     pub(super) async fn sign_in(
@@ -234,8 +291,8 @@ impl AuthManager {
         let redirect = format!("http://127.0.0.1:{}/callback", address.port());
         let verifier = Zeroizing::new(random_parameter());
         let state = Zeroizing::new(random_parameter());
-        // A nonce is included in this OIDC authorization request. ID tokens
-        // are never decoded or used for identity; Taceta uses only the access token.
+        // Personal identity is obtained from authenticated OIDC userinfo.
+        // An ID token is never accepted through an unverified local JWT decode.
         let nonce = Zeroizing::new(random_parameter());
         let mut authorize = Url::parse(&self.endpoints.authorize)
             .map_err(|_| "Grok authorization endpoint is invalid.".to_string())?;
@@ -276,15 +333,66 @@ impl AuthManager {
             ("client_id", CLIENT_ID),
             ("code_verifier", verifier.as_str()),
         ];
-        let token = tokio::select! {
+        let mut token = tokio::select! {
             _ = events.closed() => return Err("Grok sign-in was cancelled.".into()),
             token = self.exchange(&form) => token?,
         };
+        tokio::select! {
+            _ = events.closed() => return Err("Grok sign-in was cancelled.".into()),
+            result = self.complete_identity(&mut token) => result?,
+        }
         self.save_if_current(&token, epoch, true)
+    }
+
+    async fn complete_identity(&self, token: &mut Credentials) -> Result<(), String> {
+        preserve_token_principal(token);
+        if token.principal_type.as_deref() == Some("Team") {
+            // This is the provider-issued principal from the access token, as
+            // used by Grok Build's oidc/protocol.rs. It is only a routing hint;
+            // the proxy validates the signed bearer and remains authoritative.
+            token.user_id = token
+                .principal_id
+                .clone()
+                .filter(|id| !id.trim().is_empty());
+            return token.user_id.as_ref().map(|_| ()).ok_or_else(|| {
+                "Grok's team credential has no principal ID. Connect to Grok again.".into()
+            });
+        }
+        // Official endpoint published by auth.x.ai OIDC discovery. Use its
+        // authenticated subject, never a guessed ID or an unverified JWT sub.
+        let response = self
+            .http
+            .get(&self.endpoints.userinfo)
+            .bearer_auth(&token.access_token)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(
+                |_| "Unable to obtain Grok account identity. Your saved credential was preserved.",
+            )?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Grok account identity lookup failed (HTTP {}). Connect to Grok again.",
+                response.status().as_u16()
+            ));
+        }
+        #[derive(Deserialize)]
+        struct UserInfo {
+            sub: String,
+        }
+        let bytes = Zeroizing::new(read_bounded(response, 256 * 1024).await?);
+        let info: UserInfo = serde_json::from_slice(&bytes)
+            .map_err(|_| "Grok returned an invalid account identity.")?;
+        if info.sub.trim().is_empty() {
+            return Err("Grok returned an empty account identity.".into());
+        }
+        token.user_id = Some(info.sub);
+        Ok(())
     }
 
     async fn exchange(&self, form: &[(&str, &str)]) -> Result<Credentials, String> {
         let response = self.http.post(&self.endpoints.token)
+            .header("x-grok-client-version", GROK_BUILD_COMPATIBILITY_VERSION)
             .timeout(Duration::from_secs(15)).form(form).send().await
             .map_err(|_| "Unable to contact Grok's authorization service. Your saved credential was preserved.".to_string())?;
         let status = response.status();
@@ -334,7 +442,46 @@ impl AuthManager {
             expires_at: token
                 .expires_in
                 .map(|seconds| now().saturating_add(seconds)),
+            user_id: None,
+            principal_type: None,
+            principal_id: None,
         })
+    }
+}
+
+fn preserve_token_principal(token: &mut Credentials) {
+    if token.principal_type.is_some() || token.principal_id.is_some() {
+        return;
+    }
+    // Match Grok Build's peek_access_token_principal: retain the principal
+    // selected on the provider's consent screen for subsequent refresh grants.
+    // These claims do not authenticate a user; the server validates the bearer.
+    #[derive(Deserialize)]
+    struct Principal {
+        #[serde(default, alias = "principalType")]
+        principal_type: Option<String>,
+        #[serde(default, alias = "principalId")]
+        principal_id: Option<String>,
+    }
+    let mut pieces = token.access_token.split('.');
+    let (Some(_), Some(payload), Some(_), None) =
+        (pieces.next(), pieces.next(), pieces.next(), pieces.next())
+    else {
+        return;
+    };
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload) else {
+        return;
+    };
+    let bytes = Zeroizing::new(bytes);
+    let Ok(principal) = serde_json::from_slice::<Principal>(&bytes) else {
+        return;
+    };
+    if let (Some(kind), Some(id)) = (principal.principal_type, principal.principal_id)
+        && !kind.trim().is_empty()
+        && !id.trim().is_empty()
+    {
+        token.principal_type = Some(kind);
+        token.principal_id = Some(id);
     }
 }
 
