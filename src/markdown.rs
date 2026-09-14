@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
+    ops::Range,
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -1068,50 +1069,152 @@ fn render_inline_line(
     presentation: InlinePresentation,
     context: &RenderContext,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        let original_spacing = ui.spacing().item_spacing;
-        ui.spacing_mut().item_spacing.x = 0.0;
-        for inline in content {
-            match &inline.kind {
-                InlineKind::Text(value) => {
-                    render_rich_text(ui, value, &inline.style, presentation, false);
-                }
-                InlineKind::Code(value) => {
-                    render_rich_text(ui, value, &inline.style, presentation, true);
-                }
-                InlineKind::InlineMath(formula) => {
-                    let text = RichText::new(format_inline_math(formula))
-                        .monospace()
-                        .color(ui.visuals().strong_text_color());
-                    ui.add(Label::new(text).wrap());
-                }
-                InlineKind::Image {
-                    destination,
-                    title,
-                    alt,
-                } => render_image_reference(ui, destination, title, alt),
-                InlineKind::FootnoteReference(label) => {
-                    ui.label(
-                        RichText::new(format!("[{}]", context.footnote_number(label)))
-                            .small()
-                            .strong()
-                            .color(ui.visuals().hyperlink_color),
-                    );
-                }
-                InlineKind::HardBreak | InlineKind::DisplayMath(_) => {}
+    // A paragraph is one layout job. Separate wrapping labels introduce first-row
+    // indentation for every style change; a later long word can carry that offset
+    // into subsequent rows and expand the parent UI to the left.
+    let mut job = LayoutJob::default();
+    let mut links: Vec<InlineLink> = Vec::new();
+    let mut character_count = 0;
+    for inline in content {
+        let text = match &inline.kind {
+            InlineKind::Text(value) => {
+                styled_inline_text(ui, value, &inline.style, presentation, false)
+            }
+            InlineKind::Code(value) => {
+                styled_inline_text(ui, value, &inline.style, presentation, true)
+            }
+            InlineKind::InlineMath(formula) => RichText::new(format_inline_math(formula))
+                .monospace()
+                .color(ui.visuals().strong_text_color()),
+            InlineKind::FootnoteReference(label) => {
+                RichText::new(format!("[{}]", context.footnote_number(label)))
+                    .small()
+                    .strong()
+                    .color(ui.visuals().hyperlink_color)
+            }
+            InlineKind::Image { destination, title, alt } => {
+                render_inline_job(ui, std::mem::take(&mut job), &links);
+                links.clear();
+                character_count = 0;
+                render_image_reference(ui, destination, title, alt);
+                continue;
+            }
+            InlineKind::HardBreak | InlineKind::DisplayMath(_) => continue,
+        };
+        let start = character_count;
+        character_count += text.text().chars().count();
+        if let Some(url) = &inline.style.link {
+            if let Some(previous) = links.last_mut()
+                && previous.url == *url
+                && previous.characters.end == start
+            {
+                previous.characters.end = character_count;
+                previous.label.push_str(text.text());
+            } else {
+                links.push(InlineLink {
+                    characters: start..character_count,
+                    label: text.text().to_owned(),
+                    url: url.clone(),
+                });
             }
         }
-        ui.spacing_mut().item_spacing = original_spacing;
-    });
+        text.append_to(&mut job, ui.style(), eframe::egui::FontSelection::Default, Align::Center);
+    }
+    render_inline_job(ui, job, &links);
 }
 
-fn render_rich_text(
-    ui: &mut Ui,
+struct InlineLink {
+    characters: Range<usize>,
+    label: String,
+    url: String,
+}
+
+fn render_inline_job(ui: &mut Ui, mut job: LayoutJob, links: &[InlineLink]) {
+    if job.text.is_empty() {
+        return;
+    }
+    job.wrap.max_width = ui.available_width();
+    job.halign = ui.layout().horizontal_placement();
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let response = ui.add(Label::new(Arc::clone(&galley)));
+    let paragraph_id = response.id;
+    let origin = match galley.job.halign {
+        Align::Min => response.rect.left_top(),
+        Align::Center => response.rect.center_top(),
+        Align::Max => response.rect.right_top(),
+    };
+    for (link_index, link) in links.iter().enumerate() {
+        let mut response: Option<eframe::egui::Response> = None;
+        let rects = inline_link_rects(&galley, link.characters.clone());
+        for (row_index, rect) in rects.iter().enumerate() {
+            let mut sense = eframe::egui::Sense::click();
+            if row_index > 0 {
+                sense -= eframe::egui::Sense::FOCUSABLE;
+            }
+            let row_response = ui.interact(
+                rect.translate(origin.to_vec2()),
+                paragraph_id.with(("inline-link", link_index, row_index)),
+                sense,
+            );
+            response = Some(match response {
+                Some(previous) => previous | row_response,
+                None => row_response,
+            });
+        }
+        if let Some(response) = response {
+            response.widget_info(|| eframe::egui::WidgetInfo::labeled(
+                eframe::egui::WidgetType::Link, ui.is_enabled(), &link.label,
+            ));
+            if response.hovered() || response.has_focus() {
+                for rect in &rects {
+                    let rect = rect.translate(origin.to_vec2());
+                    ui.painter().line_segment(
+                        [rect.left_bottom(), rect.right_bottom()],
+                        eframe::egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
+                    );
+                }
+            }
+            if response.clicked_with_open_in_background() || response.clicked() {
+                ui.open_url(eframe::egui::OpenUrl {
+                    url: link.url.clone(),
+                    new_tab: response.clicked_with_open_in_background(),
+                });
+            }
+            let response = response.on_hover_cursor(eframe::egui::CursorIcon::PointingHand);
+            if ui.style().url_in_tooltip {
+                response.on_hover_text(&link.url);
+            }
+        }
+    }
+}
+
+fn inline_link_rects(galley: &eframe::egui::Galley, characters: Range<usize>) -> Vec<eframe::egui::Rect> {
+    let mut rects = Vec::new();
+    let mut row_start = 0;
+    for row in &galley.rows {
+        let row_end = row_start + row.row.glyphs.len();
+        let start = characters.start.max(row_start);
+        let end = characters.end.min(row_end);
+        if start < end {
+            let first = &row.row.glyphs[start - row_start];
+            let last = &row.row.glyphs[end - row_start - 1];
+            rects.push(eframe::egui::Rect::from_min_max(
+                row.pos + eframe::egui::vec2(first.pos.x, 0.0),
+                row.pos + eframe::egui::vec2(last.max_x(), row.height()),
+            ));
+        }
+        row_start = row_end + usize::from(row.ends_with_newline);
+    }
+    rects
+}
+
+fn styled_inline_text(
+    ui: &Ui,
     value: &str,
     style: &InlineStyle,
     presentation: InlinePresentation,
     code: bool,
-) {
+) -> RichText {
     let mut text = RichText::new(value);
     if code {
         text = text
@@ -1134,11 +1237,10 @@ fn render_rich_text(
         text = text.size(font_size);
     }
 
-    if let Some(url) = style.link.as_deref() {
-        ui.hyperlink_to(text, url);
-    } else {
-        ui.add(Label::new(text).wrap());
+    if style.link.is_some() {
+        text = text.color(ui.visuals().hyperlink_color);
     }
+    text
 }
 
 fn render_image_reference(ui: &mut Ui, destination: &str, title: &str, alt: &str) {
@@ -1621,6 +1723,47 @@ fn heading_size(ui: &Ui, level: HeadingLevel) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_layout_wrapped_styled_links_open_only_their_text() {
+        use eframe::egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, Shape};
+        let context = eframe::egui::Context::default();
+        let markdown = "Intro [alpha beta **gamma delta** epsilon zeta eta theta iota kappa lambda](https://example.com/reference) trailing text.";
+        let mut frame = |events: Vec<Event>| {
+            context.run_ui(RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 1000.0))),
+                events,
+                ..Default::default()
+            }, |ui| {
+                ui.set_width(220.0);
+                show(ui, markdown);
+            })
+        };
+        let initial = frame(Vec::new());
+        let text = initial.shapes.iter().find_map(|shape| match &shape.shape {
+            Shape::Text(text) if text.galley.job.text.starts_with("Intro ") => Some(text),
+            _ => None,
+        }).expect("paragraph text was drawn");
+        assert!(text.galley.rows.len() >= 3, "the linked label must wrap");
+        let hit = |row_index: usize| {
+            let row = &text.galley.rows[row_index];
+            let glyph = &row.row.glyphs[0];
+            text.pos + row.pos.to_vec2() + Vec2::new(glyph.pos.x + glyph.advance_width / 2.0, row.height() / 2.0)
+        };
+        for (position, expect_url) in [(hit(1), true), (hit(0), false)] {
+            frame(vec![Event::PointerMoved(position), Event::PointerButton {
+                pos: position, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE,
+            }]);
+            let output = frame(vec![Event::PointerButton {
+                pos: position, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE,
+            }]);
+            let urls: Vec<_> = output.platform_output.commands.iter().filter_map(|command| match command {
+                eframe::egui::OutputCommand::OpenUrl(url) => Some(url.url.as_str()),
+                _ => None,
+            }).collect();
+            assert_eq!(urls, if expect_url { vec!["https://example.com/reference"] } else { vec![] });
+        }
+    }
 
     const MARKDOWN_ACCEPTANCE_FIXTURE: &str = r#"# 見出し H1
 ## 見出し H2

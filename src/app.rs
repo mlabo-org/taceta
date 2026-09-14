@@ -3993,6 +3993,93 @@ fn model_candidate_list_height(available_height: f32) -> f32 {
 }
 
 #[cfg(test)]
+mod chat_layout_tests {
+    use super::*;
+
+    const LONG_URL: &str = "https://www.reuters.com/world/europe/trump-says-very-negative-forces-raising-exaggerated-concerns-over-ai-2026-09-13/";
+
+    fn text_rows(shape: &egui::Shape, rows: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                for row in &text.galley.rows {
+                    rows.push((
+                        row.row.glyphs.iter().map(|glyph| glyph.chr).collect(),
+                        row.rect().translate(text.pos.to_vec2()),
+                    ));
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    text_rows(shape, rows);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_assistant(content: &str) -> (Vec<(String, egui::Rect)>, egui::Rect) {
+        let mut app = model_manager_tests::test_app(Arc::default());
+        app.state.show_thinking_trace = true;
+        let context = egui::Context::default();
+        install_macos_system_fonts(&context).expect("macOS system fonts");
+        apply_app_shell_preferences(&context, AppShellPreferences {
+            font_size_points: 23,
+            ..Default::default()
+        });
+        let mut message = ChatMessage::new_assistant(content.to_owned());
+        message.thinking = format!("Thinking before the answer: {LONG_URL}");
+        message.citations = vec![LONG_URL.to_owned()];
+        let bounds = egui::Rect::from_min_size(egui::pos2(300.0, 10.0), Vec2::new(720.0, 6000.0));
+        let mut actual = egui::Rect::NOTHING;
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1800.0, 10000.0))),
+                ..Default::default()
+            },
+            |ui| {
+                actual = ui.scope_builder(egui::UiBuilder::new().max_rect(bounds), |ui| {
+                    app.show_message(ui, &message, false);
+                }).response.rect;
+            },
+        );
+        let mut rows = Vec::new();
+        for shape in output.shapes {
+            text_rows(&shape.shape, &mut rows);
+        }
+        (rows, actual)
+    }
+
+    #[test]
+    fn long_inline_urls_keep_the_answer_and_following_items_inside_the_message() {
+        let content = format!(
+            "Opening paragraph before the list.\n\n**1. 最初の話題**\nこの段落では通常の長さの文章を表示します。\n（出典：https://example.com/first ）\n\n**2. 長い出典がある話題と通常文の折り返し**\n日本語の本文にEnglishと数字が混ざります。長い出典URLが含まれても、文章全体と後続の話題は左端を保ったまま利用可能な幅で折り返されます。\n（出典：{LONG_URL} ）\n\n**3. 後続の話題**\nFollowing item must keep its left edge.\n\nAfter the list remains readable.\n\n[Linked source with a long URL: {LONG_URL}]({LONG_URL})\n\nAfter the link remains readable."
+        );
+        let (rows, actual) = draw_assistant(&content);
+        assert!(rows.iter().any(|(text, _)| text.contains("After the link")));
+        for (text, rect) in &rows {
+            assert!(rect.left() >= 299.0, "left overflow: {text:?} at {rect:?}");
+            assert!(rect.right() <= 891.5, "right overflow: {text:?} at {rect:?}");
+        }
+        assert!(actual.left() >= 299.0 && actual.right() <= 1021.0, "message expanded: {actual:?}");
+    }
+
+    #[test]
+    fn wide_code_and_tables_do_not_shift_following_answer_text() {
+        let code = "very_long_code_identifier_".repeat(60);
+        let content = format!(
+            "Before wide content.\n\n~~~text\n{code}\n~~~\n\nAfter code remains readable.\n\n| One | Two | Three | Four | Five | Six |\n| --- | --- | --- | --- | --- | --- |\n| Value | Value | Value | Value | Value | Value |\n\nAfter table remains readable."
+        );
+        let (rows, actual) = draw_assistant(&content);
+        for marker in ["Before wide", "After code", "After table"] {
+            let (_, rect) = rows.iter().find(|(text, _)| text.contains(marker)).expect("paragraph was drawn");
+            assert!((rect.left() - 300.0).abs() <= 1.0, "shifted {marker}: {rect:?}");
+            assert!(rect.right() <= 891.5, "paragraph overflow: {rect:?}");
+        }
+        assert!(actual.left() >= 299.0 && actual.right() <= 1021.0, "message expanded: {actual:?}");
+    }
+}
+
+#[cfg(test)]
 mod notice_layout_tests {
     use super::*;
 
