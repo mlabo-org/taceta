@@ -849,7 +849,11 @@ impl TacetaApp {
                             // never persisted as an assistant answer.
                             self.remove_message(conversation_id, assistant_id);
                             self.notice = Some(Notice {
-                                kind: NoticeKind::Error,
+                                kind: if error.contains("Taceta Link browser_not_running:") {
+                                    NoticeKind::Warning
+                                } else {
+                                    NoticeKind::Error
+                                },
                                 text: web_search_error_message(&error, self.language()),
                             });
                         } else {
@@ -3797,6 +3801,15 @@ fn is_web_search_error(error: &str) -> bool {
 
 fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
     let lower = error.to_ascii_lowercase();
+    for browser in ["Brave", "Chrome"] {
+        if lower.contains(&format!("taceta link browser_not_running: {}", browser.to_ascii_lowercase())) {
+            return text(
+                language,
+                &format!("{browser}が起動していません。ブラウザーを起動してから、もう一度Web検索してください。"),
+                &format!("{browser} is not running. Start the browser, then try Web Search again."),
+            ).to_owned();
+        }
+    }
     if lower.contains("web routing") {
         return text(
             language,
@@ -4692,6 +4705,23 @@ mod web_search_request_tests {
                 .contains("Ollama Web Search APIキーが未設定です")
         );
         assert!(!is_web_search_error("Ollama endpoint is unavailable"));
+    }
+
+    #[test]
+    fn stopped_browser_notice_preserves_the_required_action() {
+        for (browser, language, action) in [
+            ("Brave", AppShellLanguage::Japanese, "ブラウザーを起動してから"),
+            ("Chrome", AppShellLanguage::English, "Start the browser"),
+        ] {
+            let error = taceta::backend::BackendError::Protocol(
+                taceta::taceta_link_service::LinkError::BrowserNotRunning(browser).to_string(),
+            ).to_string();
+            assert!(is_web_search_error(&error));
+            let notice = web_search_error_message(&error, language);
+            assert!(notice.contains(browser));
+            assert!(notice.contains(action));
+            assert!(!notice.contains("browser_not_running"));
+        }
     }
 
     #[test]
