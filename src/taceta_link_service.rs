@@ -194,6 +194,8 @@ pub enum LinkError {
     InvalidJob(&'static str),
     #[error("browser link is unavailable")]
     Unavailable,
+    #[error("Taceta Link browser_not_running: {0}")]
+    BrowserNotRunning(&'static str),
     #[error("browser authentication is required")]
     AuthRequired,
     #[error("browser request timed out")]
@@ -251,6 +253,38 @@ impl Drop for PendingJobRegistration {
 }
 
 const EXTENSION_HEARTBEAT_TTL: Duration = Duration::from_secs(90);
+
+/// A read-only preflight for an explicit browser request. Starting the browser
+/// remains the user's responsibility; cached extension heartbeats are not proof
+/// that the browser process is still running.
+#[cfg(target_os = "macos")]
+pub fn check_browser_running() -> Result<(), LinkError> {
+    use crate::taceta_link_installer::{BrowserDetection, detect_default_browser};
+    use objc2_app_kit::NSRunningApplication;
+    use objc2_foundation::NSString;
+
+    let browser = match detect_default_browser()
+        .map_err(|error| LinkError::Protocol(error.to_string()))?
+    {
+        BrowserDetection::Supported(browser) => browser,
+        BrowserDetection::Unsupported { .. } => {
+            return Err(LinkError::Protocol(
+                "Web検索には既定ブラウザーをBraveまたはChromeにしてください。 / Set Brave or Chrome as the default browser for Web Search.".into(),
+            ));
+        }
+    };
+    if NSRunningApplication::runningApplicationsWithBundleIdentifier(
+        &NSString::from_str(browser.bundle_id()),
+    ).is_empty() {
+        return Err(LinkError::BrowserNotRunning(browser.display_name()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn check_browser_running() -> Result<(), LinkError> {
+    Err(LinkError::Unavailable)
+}
 
 impl TacetaLinkService {
     /// Returns true only while a protocol-valid extension heartbeat was seen

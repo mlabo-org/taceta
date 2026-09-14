@@ -3855,6 +3855,8 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "libc",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "pulldown-cmark",
  "reqwest",
  "rfd",

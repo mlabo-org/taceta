@@ -933,6 +933,8 @@ async fn execute_tool(
                     auth,
                 )
                 .map_err(|e| BackendError::Protocol(e.to_string()))?;
+                taceta_link_service::check_browser_running()
+                    .map_err(|error| BackendError::Protocol(error.to_string()))?;
                 let wait_ms = link_wait_duration(job.timeout_ms);
                 let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
                 let wait = service.enqueue_and_wait_with_progress(job, progress_tx);
@@ -1025,6 +1027,8 @@ async fn execute_tool(
                     BackendError::Protocol("Taceta Link authorization is missing".into())
                 })?;
                 let job = taceta_link_service::page_fetch_job(url.clone(), auth)
+                    .map_err(|error| BackendError::Protocol(error.to_string()))?;
+                taceta_link_service::check_browser_running()
                     .map_err(|error| BackendError::Protocol(error.to_string()))?;
                 let wait_ms = link_wait_duration(job.timeout_ms);
                 return match tokio::time::timeout(wait_ms, service.enqueue_and_wait(job)).await {

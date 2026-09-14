@@ -157,6 +157,8 @@ Taceta の「Taceta Link をセットアップ」を押すと、macOS のデフ�
 
 Taceta はブラウザーの承認を無断で完了したり、拡張をサイレントインストールしたりしません。Safari などの未対応ブラウザーには登録しません。更新時は拡張管理ページで **Reload（再読み込み）** を押してください。拡張単体の開発・検証と Native Messaging の詳細は [browser-extension/README.md](browser-extension/README.md) を参照してください。
 
+ChatGPT Web／Google 検索を使う前に、既定の Brave／Chrome を起動してください。停止中に検索を開始すると、Taceta は接続を待ち続けず、ブラウザーを起動して再試行するよう案内します。Taceta からブラウザーを自動起動することはありません。
+
 ## 更新とアンインストール
 
 更新時は Taceta を終了し、`./scripts/build-macos-app.sh` の後に `./scripts/install-macos-app.sh` を実行します。その後、ブラウザーの拡張管理ページで Taceta Link を Reload します。app bundle の更新と拡張の Reload は別の操作です。
@@ -337,6 +339,8 @@ Complete these browser steps once:
 5. Confirm extension ID `hefhkgbiiajifedgjlbiklclooifkidg` and the matching version.
 
 Taceta does not silently approve or install the browser extension, and does not register with Safari or other unsupported browsers. After an update, press **Reload** for Taceta Link. See [browser-extension/README.md](browser-extension/README.md) for standalone extension development and Native Messaging details.
+
+Start the default Brave or Chrome browser before using ChatGPT Web or Google Search. If the browser is not running, Taceta asks you to start it and retry instead of waiting for a connection. Taceta does not automatically launch the browser.
 
 ## Update and uninstall
 
