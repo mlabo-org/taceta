@@ -6,7 +6,7 @@
 
 `InferenceBackend` は通常チャットの境界です。モデル、会話入力、添付、Thinking 設定、Web Search 設定を受け取り、Thinking delta、content delta、検索進捗、参照元、完了、失敗を返します。OllamaとGrokは同じ境界に接続する推論先で、各アダプターが固有の通信形式を所有します。Thinking trace は次の入力へ混ぜません。
 
-Ollamaの通常チャットでは、Web Search OFF で外部検索 request を作りません。ON では過去の履歴を除いた現在入力だけをローカルの構造化ルーターへ渡し、`local`、`search_current`、`search_generated` のいずれかを選ばせます。通常会話、普遍的な説明、創作は `local` です。現在性、特定日時点、リリース、価格、存在確認、出典など外部事実に依存する質問は `search_current` とし、モデルの古い知識と矛盾する名前や前提も検索せず否定しません。質問自体をモデルに作らせてから検索する入力は `search_generated` です。明示的な検索命令はルーターを迂回して必ず検索します。自由文、拒否、不正 JSON は `local` へ戻さず、外部未送信の route error として停止します。LLM が通常文で即時検索を予告した場合も、その文を回答として確定せず1ターン1回だけ検索へ昇格します。検索時は設定された executor だけを適用し、外部結果は untrusted context としてローカル Ollama の最終回答に渡します。provider は暗黙に切り替えません。
+Ollamaの通常チャットでは、Web Search OFF で外部検索 request を作りません。ON では過去の履歴を除いた現在入力だけをローカルの構造化ルーターへ渡し、`search_current` または `search_generated` を必ず選ばせます。検索を省く判定はなく、通常会話、普遍的な説明、創作も外部調査の対象です。現在の質問そのものを調べる入力は `search_current` とし、Taceta はモデルが書き換えた検索語ではなく利用者の原文を検索します。モデルの古い知識と矛盾する名前や前提も検索せず否定しません。質問自体をモデルに作らせてから検索する入力は `search_generated` です。明示的な検索命令はルーターを迂回して必ず検索します。自由文、拒否、不正 JSON は内部知識による回答へ戻さず、外部未送信の route error として停止します。検索時は設定された executor だけを適用し、外部結果は untrusted context としてローカル Ollama の最終回答に渡します。provider は暗黙に切り替えません。
 
 Taceta Link は同じ version を持つ MV3 拡張、Native Messaging Host `org.mlabo.taceta.link`、user-only Unix socket で構成します。アプリが job を socket へ置き、拡張が poll して実行結果を返します。product version / protocol version / extension ID の不一致は fail-closed です。Cookie、token、profile、local storage を読み出したり輸出したりしません。
 
@@ -14,7 +14,7 @@ Taceta Link は同じ version を持つ MV3 拡張、Native Messaging Host `org.
 
 ## Web ON の承認と安全境界
 
-Web ON + Send は現在入力のローカル判定を許可し、検索が必要な場合だけ一つの Web turn を作ります。明示検索は判定を迂回し、通常会話は外部へ送りません。ChatGPT Web の turn で作成できる request は設定上限の1〜3件までで、各 job は再利用できない個別の authorization を持ちます。停止またはdropされた未完了jobはqueueとwaiterから取り除き、次のturnへ残しません。結果不明状態の同一jobは再試行しません。検索結果は最終回答そのものではなく、ローカル Ollama が生成する回答の untrusted context です。ログイン、アカウント変更、購入、削除などの destructive/account action は別途利用者の確認が必要です。
+Web ON + Send は現在入力をローカルで判定し、その入力に対する一つの Web turn を必ず作ります。明示検索は判定を迂回します。通常会話も外部調査を省きません。ChatGPT Web の turn で作成できる request は設定上限の1〜3件までで、各 job は再利用できない個別の authorization を持ちます。停止またはdropされた未完了jobはqueueとwaiterから取り除き、次のturnへ残しません。結果不明状態の同一jobは再試行しません。検索結果は最終回答そのものではなく、ローカル Ollama が生成する回答の untrusted context です。ログイン、アカウント変更、購入、削除などの destructive/account action は別途利用者の確認が必要です。
 
 ## インストール責務
 
@@ -48,7 +48,7 @@ This document defines the responsibilities of Taceta's Rust app and Taceta Link,
 
 `InferenceBackend` owns regular chat. It accepts model, conversation input, attachments, Thinking settings, and Web Search settings, then emits Thinking deltas, content deltas, search progress, citations, completion, and failure. Ollama and Grok implement this same boundary, with provider wire formats owned by their adapters. Thinking traces never enter the next input.
 
-In regular Ollama chat, Web Search OFF creates no external search request. When it is ON, a local structured router receives only the current input, never conversation history, and chooses `local`, `search_current`, or `search_generated`. Timeless explanation, writing, and casual conversation stay local. Questions that depend on current, date-specific, released, priced, sourced, existence, or otherwise externally verifiable facts use `search_current`; a name or premise that conflicts with old model knowledge must be verified rather than denied. A request to have the model formulate a question before searching uses `search_generated`. An explicit search command bypasses the router and always searches. Free text, refusal, or invalid JSON never silently falls back to a local answer. If the answering LLM nevertheless announces an immediate search in ordinary text, Taceta suppresses that announcement and promotes it to one real search per turn. The configured executor is used without provider fallback, and external output is untrusted context for a final answer generated locally by Ollama.
+In regular Ollama chat, Web Search OFF creates no external search request. When it is ON, a local structured router receives only the current input, never conversation history, and must choose `search_current` or `search_generated`. Skipping research is not allowed, so timeless explanation, writing, and casual conversation are searched too. An existing user question uses `search_current`, and Taceta searches that original input rather than a model-written rewrite. A name or premise that conflicts with old model knowledge must be verified rather than denied. A request to have the model formulate a question before searching uses `search_generated`. An explicit search command bypasses the router and always searches. Free text, refusal, or invalid JSON stops as a route error before anything is sent externally and never falls back to an answer from internal knowledge. The configured executor is used without provider fallback, and external output is untrusted context for a final answer generated locally by Ollama.
 
 Taceta Link consists of a same-version MV3 extension, Native Messaging Host `org.mlabo.taceta.link`, and a user-only Unix socket. The app places jobs on the socket; the extension polls and returns results. Product version, protocol version, or extension-ID mismatch fails closed. Cookies, tokens, profiles, and local storage are never read or exported.
 
@@ -56,7 +56,7 @@ The browser executor prefers an existing focused normal window as its route cont
 
 ## Web ON authorization and safety
 
-Web ON + Send permits local routing of the current input and creates one web turn only when needed; an explicit search command bypasses routing, while ordinary conversation remains local. That turn may create from one to three ChatGPT Web requests up to the configured limit, and each job receives a distinct, non-reusable authorization. A stopped or dropped pending job is removed from the queue and waiters so it cannot block the next turn. An unknown outcome is not retried for the same job. Search output is untrusted context, not the final answer; local Ollama generates that answer. Login, account changes, purchases, deletions, and other destructive/account actions still require separate user confirmation.
+Web ON + Send routes the current input locally and always creates one web turn for that input. An explicit search command bypasses routing. Ordinary conversation is not exempt from external research. That turn may create from one to three ChatGPT Web requests up to the configured limit, and each job receives a distinct, non-reusable authorization. A stopped or dropped pending job is removed from the queue and waiters so it cannot block the next turn. An unknown outcome is not retried for the same job. Search output is untrusted context, not the final answer; local Ollama generates that answer. Login, account changes, purchases, deletions, and other destructive/account actions still require separate user confirmation.
 
 ## Installation responsibility
 
