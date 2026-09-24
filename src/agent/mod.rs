@@ -231,6 +231,7 @@ impl AgentSession {
                 serde_json::json!({"event": seq, "content": content})
             }).collect::<Vec<_>>(),
             "model_maintained_work_state": snapshot.work_state,
+            "later_external_work_requires_reconciliation": self.state.external_work_after_state,
             "previous_status": status,
             "previous_error": snapshot.error,
             "previous_model": snapshot.latest_model,
@@ -248,6 +249,50 @@ impl AgentSession {
                 "This handoff contains no Thinking trace or interrupted assistant output."
             ],
         })).map_err(|error| format!("Could not encode the saved work handoff: {error}"))
+    }
+
+    /// Incorporate another executor's saved work before an explicit local run.
+    /// Each source record is durable and idempotent; retrying a partial import
+    /// completes the journal only and can never replay a file edit or command.
+    pub fn import_external_handoff(&mut self, handoff: &ExternalWorkHandoff) -> Result<SessionSnapshot, String> {
+        use sha2::{Digest, Sha256};
+        let _lock = self.journal.lock()?;
+        self.reload()?;
+        let workspace = WorkspaceTools::new(&handoff.workspace)?;
+        if workspace.workspace() != self.state.snapshot.workspace {
+            return Err("The external work belongs to another workspace; no records were imported.".into());
+        }
+        if handoff.source.trim().is_empty() || handoff.source_session_id.trim().is_empty()
+            || handoff.records.is_empty() || handoff.records.iter().any(|record| record.id.trim().is_empty()) {
+            return Err("The external work handoff is missing its source or saved records.".into());
+        }
+        if self.state.instructions.is_empty() && !handoff.records.iter().any(|record| {
+            record.role == ExternalWorkRole::User && !record.content.trim().is_empty()
+        }) {
+            return Err("The handoff contains no user task for this new session.".into());
+        }
+        let mut imported = self.journal.records.iter().filter_map(|record| match &record.event {
+            EventData::ExternalWorkImported { import_key, .. } => Some(import_key.clone()),
+            _ => None,
+        }).collect::<BTreeSet<_>>();
+        // Validate and prepare the complete batch before writing its first
+        // record. I/O failure can leave a prefix, which the keys make resumable.
+        let prepared = handoff.records.iter().map(|record| {
+            let bytes = serde_json::to_vec(&(&handoff.source, &handoff.source_session_id, record))
+                .map_err(|error| error.to_string())?;
+            let key = format!("{:x}", Sha256::digest(&bytes));
+            Ok::<_, String>((key, record.clone()))
+        }).collect::<Result<Vec<_>, _>>()?;
+        self.close_unresolved("Execution ownership is transferring from another provider; old approvals have expired.")?;
+        for (key, record) in prepared {
+            if imported.insert(key.clone()) {
+                self.record(EventData::ExternalWorkImported {
+                    import_key: key, source: handoff.source.clone(),
+                    source_session_id: handoff.source_session_id.clone(), record,
+                })?;
+            }
+        }
+        Ok(self.snapshot())
     }
 
     fn reload(&mut self) -> Result<(), String> {

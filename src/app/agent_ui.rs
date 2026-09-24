@@ -471,9 +471,13 @@ impl TacetaApp {
         self.scroll_to_bottom = true;
     }
 
-    fn remember_agent_snapshot(&mut self, snapshot: SessionSnapshot) {
+    pub(super) fn remember_agent_snapshot(&mut self, snapshot: SessionSnapshot) {
         let id = snapshot.id;
         if self.state.conversations.iter().any(|conversation| conversation.id == id && conversation.is_gpt()) {
+            return;
+        }
+        if self.state.conversations.iter().any(|conversation| conversation.id == id && conversation.has_gpt_history())
+            && self.agent_ui.snapshots.get(&id).is_some_and(|current| current.event_count > snapshot.event_count) {
             return;
         }
         if !self
@@ -536,13 +540,13 @@ impl TacetaApp {
                         for (index, message) in snapshot.messages.iter().enumerate() {
                             if let Some(transcript) = transcript_message(id, index, message) {
                                 self.show_message(ui, &transcript, false);
-                            } else if message.role == AgentRole::Tool {
+                            } else if message.role == AgentRole::Tool || external_tool_evidence(message).is_some() {
                                 egui::CollapsingHeader::new(
                                     message.tool_name.as_deref().unwrap_or("Tool result"),
                                 )
                                 .id_salt(("agent-tool", id, index))
                                 .show(ui, |ui| {
-                                    ui.label(&message.content);
+                                    ui.label(external_tool_evidence(message).unwrap_or_else(|| message.content.clone()));
                                 });
                             }
                         }
@@ -700,9 +704,23 @@ fn transcript_message(id: Uuid, index: usize, message: &AgentMessage) -> Option<
         AgentRole::Assistant => Role::Assistant,
         AgentRole::System | AgentRole::Tool => return None,
     };
-    let mut result = ChatMessage::new(role, &message.content);
+    let evidence = external_evidence(message);
+    if evidence.as_ref().is_some_and(|value| value["record_kind"] == "ToolResult") { return None; }
+    let content = evidence.as_ref().and_then(|value| value["content"].as_str()).unwrap_or(&message.content);
+    let mut result = ChatMessage::new(role, content);
     result.id = Uuid::from_u128(id.as_u128() ^ ((index as u128) + 1));
     Some(result)
+}
+
+fn external_evidence(message: &AgentMessage) -> Option<serde_json::Value> {
+    if message.role != AgentRole::Assistant { return None; }
+    let value: serde_json::Value = serde_json::from_str(&message.content).ok()?;
+    (value["external_work_evidence"] == true && value["content"].is_string()).then_some(value)
+}
+
+fn external_tool_evidence(message: &AgentMessage) -> Option<String> {
+    let evidence = external_evidence(message)?;
+    (evidence["record_kind"] == "ToolResult").then(|| evidence["content"].as_str().unwrap().to_owned())
 }
 
 fn status_label(language: AppShellLanguage, status: &SessionStatus) -> &'static str {

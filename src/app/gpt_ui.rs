@@ -1,10 +1,29 @@
 use super::*;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, Ordering};
+use taceta::agent::{AgentSession, ExternalWorkHandoff, SessionSnapshot};
 use taceta::gpt::{
     GptAction, GptApproval, GptClient, GptControl, GptEvent, GptLoginEvent, GptMode,
     GptQuestion, GptRunOutcome, GptRunRequest, GptRunStatus,
 };
 use tokio::sync::watch;
+
+const TRANSFER_ACTIVE: u8 = 0;
+const TRANSFER_CANCELLED: u8 = 1;
+const TRANSFER_COMMITTING: u8 = 2;
+const TRANSFER_COMMITTED: u8 = 3;
+
+struct ReverseTransferReceipt {
+    conversation: crate::persistence::Conversation,
+    snapshot: SessionSnapshot,
+}
+
+struct GptReverseTransfer {
+    task: JoinHandle<()>,
+    result: std_mpsc::Receiver<Result<ReverseTransferReceipt, String>>,
+    cancel: watch::Sender<bool>,
+    phase: Arc<AtomicU8>,
+}
 
 pub(super) struct ActiveGpt {
     task: JoinHandle<()>,
@@ -40,6 +59,7 @@ pub(super) struct GptUiState {
     login: Option<GptLoginTask>,
     logout: Option<std_mpsc::Receiver<Result<(), String>>>,
     bindings_root: Result<PathBuf, String>,
+    reverse_transfer: Option<GptReverseTransfer>,
 }
 
 impl Default for GptUiState {
@@ -54,6 +74,7 @@ impl Default for GptUiState {
             login: None,
             logout: None,
             bindings_root,
+            reverse_transfer: None,
         }
     }
 }
@@ -62,9 +83,125 @@ impl GptUiState {
     pub(super) fn auth_busy(&self) -> bool {
         self.login.is_some() || self.logout.is_some()
     }
+
+    pub(super) fn is_transferring(&self) -> bool { self.reverse_transfer.is_some() }
 }
 
 impl TacetaApp {
+    pub(super) fn start_gpt_reverse_transfer(&mut self) {
+        if self.is_generating() || self.gpt_ui.auth_busy() { return; }
+        let conversation = self.state.active_conversation().clone();
+        if let Err(error) = conversation.returned_to_grok() {
+            self.notice = Some(Notice { kind: NoticeKind::Error, text: error });
+            return;
+        }
+        let Some(workspace) = conversation.workspace.clone() else { return; };
+        let roots = self.agent_ui.data_root.clone().and_then(|agent_root| {
+            self.gpt_ui.bindings_root.clone().map(|binding_root| (agent_root, binding_root))
+        });
+        let (agent_root, binding_root) = match roots {
+            Ok(roots) => roots,
+            Err(error) => {
+                self.notice = Some(Notice { kind: NoticeKind::Error, text: error });
+                return;
+            }
+        };
+        let thread_id = conversation.gpt.as_ref().and_then(|session| session.thread_id.clone());
+        let client = self.gpt_ui.client.clone();
+        let (cancel, mut cancelled) = watch::channel(false);
+        let phase = Arc::new(AtomicU8::new(TRANSFER_ACTIVE));
+        let worker_phase = Arc::clone(&phase);
+        let (tx, result) = std_mpsc::channel();
+        let task = self.runtime.spawn(async move {
+            let exported = if let Some(thread_id) = thread_id {
+                tokio::select! {
+                    result = client.export_handoff(&thread_id, &workspace) => result.map(Some),
+                    _ = cancelled.changed() => Err("GPT work transfer cancelled; the current owner is unchanged".into()),
+                }
+            } else { Ok(None) };
+            let handoff = match exported {
+                Ok(handoff) => handoff,
+                Err(error) => { let _ = tx.send(Err(error)); return; }
+            };
+            let prepared = tokio::task::spawn_blocking(move || {
+                if worker_phase.load(Ordering::Acquire) != TRANSFER_ACTIVE {
+                    return Err("GPT work transfer cancelled; the current owner is unchanged".into());
+                }
+                let snapshot = import_gpt_reverse_work(&agent_root, &conversation, handoff.as_ref())?;
+                commit_gpt_reverse_work(&binding_root, &conversation, snapshot, &worker_phase)
+            }).await.map_err(|error| format!("Could not transfer the saved GPT work: {error}"))
+                .and_then(|result| result);
+            let _ = tx.send(prepared);
+        });
+        self.gpt_ui.reverse_transfer = Some(GptReverseTransfer { task, result, cancel, phase });
+        self.notice = Some(Notice { kind: NoticeKind::Info,
+            text: text(self.language(), "保存済みのGPT作業をGrokへ引き継いでいます。", "Transferring saved GPT work to Grok.").into() });
+    }
+
+    fn drain_gpt_reverse_transfer(&mut self) {
+        let result = self.gpt_ui.reverse_transfer.as_ref().and_then(|transfer| match transfer.result.try_recv() {
+            Ok(result) => Some(result),
+            Err(std_mpsc::TryRecvError::Empty) => None,
+            Err(std_mpsc::TryRecvError::Disconnected) => Some(Err("GPT work transfer stopped before its ownership result was returned".into())),
+        });
+        let Some(result) = result else { return; };
+        let transfer = self.gpt_ui.reverse_transfer.take().unwrap();
+        let cancelled = transfer.phase.load(Ordering::Acquire) == TRANSFER_CANCELLED;
+        match result {
+            Ok(receipt) => {
+                if let Err(error) = self.accept_gpt_reverse_transfer(receipt) {
+                    self.notice = Some(Notice { kind: NoticeKind::Error, text: error });
+                    return;
+                }
+                self.bind_selected_provider();
+                self.notice = Some(Notice { kind: NoticeKind::Info,
+                    text: text(self.language(),
+                        "同じ作業をGrokへ引き継ぎました。「再開」または次の送信で続けられます。GPTの原文履歴は残っています。",
+                        "The same task is now available in Grok. Use Resume or send a message to continue. Original GPT history is preserved.").into() });
+            }
+            Err(error) => self.notice = Some(Notice {
+                kind: if cancelled { NoticeKind::Info } else { NoticeKind::Error },
+                text: if cancelled {
+                    text(self.language(), "引き継ぎを中止しました。GPTの会話と作業フォルダーを維持しています。", "Transfer cancelled. The GPT conversation and workspace are unchanged.").into()
+                } else { error },
+            }),
+        }
+    }
+
+    fn accept_gpt_reverse_transfer(&mut self, receipt: ReverseTransferReceipt) -> Result<(), String> {
+        self.state.commit_gpt_reverse_transfer(receipt.conversation)?;
+        self.remember_agent_snapshot(receipt.snapshot);
+        self.scroll_to_bottom = true;
+        Ok(())
+    }
+
+    pub(super) fn cancel_gpt_reverse_transfer(&mut self) {
+        if let Some(transfer) = &self.gpt_ui.reverse_transfer {
+            if transfer.phase.compare_exchange(TRANSFER_ACTIVE, TRANSFER_CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                let _ = transfer.cancel.send(true);
+            }
+        }
+    }
+
+    pub(super) fn show_gpt_transfer(&mut self, ctx: &Context) {
+        let Some(transfer) = &self.gpt_ui.reverse_transfer else { return; };
+        let phase = transfer.phase.load(Ordering::Acquire);
+        let language = self.language();
+        let mut cancel = false;
+        egui::Window::new(text(language, "Grokへ作業を引き継ぐ", "Transfer work to Grok"))
+            .id(egui::Id::new("gpt-reverse-transfer")).collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.spinner();
+                ui.label(match phase {
+                    TRANSFER_COMMITTING | TRANSFER_COMMITTED => text(language, "会話の切り替えを保存しています…", "Saving conversation ownership…"),
+                    TRANSFER_CANCELLED => text(language, "中止を処理しています…", "Cancelling transfer…"),
+                    _ => text(language, "保存済みの指示と作業結果を読み込み、同じフォルダーの作業へ引き継いでいます。", "Reading saved instructions and results into the task in the same workspace."),
+                });
+                ui.label(text(language, "モデルの生成やツール実行は行いません。", "This does not generate a response or run tools."));
+                cancel = ui.add_enabled(phase == TRANSFER_ACTIVE, Button::new(text(language, "中止", "Cancel"))).clicked();
+            });
+        if cancel { self.cancel_gpt_reverse_transfer(); }
+    }
+
     pub(super) fn show_gpt_settings(&mut self, ui: &mut Ui) {
         let language = self.language();
         ui.label(text(language,
@@ -338,6 +475,7 @@ impl TacetaApp {
 
     pub(super) fn drain_gpt_work(&mut self) {
         self.drain_gpt_auth();
+        self.drain_gpt_reverse_transfer();
         let mut events = Vec::new();
         let mut outcome = None;
         if let Some(active) = &mut self.gpt_ui.active {
@@ -535,6 +673,8 @@ impl TacetaApp {
     }
 
     pub(super) fn abort_gpt_on_exit(&mut self) {
+        self.cancel_gpt_reverse_transfer();
+        if let Some(transfer) = self.gpt_ui.reverse_transfer.take() { transfer.task.abort(); }
         if let Some(active) = self.gpt_ui.active.take() {
             let _ = active.cancel.send(true);
             active.task.abort();
@@ -649,7 +789,7 @@ impl TacetaApp {
 
     pub(super) fn archive_gpt_chats(&mut self, ids: &[Uuid]) -> bool {
         for id in ids {
-            if !self.state.conversations.iter().any(|conversation| conversation.id == *id && conversation.is_gpt()) { continue; }
+            if !self.state.conversations.iter().any(|conversation| conversation.id == *id && conversation.has_gpt_history()) { continue; }
             let result = self.gpt_ui.bindings_root.as_ref().map_err(Clone::clone)
                 .and_then(|root| crate::persistence::archive_gpt_binding(root, *id));
             if let Err(error) = result {
@@ -659,6 +799,56 @@ impl TacetaApp {
         }
         true
     }
+}
+
+fn import_gpt_reverse_work(
+    agent_root: &std::path::Path,
+    conversation: &crate::persistence::Conversation,
+    handoff: Option<&ExternalWorkHandoff>,
+) -> Result<SessionSnapshot, String> {
+    let gpt = conversation.gpt.as_ref().ok_or("The GPT task metadata is missing")?;
+    let workspace = conversation.workspace.as_deref().ok_or("The GPT task workspace is missing")?;
+    let mut session = if gpt.handoff_from_taceta {
+        // Returning to an original task must never silently replace missing
+        // original instructions with a newly created, empty journal.
+        AgentSession::open(agent_root, conversation.id)?
+    } else {
+        AgentSession::open_or_create(agent_root, conversation.id, workspace)?.0
+    };
+    let snapshot = session.snapshot();
+    let selected_workspace = fs::canonicalize(workspace).map_err(|error| format!("Could not resolve the task workspace: {error}"))?;
+    if snapshot.workspace != selected_workspace {
+        return Err("The original task belongs to another workspace; GPT ownership is unchanged".into());
+    }
+    match handoff {
+        None if gpt.handoff_from_taceta && gpt.pending_handoff && gpt.thread_id.is_none() => Ok(snapshot),
+        Some(handoff) if gpt.thread_id.as_deref() == Some(handoff.source_session_id.as_str()) => {
+            if handoff.records.is_empty() && gpt.handoff_from_taceta && gpt.pending_handoff {
+                if fs::canonicalize(&handoff.workspace).map_err(|error| error.to_string())? != selected_workspace {
+                    return Err("The empty GPT history belongs to another workspace".into());
+                }
+                Ok(snapshot)
+            } else {
+                session.import_external_handoff(handoff)
+            }
+        }
+        _ => Err("The saved GPT records do not match this task; ownership is unchanged".into()),
+    }
+}
+
+fn commit_gpt_reverse_work(
+    binding_root: &std::path::Path,
+    previous: &crate::persistence::Conversation,
+    snapshot: SessionSnapshot,
+    phase: &AtomicU8,
+) -> Result<ReverseTransferReceipt, String> {
+    if phase.compare_exchange(TRANSFER_ACTIVE, TRANSFER_COMMITTING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err("GPT work transfer cancelled; imported records remain saved without changing the owner".into());
+    }
+    let conversation = previous.returned_to_grok()?;
+    crate::persistence::save_gpt_reverse_ownership(binding_root, previous, &conversation)?;
+    phase.store(TRANSFER_COMMITTED, Ordering::Release);
+    Ok(ReverseTransferReceipt { conversation, snapshot })
 }
 
 fn gpt_message(conversation: &mut crate::persistence::Conversation, id: String) -> &mut ChatMessage {
@@ -692,6 +882,227 @@ mod tests {
     use super::*;
     use crate::app::model_manager_tests::{RecordingServices, test_app};
     use taceta::gpt::GptQuestionOption;
+    use taceta::agent::{AgentMessage, AgentRole, ExternalWorkRecord, ExternalWorkRole, SessionStatus};
+
+    fn reverse_conversation(workspace: &std::path::Path, from_taceta: bool) -> crate::persistence::Conversation {
+        let mut conversation = crate::persistence::Conversation::for_provider(InferenceProvider::Gpt);
+        conversation.workspace = Some(workspace.to_owned());
+        conversation.messages = vec![ChatMessage::new_user("Preserve the original goal"), ChatMessage::new_assistant("GPT progress")];
+        let session = conversation.gpt.as_mut().unwrap();
+        session.thread_id = Some("saved-gpt-work".into());
+        session.handoff_from_taceta = from_taceta;
+        conversation
+    }
+
+    fn reverse_records(workspace: &std::path::Path) -> ExternalWorkHandoff {
+        ExternalWorkHandoff {
+            source: "codex".into(), source_session_id: "saved-gpt-work".into(), workspace: workspace.to_owned(),
+            records: vec![
+                ExternalWorkRecord { id: "user-1".into(), role: ExternalWorkRole::User, content: "Preserve the original goal".into() },
+                ExternalWorkRecord { id: "answer-1".into(), role: ExternalWorkRole::Assistant, content: "GPT progress".into() },
+                ExternalWorkRecord { id: "tool-1".into(), role: ExternalWorkRole::ToolResult, content: "Saved test output".into() },
+            ],
+        }
+    }
+
+    fn attach_reverse_conversation(app: &mut TacetaApp, conversation: crate::persistence::Conversation) {
+        app.state.inference_provider = InferenceProvider::Gpt;
+        app.state.active_conversation_id = conversation.id;
+        app.state.conversations = vec![conversation];
+        app.backend = None;
+    }
+
+    #[test]
+    fn gpt_reverse_fresh_task_keeps_identity_visible_history_and_durable_local_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("workspace")).unwrap();
+        let workspace = fs::canonicalize(temp.path().join("workspace")).unwrap();
+        fs::write(workspace.join("current.rs"), "current workspace contents").unwrap();
+        let agent_root = temp.path().join("AgentSessions");
+        let binding_root = temp.path().join("GptBindings");
+        let conversation = reverse_conversation(&workspace, false);
+        let id = conversation.id;
+        crate::persistence::save_gpt_binding(&binding_root, &conversation).unwrap();
+        let snapshot = import_gpt_reverse_work(&agent_root, &conversation, Some(&reverse_records(&workspace))).unwrap();
+        assert_eq!(snapshot.status, SessionStatus::Interrupted);
+        let receipt = commit_gpt_reverse_work(&binding_root, &conversation, snapshot, &AtomicU8::new(TRANSFER_ACTIVE)).unwrap();
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        attach_reverse_conversation(&mut app, conversation);
+        let stale = app.state.clone();
+        app.accept_gpt_reverse_transfer(receipt).unwrap();
+        assert_eq!(app.state.active_conversation_id, id);
+        assert_eq!(app.state.inference_provider, InferenceProvider::Grok);
+        assert_eq!(app.state.active_conversation().workspace.as_ref(), Some(&workspace));
+        assert!(!app.state.active_conversation().is_gpt());
+        assert!(app.state.active_conversation().gpt.is_none());
+        assert_eq!(app.state.active_conversation().archived_gpt_thread_ids, vec!["saved-gpt-work"]);
+        assert_eq!(app.state.active_conversation().messages[0].content, "Preserve the original goal");
+        assert_eq!(app.state.active_conversation().messages[1].content, "GPT progress");
+        assert!(!app.is_generating());
+        assert_eq!(fs::read_to_string(workspace.join("current.rs")).unwrap(), "current workspace contents");
+        let mut recovered = stale;
+        crate::persistence::recover_gpt_bindings(&mut recovered, &binding_root).unwrap();
+        assert_eq!(recovered.inference_provider, InferenceProvider::Grok);
+        assert!(!recovered.active_conversation().is_gpt());
+        assert!(recovered.active_conversation().gpt.is_none());
+        assert_eq!(AgentSession::open(&agent_root, id).unwrap().snapshot().status, SessionStatus::Interrupted);
+    }
+
+    #[test]
+    fn gpt_reverse_return_to_original_survives_stale_recovery_and_roundtrip_starts_fresh_gpt_context() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("workspace")).unwrap();
+        let workspace = fs::canonicalize(temp.path().join("workspace")).unwrap();
+        let agent_root = temp.path().join("AgentSessions");
+        let binding_root = temp.path().join("GptBindings");
+        let conversation = reverse_conversation(&workspace, true);
+        let id = conversation.id;
+        let mut original = AgentSession::create(&agent_root, id, &workspace).unwrap();
+        original.import_messages(vec![AgentMessage::text(AgentRole::User, "Original goal before GPT")]).unwrap();
+        let stale_snapshot = original.snapshot();
+        drop(original);
+        let mut handoff = reverse_records(&workspace);
+        handoff.records[0].content = "New correction from GPT work".into();
+        let snapshot = import_gpt_reverse_work(&agent_root, &conversation, Some(&handoff)).unwrap();
+        assert_eq!(snapshot.goal, "Original goal before GPT");
+        let receipt = commit_gpt_reverse_work(&binding_root, &conversation, snapshot, &AtomicU8::new(TRANSFER_ACTIVE)).unwrap();
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        attach_reverse_conversation(&mut app, conversation);
+        app.accept_gpt_reverse_transfer(receipt).unwrap();
+        app.remember_agent_snapshot(stale_snapshot);
+        assert!(app.state.active_conversation().messages.iter().any(|message| message.content == "GPT progress"));
+        app.state.switch_provider(InferenceProvider::Gpt);
+        assert_eq!(app.state.active_conversation_id, id);
+        let gpt = app.state.active_conversation().gpt.as_ref().unwrap();
+        assert!(gpt.pending_handoff && gpt.handoff_from_taceta);
+        assert!(gpt.thread_id.is_none());
+        let updated = AgentSession::open(&agent_root, id).unwrap().export_handoff(&workspace).unwrap();
+        assert!(updated.contains("Original goal before GPT"));
+        assert!(updated.contains("New correction from GPT work"));
+        assert!(updated.contains("GPT progress"));
+        assert!(updated.contains("Saved test output"));
+        // An earlier ownership checkpoint cannot undo a later explicit
+        // forward selection that eframe has already saved.
+        crate::persistence::recover_gpt_bindings(&mut app.state, &binding_root).unwrap();
+        assert_eq!(app.state.inference_provider, InferenceProvider::Gpt);
+        assert!(app.state.active_conversation().gpt.as_ref().unwrap().thread_id.is_none());
+    }
+
+    #[test]
+    fn gpt_reverse_unstarted_forward_restores_original_without_export_or_new_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("workspace")).unwrap();
+        let workspace = fs::canonicalize(temp.path().join("workspace")).unwrap();
+        let agent_root = temp.path().join("AgentSessions");
+        let binding_root = temp.path().join("GptBindings");
+        let mut conversation = reverse_conversation(&workspace, true);
+        let mut original = AgentSession::create(&agent_root, conversation.id, &workspace).unwrap();
+        original.import_messages(vec![AgentMessage::text(AgentRole::User, "Original task")]).unwrap();
+        let before = original.snapshot();
+        drop(original);
+        let gpt = conversation.gpt.as_mut().unwrap();
+        gpt.thread_id = None;
+        gpt.pending_handoff = true;
+        let snapshot = import_gpt_reverse_work(&agent_root, &conversation, None).unwrap();
+        assert_eq!(snapshot.event_count, before.event_count);
+        assert_eq!(snapshot.status, before.status);
+        let receipt = commit_gpt_reverse_work(&binding_root, &conversation, snapshot, &AtomicU8::new(TRANSFER_ACTIVE)).unwrap();
+        assert_eq!(receipt.conversation.id, conversation.id);
+        assert_eq!(receipt.conversation.provider, Some(InferenceProvider::Grok));
+        assert!(receipt.conversation.gpt.is_none());
+        assert_eq!(AgentSession::list_ids(&agent_root).unwrap(), vec![conversation.id]);
+
+        // A created but unused Codex thread needs an authoritative empty
+        // export before the same direct restoration is accepted.
+        conversation.gpt.as_mut().unwrap().thread_id = Some("saved-gpt-work".into());
+        assert!(import_gpt_reverse_work(&agent_root, &conversation, None).is_err());
+        let mut empty = reverse_records(&workspace);
+        empty.records.clear();
+        assert_eq!(import_gpt_reverse_work(&agent_root, &conversation, Some(&empty)).unwrap().event_count, before.event_count);
+    }
+
+    #[test]
+    fn gpt_reverse_missing_original_failed_import_and_cancelled_commit_preserve_gpt() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("workspace")).unwrap();
+        let workspace = fs::canonicalize(temp.path().join("workspace")).unwrap();
+        let agent_root = temp.path().join("AgentSessions");
+        let binding_root = temp.path().join("GptBindings");
+        let conversation = reverse_conversation(&workspace, true);
+        let handoff = reverse_records(&workspace);
+        assert!(import_gpt_reverse_work(&agent_root, &conversation, Some(&handoff)).is_err());
+        assert!(!agent_root.join(conversation.id.to_string()).exists());
+        let mut original = AgentSession::create(&agent_root, conversation.id, &workspace).unwrap();
+        original.import_messages(vec![AgentMessage::text(AgentRole::User, "Original task")]).unwrap();
+        drop(original);
+        crate::persistence::save_gpt_binding(&binding_root, &conversation).unwrap();
+        let mut invalid = handoff.clone();
+        invalid.records[0].id.clear();
+        assert!(import_gpt_reverse_work(&agent_root, &conversation, Some(&invalid)).is_err());
+        let snapshot = import_gpt_reverse_work(&agent_root, &conversation, Some(&handoff)).unwrap();
+        assert!(commit_gpt_reverse_work(&binding_root, &conversation, snapshot, &AtomicU8::new(TRANSFER_CANCELLED)).is_err());
+        assert!(conversation.is_gpt());
+        assert_eq!(conversation.gpt.as_ref().unwrap().thread_id.as_deref(), Some("saved-gpt-work"));
+        let mut state = PersistedAppState::default();
+        state.active_conversation_id = conversation.id;
+        state.conversations = vec![conversation];
+        crate::persistence::recover_gpt_bindings(&mut state, &binding_root).unwrap();
+        assert_eq!(state.inference_provider, InferenceProvider::Gpt);
+        assert!(state.active_conversation().is_gpt());
+        assert!(AgentSession::open(&agent_root, state.active_conversation_id).unwrap().snapshot().messages.iter().any(|message| message.content.contains("GPT progress")));
+    }
+
+    #[test]
+    fn gpt_reverse_failed_ownership_save_keeps_gpt_and_retry_reuses_durable_import() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("workspace")).unwrap();
+        let workspace = fs::canonicalize(temp.path().join("workspace")).unwrap();
+        let agent_root = temp.path().join("AgentSessions");
+        let binding_root = temp.path().join("GptBindings");
+        let blocked_root = temp.path().join("blocked-binding-root");
+        fs::write(&blocked_root, "not a directory").unwrap();
+        let conversation = reverse_conversation(&workspace, false);
+        let handoff = reverse_records(&workspace);
+        crate::persistence::save_gpt_binding(&binding_root, &conversation).unwrap();
+        let snapshot = import_gpt_reverse_work(&agent_root, &conversation, Some(&handoff)).unwrap();
+        let imported_count = snapshot.event_count;
+        assert!(commit_gpt_reverse_work(&blocked_root, &conversation, snapshot, &AtomicU8::new(TRANSFER_ACTIVE)).is_err());
+        assert!(conversation.is_gpt());
+        let retry = import_gpt_reverse_work(&agent_root, &conversation, Some(&handoff)).unwrap();
+        assert_eq!(retry.event_count, imported_count);
+        let receipt = commit_gpt_reverse_work(&binding_root, &conversation, retry, &AtomicU8::new(TRANSFER_ACTIVE)).unwrap();
+        assert_eq!(receipt.conversation.id, conversation.id);
+        assert_eq!(receipt.conversation.provider, Some(InferenceProvider::Grok));
+    }
+
+    #[test]
+    fn gpt_reverse_transfer_blocks_owner_changes_and_send_until_cancel_is_recorded() {
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        attach_reverse_conversation(&mut app, reverse_conversation(std::path::Path::new("/fixture/workspace"), false));
+        let id = app.state.active_conversation_id;
+        let (tx, result) = std_mpsc::channel();
+        let (cancel, cancelled) = watch::channel(false);
+        let phase = Arc::new(AtomicU8::new(TRANSFER_ACTIVE));
+        app.gpt_ui.reverse_transfer = Some(GptReverseTransfer {
+            task: app.runtime.spawn(std::future::pending()), result, cancel, phase: Arc::clone(&phase),
+        });
+        app.select_provider(InferenceProvider::Ollama);
+        app.state.draft = "must not start yet".into();
+        app.start_generation();
+        assert_eq!(app.state.inference_provider, InferenceProvider::Gpt);
+        assert_eq!(app.state.active_conversation_id, id);
+        assert!(app.gpt_ui.active.is_none());
+        assert!(app.is_generating());
+        app.stop_generation();
+        assert_eq!(phase.load(Ordering::Acquire), TRANSFER_CANCELLED);
+        assert!(*cancelled.borrow());
+        assert!(app.is_generating());
+        tx.send(Err("cancelled before ownership commit".into())).unwrap();
+        app.drain_gpt_reverse_transfer();
+        assert!(!app.is_generating());
+        assert_eq!(app.state.inference_provider, InferenceProvider::Gpt);
+        assert_eq!(app.state.draft, "must not start yet");
+    }
 
     fn active_fixture(app: &mut TacetaApp) -> (
         std_mpsc::Sender<Result<GptRunOutcome, String>>,
