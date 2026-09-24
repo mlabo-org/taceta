@@ -7,7 +7,7 @@
 use serde::Serialize;
 use std::{
     fs, io,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 use thiserror::Error;
 
@@ -35,51 +35,15 @@ impl SupportedBrowser {
             Self::Chrome => "Chrome",
         }
     }
-    pub fn user_data_dir(&self, home: &Path) -> PathBuf {
+    pub fn native_host_dirs(&self, home: &Path) -> Vec<PathBuf> {
+        // macOS Brave explicitly overrides DIR_USER_NATIVE_MESSAGING to
+        // Chrome's location (brave-core/app/brave_main_delegate.cc). Neither
+        // browser's native-host lookup needs profile metadata or profile dirs.
         match self {
-            Self::Brave => home.join("Library/Application Support/BraveSoftware/Brave-Browser"),
-            Self::Chrome => home.join("Library/Application Support/Google/Chrome"),
+            Self::Brave | Self::Chrome => vec![home.join(
+                "Library/Application Support/Google/Chrome/NativeMessagingHosts",
+            )],
         }
-    }
-    pub fn native_host_dirs(&self, home: &Path) -> Result<Vec<PathBuf>, InstallerError> {
-        let user_data = self.user_data_dir(home);
-        let mut directories = vec![user_data.join("NativeMessagingHosts")];
-        let local_state = user_data.join("Local State");
-        if local_state.is_file() {
-            let state: serde_json::Value = serde_json::from_slice(&fs::read(local_state)?)
-                .map_err(InstallerError::BrowserState)?;
-            let profile = state.get("profile").unwrap_or(&serde_json::Value::Null);
-            let mut names = Vec::new();
-            if let Some(active) = profile
-                .get("last_active_profiles")
-                .and_then(|v| v.as_array())
-            {
-                names.extend(active.iter().filter_map(|v| v.as_str()));
-            }
-            if let Some(last_used) = profile.get("last_used").and_then(|v| v.as_str()) {
-                names.push(last_used);
-            }
-            for name in names {
-                if is_safe_profile_name(name) {
-                    let directory = user_data.join(name).join("NativeMessagingHosts");
-                    if !directories.contains(&directory) {
-                        directories.push(directory);
-                    }
-                }
-            }
-        }
-        // Brave's native-messaging lookup also consults the Chrome-compatible
-        // user-level root on this macOS configuration. Keep this as an exact
-        // additional candidate; never alter its shared directory permissions.
-        if matches!(self, Self::Brave) {
-            let chrome_root = SupportedBrowser::Chrome
-                .user_data_dir(home)
-                .join("NativeMessagingHosts");
-            if !directories.contains(&chrome_root) {
-                directories.push(chrome_root);
-            }
-        }
-        Ok(directories)
     }
     pub fn management_url(&self) -> &'static str {
         match self {
@@ -127,8 +91,12 @@ pub enum InstallerError {
     Ownership(PathBuf),
     #[error("invalid native host manifest: {0}")]
     Manifest(#[from] serde_json::Error),
-    #[error("invalid browser profile state: {0}")]
-    BrowserState(serde_json::Error),
+    #[error("Taceta Link registration failed at {path}: {source}")]
+    HostRegistration {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("LaunchServices failed: {0}")]
@@ -192,11 +160,17 @@ impl Installer {
         let host_binary = self.app_bundle.join("Contents/MacOS/taceta-link-host");
         let bytes = host_manifest_bytes(&host_binary)?;
         let mut manifest_paths = Vec::new();
-        for host_dir in browser.native_host_dirs(&self.home)? {
-            fs::create_dir_all(&host_dir)?;
+        for host_dir in browser.native_host_dirs(&self.home) {
+            fs::create_dir_all(&host_dir).map_err(|source| InstallerError::HostRegistration {
+                path: host_dir.clone(), source,
+            })?;
             let manifest_path = host_dir.join(format!("{HOST_NAME}.json"));
-            fs::write(&manifest_path, &bytes)?;
-            manifest_permissions(&manifest_path)?;
+            fs::write(&manifest_path, &bytes).map_err(|source| InstallerError::HostRegistration {
+                path: manifest_path.clone(), source,
+            })?;
+            manifest_permissions(&manifest_path).map_err(|source| InstallerError::HostRegistration {
+                path: manifest_path.clone(), source,
+            })?;
             manifest_paths.push(manifest_path);
         }
         Ok(InstallStatus {
@@ -220,7 +194,7 @@ impl Installer {
             fs::remove_dir_all(&target)?;
         }
         let mut manifest_paths = Vec::new();
-        for host_dir in browser.native_host_dirs(&self.home)? {
+        for host_dir in browser.native_host_dirs(&self.home) {
             let manifest = host_dir.join(format!("{HOST_NAME}.json"));
             if manifest.exists() && self.owns_host_manifest(&manifest, &browser)? {
                 ensure_owned(&manifest, &host_dir)?;
@@ -277,19 +251,11 @@ impl Installer {
                             .as_ref(),
                     )
                 && browser
-                    .native_host_dirs(&self.home)?
+                    .native_host_dirs(&self.home)
                     .iter()
                     .any(|directory| directory.join(format!("{HOST_NAME}.json")) == path),
         )
     }
-}
-
-fn is_safe_profile_name(name: &str) -> bool {
-    let mut components = Path::new(name).components();
-    matches!(
-        (components.next(), components.next()),
-        (Some(Component::Normal(_)), None)
-    )
 }
 
 fn read_versions(source: &Path) -> Result<(String, String, String), InstallerError> {
@@ -375,7 +341,7 @@ fn user_only(path: &Path) -> Result<(), InstallerError> {
     Ok(())
 }
 
-fn manifest_permissions(path: &Path) -> Result<(), InstallerError> {
+fn manifest_permissions(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -495,106 +461,68 @@ mod tests {
     }
 
     #[test]
-    fn registers_standard_and_active_profile_manifests_without_chmodding_shared_dirs() {
+    fn registers_canonical_host_without_reading_browser_profile_state() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let root = std::env::temp_dir().join(format!(
-            "taceta-profile-registration-{}",
-            std::process::id()
-        ));
-        let app = root.join("Taceta.app");
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("Taceta.app");
         let resources = app.join("Contents/Resources/TacetaLink");
         fs::create_dir_all(&resources).unwrap();
-        fs::write(resources.join("VERSION"), format!("{EXTENSION_VERSION}\n")).unwrap();
-        fs::write(
-            resources.join("manifest.json"),
-            format!(r#"{{"version":"{EXTENSION_VERSION}"}}"#),
-        )
-        .unwrap();
-        let user_data = SupportedBrowser::Brave.user_data_dir(&root);
-        fs::create_dir_all(user_data.join("Default/NativeMessagingHosts")).unwrap();
-        fs::set_permissions(
-            user_data.join("Default/NativeMessagingHosts"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        fs::write(
-            user_data.join("Local State"),
-            r#"{"profile":{"last_used":"Default","last_active_profiles":["Default"]}}"#,
-        )
-        .unwrap();
-        let unrelated = user_data.join("Default/NativeMessagingHosts/example.other.json");
+        fs::write(resources.join("VERSION"), EXTENSION_VERSION).unwrap();
+        fs::write(resources.join("manifest.json"),
+            format!(r#"{{"version":"{EXTENSION_VERSION}"}}"#)).unwrap();
+
+        // Invalid private state makes any old profile-reading route fail. The
+        // correct native-host registration does not need to open this file.
+        let brave = root.path().join("Library/Application Support/BraveSoftware/Brave-Browser");
+        fs::create_dir_all(&brave).unwrap();
+        fs::write(brave.join("Local State"), "PRIVATE_STATE_NOT_JSON").unwrap();
+        let shared = root.path().join("Library/Application Support/Google/Chrome/NativeMessagingHosts");
+        fs::create_dir_all(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        let unrelated = shared.join("example.other.json");
         fs::write(&unrelated, "{}").unwrap();
 
-        let installer = Installer::new(&root, &app);
-        let status = installer
-            .setup(BrowserDetection::Supported(SupportedBrowser::Brave))
-            .unwrap();
-        assert_eq!(status.host_manifest_paths.len(), 3);
-        assert!(
-            status
-                .host_manifest_paths
-                .iter()
-                .any(|path| path.starts_with(SupportedBrowser::Chrome.user_data_dir(&root)))
-        );
-        assert!(status.host_manifest_paths.iter().all(|path| path.is_file()));
-        assert!(
-            status
-                .host_manifest_paths
-                .iter()
-                .all(|path| { fs::metadata(path).unwrap().mode() & 0o777 == 0o644 })
-        );
-        assert_eq!(
-            fs::metadata(installer.materialized_dir().join("manifest.json"))
-                .unwrap()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        assert_eq!(
-            fs::metadata(user_data.join("Default/NativeMessagingHosts"))
-                .unwrap()
-                .mode()
-                & 0o777,
-            0o755
-        );
-        assert!(unrelated.is_file());
-
+        let installer = Installer::new(root.path(), &app);
+        let status = installer.setup(BrowserDetection::Supported(SupportedBrowser::Brave)).unwrap();
+        assert_eq!(status.host_manifest_paths, vec![shared.join(format!("{HOST_NAME}.json"))]);
+        assert!(status.registered);
+        assert_eq!(fs::metadata(&status.host_manifest_paths[0]).unwrap().mode() & 0o777, 0o644);
+        assert_eq!(fs::metadata(&shared).unwrap().mode() & 0o777, 0o755);
+        assert_eq!(fs::metadata(installer.materialized_dir().join("manifest.json")).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(brave.join("Local State")).unwrap(), "PRIVATE_STATE_NOT_JSON");
+        assert!(!brave.join("NativeMessagingHosts").exists());
+        assert!(!brave.join("Default").exists());
         installer.uninstall(SupportedBrowser::Brave).unwrap();
-        assert!(status.host_manifest_paths.iter().all(|path| !path.exists()));
+        assert!(!status.host_manifest_paths[0].exists());
         assert!(unrelated.is_file());
-        fs::remove_dir_all(root).unwrap();
+        assert!(brave.join("Local State").exists());
     }
 
     #[test]
-    fn rejects_profile_path_traversal() {
-        assert!(is_safe_profile_name("Default"));
-        assert!(is_safe_profile_name("Profile 1"));
-        assert!(!is_safe_profile_name("../Default"));
-        assert!(!is_safe_profile_name("nested/Profile"));
-        assert!(!is_safe_profile_name(""));
-    }
-
-    #[test]
-    fn brave_adds_unique_chrome_compatibility_root_and_chrome_does_not() {
-        use std::collections::HashSet;
+    fn brave_and_chrome_use_the_same_user_registration_path() {
         let root = Path::new("/tmp/taceta-home");
-        let brave = SupportedBrowser::Brave.native_host_dirs(root).unwrap();
-        let chrome = SupportedBrowser::Chrome.native_host_dirs(root).unwrap();
-        assert!(
-            brave.contains(
-                &SupportedBrowser::Chrome
-                    .user_data_dir(root)
-                    .join("NativeMessagingHosts")
-            )
-        );
-        assert_eq!(brave.len(), brave.iter().collect::<HashSet<_>>().len());
-        assert_eq!(chrome.len(), 1);
-        assert!(
-            !chrome
-                .iter()
-                .any(|path| path.starts_with(SupportedBrowser::Brave.user_data_dir(root)))
-        );
+        let expected = vec![root.join("Library/Application Support/Google/Chrome/NativeMessagingHosts")];
+        assert_eq!(SupportedBrowser::Brave.native_host_dirs(root), expected);
+        assert_eq!(SupportedBrowser::Chrome.native_host_dirs(root), expected);
+    }
+
+    #[test]
+    fn registration_errors_identify_the_failing_host_path() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("Taceta.app");
+        let resources = app.join("Contents/Resources/TacetaLink");
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(resources.join("VERSION"), EXTENSION_VERSION).unwrap();
+        fs::write(resources.join("manifest.json"),
+            format!(r#"{{"version":"{EXTENSION_VERSION}"}}"#)).unwrap();
+        let blocked = root.path().join("Library/Application Support/Google/Chrome/NativeMessagingHosts");
+        fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        fs::write(&blocked, "not a directory").unwrap();
+        let error = Installer::new(root.path(), &app)
+            .setup(BrowserDetection::Supported(SupportedBrowser::Brave)).unwrap_err();
+        assert!(matches!(&error, InstallerError::HostRegistration { path, .. } if path == &blocked));
+        assert!(error.to_string().contains("NativeMessagingHosts"));
+        assert_eq!(fs::read_to_string(blocked).unwrap(), "not a directory");
     }
 
     #[test]
