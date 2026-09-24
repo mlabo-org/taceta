@@ -23,7 +23,7 @@ pub(super) struct ActiveAgent {
 pub(super) struct AgentUiState {
     pub active: Option<ActiveAgent>,
     snapshots: HashMap<Uuid, SessionSnapshot>,
-    data_root: Result<PathBuf, String>,
+    pub(super) data_root: Result<PathBuf, String>,
     recovery_started: bool,
     recovery: Option<std_mpsc::Receiver<Vec<Result<SessionSnapshot, String>>>>,
 }
@@ -55,6 +55,10 @@ impl AgentUiState {
 
 impl TacetaApp {
     pub(super) fn show_agent_settings(&mut self, ui: &mut Ui) {
+        if self.state.inference_provider == InferenceProvider::Gpt {
+            self.show_gpt_run_settings(ui);
+            return;
+        }
         let language = self.language();
         ui.heading(text(
             language,
@@ -95,6 +99,10 @@ impl TacetaApp {
     }
 
     pub(super) fn show_agent_controls(&mut self, root_ui: &mut Ui) {
+        if self.state.inference_provider == InferenceProvider::Gpt {
+            self.show_gpt_controls(root_ui);
+            return;
+        }
         let language = self.language();
         Panel::top("taceta-agent-controls").show_inside(root_ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -106,6 +114,7 @@ impl TacetaApp {
                 });
                 self.state.active_conversation_mut().agent_enabled = selected;
                 self.show_provider_selector(ui);
+                if self.state.inference_provider == InferenceProvider::Gpt { return; }
                 if !selected { return; }
                 let id = self.state.active_conversation_id;
                 let workspace = self.state.active_conversation().workspace.clone();
@@ -154,6 +163,9 @@ impl TacetaApp {
     }
 
     fn start_agent_action(&mut self, resume: bool, compact_only: bool) {
+        if self.state.inference_provider == InferenceProvider::Gpt {
+            return;
+        }
         if self.is_generating()
             || self.model_unload_result.is_some()
             || self.agent_ui.recovery.is_some()
@@ -246,6 +258,7 @@ impl TacetaApp {
         let backend: Arc<dyn AgentModel> = match self.state.inference_provider {
             InferenceProvider::Ollama => Arc::new(OllamaClient::new(self.ollama_endpoint.clone())),
             InferenceProvider::Grok => Arc::clone(&self.provider_ui.grok) as Arc<dyn AgentModel>,
+            InferenceProvider::Gpt => return,
         };
         let (event_tx, events) = mpsc::unbounded_channel();
         let (approval_tx, approval_rx) = mpsc::unbounded_channel();
@@ -460,6 +473,9 @@ impl TacetaApp {
 
     fn remember_agent_snapshot(&mut self, snapshot: SessionSnapshot) {
         let id = snapshot.id;
+        if self.state.conversations.iter().any(|conversation| conversation.id == id && conversation.is_gpt()) {
+            return;
+        }
         if !self
             .state
             .conversations
@@ -473,6 +489,9 @@ impl TacetaApp {
                     title: conversation_title(&snapshot.goal, "Taceta"),
                     agent_enabled: true,
                     workspace: Some(snapshot.workspace.clone()),
+                    provider: Some(if snapshot.latest_model.as_deref().is_some_and(|model| model.starts_with("grok")) {
+                        InferenceProvider::Grok
+                    } else { InferenceProvider::Ollama }),
                     ..Default::default()
                 },
             );
@@ -611,6 +630,10 @@ impl TacetaApp {
     }
 
     pub(super) fn archive_agent_chats(&mut self, ids: &[Uuid]) -> bool {
+        let ids = ids.iter().copied().filter(|id| {
+            !self.state.conversations.iter().any(|conversation| conversation.id == *id && conversation.is_gpt()
+                && !conversation.gpt.as_ref().is_some_and(|session| session.handoff_from_taceta))
+        }).collect::<Vec<_>>();
         let root = match &self.agent_ui.data_root {
             Ok(root) => root.clone(),
             Err(error) => {
@@ -628,7 +651,7 @@ impl TacetaApp {
                 return true;
             }
         };
-        for id in ids {
+        for id in &ids {
             if let Err(error) = AgentSession::archive(&root, *id) {
                 self.notice = Some(Notice {
                     kind: NoticeKind::Error,
@@ -707,6 +730,25 @@ fn status_label(language: AppShellLanguage, status: &SessionStatus) -> &'static 
 mod tests {
     use super::*;
     use crate::app::model_manager_tests::{RecordingServices, test_app};
+
+    #[test]
+    fn gpt_owned_conversation_is_never_overwritten_by_an_old_agent_snapshot() {
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        app.state.switch_provider(InferenceProvider::Gpt);
+        let id = app.state.active_conversation_id;
+        app.state.active_conversation_mut().messages.push(ChatMessage::new_assistant("Current GPT result"));
+        app.remember_agent_snapshot(SessionSnapshot {
+            id, workspace: PathBuf::from("/fixture/old-workspace"), status: SessionStatus::Interrupted,
+            goal: "Earlier task".into(), user_instructions: vec!["Earlier instruction".into()],
+            work_state: Default::default(), messages: vec![AgentMessage {
+                role: AgentRole::Assistant, content: "Old result".into(), tool_calls: vec![],
+                tool_call_id: None, tool_name: None,
+            }], error: None, event_count: 1, summary: None, latest_model: Some("grok-test".into()),
+        });
+        assert_eq!(app.state.active_conversation().messages[0].content, "Current GPT result");
+        assert!(app.state.active_conversation().workspace.is_none());
+        assert!(!app.agent_ui.snapshots.contains_key(&id));
+    }
 
     #[test]
     fn approval_button_is_one_shot_and_stop_is_independent_of_trace_visibility() {

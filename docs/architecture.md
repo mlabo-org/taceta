@@ -4,7 +4,7 @@
 
 ## アプリとローカル経路
 
-`InferenceBackend` は通常チャットの境界です。モデル、会話入力、添付、Thinking 設定、Web Search 設定を受け取り、Thinking delta、content delta、検索進捗、参照元、完了、失敗を返します。OllamaとGrokは同じ境界に接続する推論先で、各アダプターが固有の通信形式を所有します。Thinking trace は次の入力へ混ぜません。
+`InferenceBackend` はOllamaとGrokの通常チャットの境界です。モデル、会話入力、添付、Thinking 設定、Web Search 設定を受け取り、Thinking delta、content delta、検索進捗、参照元、完了、失敗を返します。OllamaとGrokは同じ境界に接続する推論先で、各アダプターが固有の通信形式を所有します。Thinking trace は次の入力へ混ぜません。
 
 Ollamaの通常チャットでは、Web Search OFF で外部検索 request を作りません。ON では過去の履歴を除いた現在入力だけをローカルの構造化ルーターへ渡し、`search_current` または `search_generated` を必ず選ばせます。検索を省く判定はなく、通常会話、普遍的な説明、創作も外部調査の対象です。現在の質問そのものを調べる入力は `search_current` とし、Taceta はモデルが書き換えた検索語ではなく利用者の原文を検索します。モデルの古い知識と矛盾する名前や前提も検索せず否定しません。質問自体をモデルに作らせてから検索する入力は `search_generated` です。明示的な検索命令はルーターを迂回して必ず検索します。自由文、拒否、不正 JSON は内部知識による回答へ戻さず、外部未送信の route error として停止します。検索時は設定された executor だけを適用し、外部結果は untrusted context としてローカル Ollama の最終回答に渡します。provider は暗黙に切り替えません。
 
@@ -30,7 +30,21 @@ Tacetaへの適応は、明示的なログインUI、キャンセルと切断、
 
 `agent` がTaceta自身の作業実行を所有し、`AgentModel` を介してOllamaまたはGrokへ接続します。UIは作業フォルダー、モデル、指示、上限を渡し、進捗・承認要求・保存済み状態を表示します。ファイル読み取り、編集、検索、コマンド実行は作業フォルダーに束縛され、編集とコマンドには個別の承認が必要です。コマンドの書き込み先は作業フォルダーと専用一時領域に限り、ネットワークは許可しません。停止・時間上限・アプリ終了では子プロセスも終了します。Taceta Linkと外部CLIはこの実行経路を所有しません。
 
-## コンパクションと再開
+## GPTとCodexの作業実行
+
+`gpt::GptClient` は独立したCodex App Serverの接続を所有します。`InferenceBackend` や一回のモデル推論を表す `AgentModel` には組み込みません。Codexが推論、ツール実行、承認判断、会話履歴、コンパクションを担当し、`app/gpt_ui` がユーザーの入力、作業フォルダー、モデル選択、表示、承認回答、停止を扱います。UIには型付きの `GptRunRequest`、`GptEvent`、`GptControl` を渡し、JSON-RPCのwire形式とrequest IDは接続内に留めます。
+
+公式の既存Codex CLIを `app-server --listen stdio://` で起動します。Taceta専用の `CODEX_HOME` を使い、OAuthの開始・完了・キャンセル・解除は公開account APIに委ねます。トークンをTaceta自身で読み出さず、Codexのkeyring保存を使用します。別のCodex環境の設定・認証・会話をコピーしません。クライアントの構築だけでは認証、プロセス起動、外部リクエストを開始しません。
+
+GPTの会話は返されたthread IDに結び付け、UIが保存した確認を接続側へ返してからturnを開始します。Codex履歴をTacetaの `AgentSession` に再構築せず、次のturnには今回の入力だけを送り、再起動後は `thread/resume` で続行します。モデルの変更は同じthreadで可能です。GPTのモード・作業フォルダーを変更する際は元の会話を残して分離します。Tacetaから削除したGPT会話のCodex原文は専用領域に残します。
+
+Ollama／Grokの作業からGPTへの移管は `AgentSession::export_handoff` が担当します。停止中の同一作業・フォルダーを確認し、元のユーザー指示と訂正を順序通りに保持し、構造化された作業状態、保存済み要約、現在の完全な会話・ツール結果の組、未解決の操作と以前の原文記録の場所を渡します。Thinking、途中で切れた回答、承認は移しません。UIは同じTaceta会話IDを維持し、最初のCodex入力に移管資料をデータとして加えます。元の `AgentSession` は書き換えず、以後の作業はCodexが所有します。初回送信に失敗した場合はCodexに保存済みの入力で移管済みか判断し、同じ資料を重複送信しません。通常チャットの切り替えとGPTからの逆方向の切り替えは別会話を使用します。
+
+コーディングには `workspace-write`、`untrusted`、ユーザー承認を使い、コマンドのネットワーク接続を禁止します。Codexが要求したコマンド・ファイル変更の承認は、一度だけ許可または拒否します。通常チャットは空の専用cwdとread-only、承認never、実行環境なしで開始し、ファイル・コマンドのツールを提供しません。時間とツール操作通知を基準に中断し、未完了の停止を成功に変換しません。操作通知による上限はCodex内部の推論回数や並行実行済み操作を厳密に制限するものではありません。
+
+回答はitem単位に逐次表示し、確定itemで置き換えます。完了の根拠は対応するturnの終端通知です。接続切断やEOFを完了とみなしません。Thinking通知は表示専用で、Tacetaが次の入力へ追加することはありません。Codex内部の会話管理と推論状態はCodexが所有します。
+
+## OllamaとGrokのコンパクションと再開
 
 元の出来事を保存する追記式の記録と、現在モデルに渡す入力を分離します。目的、ユーザー指示、構造化した作業状態は要約から独立して保持し、Thinking traceを後続入力へ戻しません。圧縮はツール呼び出しと結果の組が完了した境界で行い、モデルの入力上限と返却使用量を基準に、要約と次の出力の余白を確保します。手動圧縮も同じ処理を使用します。
 
@@ -46,7 +60,7 @@ This document defines the responsibilities of Taceta's Rust app and Taceta Link,
 
 ## App and local transport
 
-`InferenceBackend` owns regular chat. It accepts model, conversation input, attachments, Thinking settings, and Web Search settings, then emits Thinking deltas, content deltas, search progress, citations, completion, and failure. Ollama and Grok implement this same boundary, with provider wire formats owned by their adapters. Thinking traces never enter the next input.
+`InferenceBackend` owns regular Ollama and Grok chat. It accepts model, conversation input, attachments, Thinking settings, and Web Search settings, then emits Thinking deltas, content deltas, search progress, citations, completion, and failure. Ollama and Grok implement this same boundary, with provider wire formats owned by their adapters. Thinking traces never enter the next input.
 
 In regular Ollama chat, Web Search OFF creates no external search request. When it is ON, a local structured router receives only the current input, never conversation history, and must choose `search_current` or `search_generated`. Skipping research is not allowed, so timeless explanation, writing, and casual conversation are searched too. An existing user question uses `search_current`, and Taceta searches that original input rather than a model-written rewrite. A name or premise that conflicts with old model knowledge must be verified rather than denied. A request to have the model formulate a question before searching uses `search_generated`. An explicit search command bypasses the router and always searches. Free text, refusal, or invalid JSON stops as a route error before anything is sent externally and never falls back to an answer from internal knowledge. The configured executor is used without provider fallback, and external output is untrusted context for a final answer generated locally by Ollama.
 
@@ -72,7 +86,21 @@ Each regular chat answer preserves the requested model and raw `response.model` 
 
 `agent` owns task execution within Taceta and connects to Ollama or Grok through `AgentModel`. The UI supplies workspace, model, instructions and limits, and displays progress, approval requests and saved state. Reads, edits, search and commands are bound to the chosen workspace. Each edit and command requires its own approval. Commands may write only to that workspace and their scratch area, with networking denied. Cancellation, time limits and app shutdown terminate child processes. Taceta Link and external CLIs do not own this execution path.
 
-## Compaction and resumption
+## GPT and Codex execution
+
+`gpt::GptClient` owns the independent Codex App Server connection, outside `InferenceBackend` and the single-inference `AgentModel` interface. Codex owns inference, tool execution, approval decisions, history and compaction. `app/gpt_ui` owns user input, workspace and model selection, presentation, approval responses and stopping. The boundary uses typed `GptRunRequest`, `GptEvent` and `GptControl`; wire JSON-RPC and request IDs remain in the adapter.
+
+The already-installed official Codex CLI runs as `app-server --listen stdio://` with Taceta's own `CODEX_HOME`. Public account methods manage OAuth, cancellation and logout. Codex uses keyring storage; Taceta does not extract tokens or copy another Codex environment's credentials, settings or history. Client construction starts no authentication, process or external request.
+
+The UI durably saves a returned thread ID and acknowledges it before the next turn starts. Subsequent turns send only the new input; restart uses `thread/resume`. Codex history is not reconstructed inside Taceta's `AgentSession`. Models can change within a thread. Changing a GPT thread's mode or workspace preserves the original conversation and starts another. Deleting a GPT conversation from Taceta retains original Codex history in the isolated home.
+
+`AgentSession::export_handoff` owns an explicit Ollama/Grok-to-GPT task transfer. It locks the inactive task, verifies the same workspace, preserves ordered user requests and corrections, and exports structured work state, saved summary, complete current message/tool-result groups, unresolved effects and the exact original-record directory. Thinking, interrupted prose and approvals are excluded. The UI keeps the same Taceta conversation ID and supplies the transfer as data in the first Codex input. The original journal remains unchanged; Codex owns subsequent work. A retry consults saved Codex input to distinguish an empty thread from an already-delivered transfer, preventing duplicate delivery. Ordinary chat transitions and reverse transitions from GPT use separate conversations.
+
+Coding uses `workspace-write`, `untrusted` and user approval, with command network access disabled. Codex-requested approvals are accepted once or denied. Ordinary chat uses an empty cwd, read-only sandbox, never approval and no execution environment, so it has no filesystem or command tools. Time and tool-action notifications trigger interruption. Interrupted or limited runs remain distinct from success; notification thresholds do not strictly cap internal inference calls or already-running parallel actions.
+
+Assistant messages stream by item and are replaced by their final item text. Only the matching turn's terminal notification establishes its outcome; disconnect or EOF is not completion. Thinking notifications are for display and are never added to new inputs by Taceta. Codex owns its internal conversation and reasoning state.
+
+## Ollama and Grok compaction and resumption
 
 An append-only event journal is separate from the current model input. Goals, user instructions and structured work state remain independent of summaries; Thinking traces are not replayed. Compaction occurs between complete tool-call/result groups, using the model context limit and returned usage while reserving space for summarization and the next response. Manual compaction uses the same path.
 

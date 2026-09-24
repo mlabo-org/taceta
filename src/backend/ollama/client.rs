@@ -53,6 +53,9 @@ impl crate::agent::AgentModel for OllamaClient {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::agent::AgentTurn, String>> + Send>> {
         let client = self.clone_for_task();
         Box::pin(async move {
+            if matches!(request.thinking, ThinkingMode::Effort(_)) {
+                return Err("Select a Thinking setting advertised by this Ollama model.".into());
+            }
             lifecycle::ensure_ready(&client.http, &client.endpoint)
                 .await.map_err(|error| error.to_string())?;
             let body = agent_chat_body(request);
@@ -235,6 +238,11 @@ impl InferenceBackend for OllamaClient {
     ) -> BackendFuture<()> {
         let client = self.clone_for_task();
         Box::pin(async move {
+            if matches!(request.thinking, ThinkingMode::Effort(_)) {
+                return Err(BackendError::Protocol(
+                    "Select a Thinking setting advertised by this Ollama model.".into(),
+                ));
+            }
             lifecycle::ensure_ready(&client.http, &client.endpoint).await?;
             let tools = validate_tools(request.tools.as_ref())?;
             if tools.is_some() {
@@ -1127,6 +1135,8 @@ fn think_value(mode: ThinkingMode) -> Option<serde_json::Value> {
         ThinkingMode::Default => None,
         ThinkingMode::Off => Some(false.into()),
         ThinkingMode::On => Some(true.into()),
+        // Public entry points reject catalog-specific efforts for Ollama.
+        ThinkingMode::Effort(effort) => Some(effort.as_str().into()),
         ThinkingMode::Level(level) => Some(serde_json::Value::String(
             match level {
                 crate::domain::ThinkingLevel::Low => "low",
