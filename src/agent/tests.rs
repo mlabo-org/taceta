@@ -174,6 +174,75 @@ fn answer(text: &str) -> AgentTurn {
         ..AgentTurn::default()
     }
 }
+
+#[tokio::test]
+async fn gpt_reverse_import_resumes_completed_work_after_restart_without_duplicate_or_replay() {
+    let fixture = Fixture::new();
+    fixture.write("work.rs", "// already changed by GPT\n");
+    let id = Uuid::new_v4();
+    let mut session = AgentSession::create(&fixture.store, id, &fixture.workspace).unwrap();
+    session.record(EventData::UserInput { content: "Fix the parser without changing the public API.".into() }).unwrap();
+    session.record(EventData::StatusChanged { status: SessionStatus::Completed, message: None }).unwrap();
+    let handoff = ExternalWorkHandoff {
+        source: "codex".into(), source_session_id: "thread-gpt".into(), workspace: fixture.workspace.clone(),
+        records: vec![
+            ExternalWorkRecord { id: "turn-1/user".into(), role: ExternalWorkRole::User, content: "Also retain Japanese input.".into() },
+            ExternalWorkRecord { id: "turn-1/command".into(), role: ExternalWorkRole::ToolResult,
+                content: "command: integration-test; status: completed; exitCode: 0; output: parser passed".into() },
+            ExternalWorkRecord { id: "turn-1/answer".into(), role: ExternalWorkRole::Assistant,
+                content: "Parser fixed and tested; the documentation still needs updating.".into() },
+        ],
+    };
+    // A previously durable prefix represents an interrupted import. The full
+    // retry must finish it without adding the same user correction twice.
+    let prefix = ExternalWorkHandoff { records: handoff.records[..1].to_vec(), ..handoff.clone() };
+    session.import_external_handoff(&prefix).unwrap();
+    let imported = session.import_external_handoff(&handoff).unwrap();
+    assert_eq!(imported.goal, "Fix the parser without changing the public API.");
+    assert_eq!(imported.user_instructions.len(), 2);
+    assert_eq!(imported.status, SessionStatus::Interrupted);
+    let count = session.journal.records.len();
+    drop(session);
+    let mut recovered = AgentSession::open(&fixture.store, id).unwrap();
+    recovered.import_external_handoff(&handoff).unwrap();
+    assert_eq!(recovered.journal.records.len(), count);
+    let forward = recovered.export_handoff(&fixture.workspace).unwrap();
+    assert!(forward.contains("parser passed"));
+    assert!(forward.contains("documentation still needs updating"));
+
+    let model = Arc::new(ScriptModel::new(vec![answer("Continue by updating the documentation.")]));
+    let (events, _event_receiver) = mpsc::unbounded_channel();
+    let (_approval_sender, approvals) = mpsc::unbounded_channel();
+    let (_cancel_sender, cancel) = watch::channel(false);
+    let finished = recovered.run(config(None), model.clone(), events, approvals, cancel).await.unwrap();
+    assert_eq!(finished.status, SessionStatus::Completed);
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "A prior Completed status must not skip the continuation");
+    let input = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(input.contains("Also retain Japanese input."));
+    assert!(input.contains("parser passed"));
+    assert!(input.contains("Reconcile completed and pending work"));
+    assert!(!input.contains("PRIVATE_THINKING_MUST_NOT_REENTER"));
+    assert!(requests[0].messages.iter().all(|message| message.tool_calls.is_empty()));
+    assert_eq!(fs::read_to_string(fixture.workspace.join("work.rs")).unwrap(), "// already changed by GPT\n");
+}
+
+#[test]
+fn gpt_reverse_import_establishes_gpt_origin_task_and_rejects_another_workspace() {
+    let fixture = Fixture::new();
+    let mut session = AgentSession::create(&fixture.store, Uuid::new_v4(), &fixture.workspace).unwrap();
+    let mut handoff = ExternalWorkHandoff {
+        source: "codex".into(), source_session_id: "original-gpt-thread".into(), workspace: fixture.base.clone(),
+        records: vec![ExternalWorkRecord { id: "first-request".into(), role: ExternalWorkRole::User, content: "Implement a local parser.".into() }],
+    };
+    assert!(session.import_external_handoff(&handoff).is_err());
+    assert_eq!(session.journal.records.len(), 1);
+    handoff.workspace = fixture.workspace.clone();
+    let imported = session.import_external_handoff(&handoff).unwrap();
+    assert_eq!(imported.goal, "Implement a local parser.");
+    assert_eq!(imported.workspace, fs::canonicalize(&fixture.workspace).unwrap());
+    assert_eq!(imported.status, SessionStatus::Interrupted);
+}
 fn tool(name: &str, arguments: serde_json::Value) -> AgentTurn {
     AgentTurn {
         tool_calls: vec![AgentToolCall {

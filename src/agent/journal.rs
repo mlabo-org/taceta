@@ -23,6 +23,12 @@ pub(super) enum EventData {
     ImportedMessages {
         messages: Vec<AgentMessage>,
     },
+    ExternalWorkImported {
+        import_key: String,
+        source: String,
+        source_session_id: String,
+        record: ExternalWorkRecord,
+    },
     UserInput {
         content: String,
     },

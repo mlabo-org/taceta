@@ -1335,6 +1335,10 @@ impl TacetaApp {
     }
 
     fn stop_generation(&mut self) {
+        if self.gpt_ui.is_transferring() {
+            self.cancel_gpt_reverse_transfer();
+            return;
+        }
         if self.gpt_ui.active.is_some() {
             self.stop_gpt_run();
             return;
@@ -1768,10 +1772,10 @@ impl TacetaApp {
                         "Delete this chat. Agent event records, if any, are moved to a recovery folder on this Mac.",
                     )
                 ));
-                if self.state.conversations.iter().any(|conversation| conversation.id == confirmation.conversation_id && conversation.is_gpt()) {
+                if self.state.conversations.iter().any(|conversation| conversation.id == confirmation.conversation_id && conversation.has_gpt_history()) {
                     ui.label(text(language,
-                        "GPTはこの一覧から削除します。Codexの原文履歴は削除せず、会話IDの控えをこのMacのTaceta/GptBindings/archivedへ退避します。",
-                        "GPT is removed from this list. Codex's original history remains, and the conversation binding is kept in this Mac's Taceta/GptBindings/archived folder."));
+                        "Codexの原文履歴は削除せず、会話IDの控えをこのMacのTaceta/GptBindings/archivedへ退避します。",
+                        "Codex's original history remains, and the conversation binding is kept in this Mac's Taceta/GptBindings/archived folder."));
                 }
                 if self.is_generating() {
                     ui.label(
@@ -1846,7 +1850,7 @@ impl TacetaApp {
                     "Delete the selected {selected_count} chats. Agent event records are moved to a recovery folder on this Mac."
                 ),
             });
-            if self.state.conversations.iter().any(|conversation| confirmation.conversation_ids.contains(&conversation.id) && conversation.is_gpt()) {
+            if self.state.conversations.iter().any(|conversation| confirmation.conversation_ids.contains(&conversation.id) && conversation.has_gpt_history()) {
                 ui.label(text(language,
                     "GPTは一覧からのみ削除し、Codexの原文履歴と復元用の会話IDはこのMacに残します。",
                     "GPT chats are removed from this list; Codex's original history and recovery bindings remain on this Mac."));
@@ -3729,6 +3733,7 @@ impl eframe::App for TacetaApp {
         self.show_conversation_history_dialogs(ui.ctx());
         self.show_agent_approval(ui.ctx());
         self.show_gpt_requests(ui.ctx());
+        self.show_gpt_transfer(ui.ctx());
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

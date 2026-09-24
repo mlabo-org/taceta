@@ -42,6 +42,31 @@ pub struct AgentMessage {
     pub tool_name: Option<String>,
 }
 
+/// Portable, public work records from another execution service. They carry
+/// evidence and user instructions, never executable tool calls or approvals.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalWorkHandoff {
+    pub source: String,
+    pub source_session_id: String,
+    pub workspace: PathBuf,
+    pub records: Vec<ExternalWorkRecord>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalWorkRole {
+    User,
+    Assistant,
+    ToolResult,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalWorkRecord {
+    /// Stable source item identity, retained across repeated reads.
+    pub id: String,
+    pub role: ExternalWorkRole,
+    pub content: String,
+}
+
 impl AgentMessage {
     pub fn text(role: AgentRole, content: impl Into<String>) -> Self {
         Self {

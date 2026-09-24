@@ -1,6 +1,7 @@
 //! ChatGPT OAuth and Codex's complete execution lifecycle. Codex owns its
 //! transcript, compaction and tools; this module does not implement AgentModel.
 mod catalog;
+mod handoff;
 mod protocol;
 mod transport;
 mod types;
@@ -30,6 +31,22 @@ struct Paths { home: PathBuf, chat: PathBuf, executable: PathBuf }
 impl GptClient {
     /// Construction does not read files, start a process, or connect to an account.
     pub fn new() -> Self { Self::default() }
+
+    /// Export only saved public work items. This never authenticates, discovers
+    /// models, resumes a thread, starts a turn, or runs a tool.
+    pub async fn export_handoff(
+        &self, thread_id: &str, expected_workspace: &Path,
+    ) -> Result<crate::agent::ExternalWorkHandoff, String> {
+        if thread_id.trim().is_empty() { return Err("No saved GPT conversation was selected for transfer.".into()); }
+        let _guard = self.coordination.try_lock()
+            .map_err(|_| "GPT is still busy. Stop its active operation before transferring the task.")?;
+        let mut connection = timeout(RPC_SESSION_TIMEOUT, open(true)).await
+            .map_err(|_| "Opening the public Codex history connection timed out.")??;
+        let result = timeout(RPC_SESSION_TIMEOUT, handoff::read(&mut connection, thread_id, expected_workspace)).await
+            .map_err(|_| "Reading the complete GPT history timed out. No partial task handoff was returned.".to_owned())?;
+        connection.shutdown().await;
+        result
+    }
 
     pub async fn sign_in(&self, events: UnboundedSender<GptLoginEvent>) -> Result<(), String> {
         tokio::select! {

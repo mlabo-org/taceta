@@ -24,6 +24,7 @@ impl Default for ProviderUiState {
 impl TacetaApp {
     pub(super) fn is_generating(&self) -> bool {
         self.generation.is_some() || self.agent_ui.active.is_some() || self.gpt_ui.active.is_some()
+            || self.gpt_ui.is_transferring()
     }
 
     fn can_change_provider(&self) -> bool {
@@ -36,6 +37,10 @@ impl TacetaApp {
 
     pub(super) fn select_provider(&mut self, provider: InferenceProvider) {
         if provider == self.state.inference_provider || !self.can_change_provider() {
+            return;
+        }
+        if provider == InferenceProvider::Grok && self.state.active_conversation().requires_gpt_reverse_transfer() {
+            self.start_gpt_reverse_transfer();
             return;
         }
         self.state.switch_provider(provider);
