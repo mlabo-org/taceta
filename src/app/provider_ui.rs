@@ -23,7 +23,7 @@ impl Default for ProviderUiState {
 
 impl TacetaApp {
     pub(super) fn is_generating(&self) -> bool {
-        self.generation.is_some() || self.agent_ui.active.is_some()
+        self.generation.is_some() || self.agent_ui.active.is_some() || self.gpt_ui.active.is_some()
     }
 
     fn can_change_provider(&self) -> bool {
@@ -31,27 +31,27 @@ impl TacetaApp {
             && self.model_pull.is_none()
             && self.model_unload_result.is_none()
             && self.provider_ui.login.is_none()
+            && !self.gpt_ui.auth_busy()
     }
 
     pub(super) fn select_provider(&mut self, provider: InferenceProvider) {
         if provider == self.state.inference_provider || !self.can_change_provider() {
             return;
         }
-        if let Some(model) = self.state.selected_model.take() {
-            self.state
-                .provider_models
-                .insert(self.state.inference_provider, model);
-        }
-        self.state.inference_provider = provider;
-        self.state.selected_model = self.state.provider_models.get(&provider).cloned();
-        self.backend = match provider {
-            InferenceProvider::Ollama => Arc::new(
+        self.state.switch_provider(provider);
+        self.bind_selected_provider();
+    }
+
+    pub(super) fn bind_selected_provider(&mut self) {
+        self.backend = match self.state.inference_provider {
+            InferenceProvider::Ollama => Some(Arc::new(
                 OllamaClient::new(self.ollama_endpoint.clone())
                     .with_link_service(Arc::clone(&self.link_service)),
-            ),
+            ) as Arc<dyn InferenceBackend>),
             InferenceProvider::Grok => {
-                Arc::clone(&self.provider_ui.grok) as Arc<dyn InferenceBackend>
+                Some(Arc::clone(&self.provider_ui.grok) as Arc<dyn InferenceBackend>)
             }
+            InferenceProvider::Gpt => None,
         };
         // A model list belongs to the request that produced it. A late reply
         // from the previous endpoint cannot replace this provider's models.
@@ -62,6 +62,16 @@ impl TacetaApp {
         self.refresh_models();
     }
 
+    pub(super) fn select_saved_conversation(&mut self, id: Uuid) {
+        if self.is_generating() {
+            return;
+        }
+        let previous = self.state.inference_provider;
+        if self.state.select_conversation(id) && previous != self.state.inference_provider {
+            self.bind_selected_provider();
+        }
+    }
+
     pub(super) fn show_provider_selector(&mut self, ui: &mut Ui) {
         let mut selected = self.state.inference_provider;
         ui.add_enabled_ui(self.can_change_provider(), |ui| {
@@ -69,7 +79,7 @@ impl TacetaApp {
                 .selected_text(selected.label())
                 .width(126.0)
                 .show_ui(ui, |ui| {
-                    for provider in [InferenceProvider::Ollama, InferenceProvider::Grok] {
+                    for provider in [InferenceProvider::Ollama, InferenceProvider::Grok, InferenceProvider::Gpt] {
                         ui.selectable_value(&mut selected, provider, provider.label());
                     }
                 });
@@ -82,9 +92,18 @@ impl TacetaApp {
         ui.heading(text(language, "推論の接続先", "Inference provider"));
         self.show_provider_selector(ui);
         ui.label(text(language,
-            "Ollamaは設定したサーバー、GrokはxAIのサーバーで生成します。Grokを選ぶと、会話と作業に必要なファイル内容がxAIへ送られます。",
-            "Ollama uses your configured server. Grok sends conversation context and the file content needed for your task to xAI."));
+            "Ollamaは設定したサーバーを使います。GrokはxAI、GPTはOpenAIへ会話と作業に必要な内容を送ります。GPTはCodexの会話履歴を使います。",
+            "Ollama uses your configured server. Grok sends task context to xAI; GPT sends it to OpenAI. GPT conversations use Codex history."));
         ui.add_space(8.0);
+        if self.state.inference_provider == InferenceProvider::Gpt {
+            self.show_gpt_settings(ui);
+            ui.add_space(20.0);
+            return;
+        }
+        if self.state.inference_provider == InferenceProvider::Ollama {
+            ui.add_space(20.0);
+            return;
+        }
         ui.horizontal(|ui| {
             if self.provider_ui.login.is_some() {
                 ui.spinner();
@@ -277,7 +296,7 @@ mod tests {
         let mut state = load_app_state(Some(&storage));
         assert_eq!(state.inference_provider, InferenceProvider::Ollama);
         assert!(!state.active_conversation().agent_enabled);
-        state.inference_provider = InferenceProvider::Grok;
+        state.switch_provider(InferenceProvider::Grok);
         state
             .provider_models
             .insert(InferenceProvider::Ollama, "local-model".into());

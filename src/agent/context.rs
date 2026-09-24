@@ -110,7 +110,7 @@ fn same_range(group: &MessageGroup, range: &RetainedHistoryRange) -> bool {
         && group.first_message == range.first_message
         && group.last_message == range.last_message
 }
-fn active_groups(state: &State) -> Vec<&MessageGroup> {
+pub(super) fn active_groups(state: &State) -> Vec<&MessageGroup> {
     state
         .groups
         .iter()

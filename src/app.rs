@@ -8,6 +8,7 @@ use std::{
 };
 
 mod agent_ui;
+mod gpt_ui;
 mod provider_ui;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -26,7 +27,7 @@ use taceta::{
         Attachment, AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent,
         MAX_CHATGPT_WEB_REQUEST_LIMIT, MIN_CHATGPT_WEB_REQUEST_LIMIT, InferenceProvider, ModelCandidate,
         ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingCapability,
-        ThinkingLevel, ThinkingMode,
+        ReasoningEffort, ThinkingLevel, ThinkingMode,
     },
 };
 use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
@@ -124,7 +125,7 @@ pub struct TacetaApp {
     system_language: AppShellLanguage,
     state: PersistedAppState,
     screen: Screen,
-    backend: Arc<dyn InferenceBackend>,
+    backend: Option<Arc<dyn InferenceBackend>>,
     model_manager: Arc<dyn ModelManager>,
     runtime: Runtime,
     model_result_tx: std_mpsc::Sender<(u64, Result<Vec<ModelDescriptor>, String>)>,
@@ -132,6 +133,7 @@ pub struct TacetaApp {
     model_list_epoch: u64,
     provider_ui: provider_ui::ProviderUiState,
     agent_ui: agent_ui::AgentUiState,
+    gpt_ui: gpt_ui::GptUiState,
     model_refresh_pending: bool,
     models: Vec<ModelDescriptor>,
     connection: ConnectionState,
@@ -187,7 +189,9 @@ impl TacetaApp {
         apply_app_shell_preferences(&creation_context.egui_ctx, shell_preferences);
 
         let link_service = Arc::new(TacetaLinkService::default());
-        let state = load_app_state(creation_context.storage);
+        let mut state = load_app_state(creation_context.storage);
+        let gpt_recovery = crate::persistence::gpt_bindings_root()
+            .and_then(|root| crate::persistence::recover_gpt_bindings(&mut state, &root));
         let endpoint_result =
             OllamaEndpoint::resolve(state.ollama_endpoint_mode, &state.ollama_custom_endpoint);
         let (ollama_endpoint, initial_endpoint_error) = match endpoint_result {
@@ -274,7 +278,10 @@ impl TacetaApp {
             }
         }
         if app.state.inference_provider == InferenceProvider::Grok {
-            app.backend = Arc::clone(&app.provider_ui.grok) as Arc<dyn InferenceBackend>;
+            app.backend = Some(Arc::clone(&app.provider_ui.grok) as Arc<dyn InferenceBackend>);
+            app.refresh_models();
+        } else if app.state.inference_provider == InferenceProvider::Gpt {
+            app.backend = None;
             app.refresh_models();
         } else if let Some(error) = initial_endpoint_error {
             let error = ollama_endpoint_error_message(app.language(), &error);
@@ -285,6 +292,9 @@ impl TacetaApp {
             });
         } else {
             app.refresh_models();
+        }
+        if let Err(error) = gpt_recovery {
+            app.notice = Some(Notice { kind: NoticeKind::Error, text: error });
         }
         app
     }
@@ -309,6 +319,7 @@ impl TacetaApp {
         let (delete_result_tx, delete_result_rx) = std_mpsc::channel();
         let ollama_endpoint_mode_draft = state.ollama_endpoint_mode;
         let ollama_custom_endpoint_draft = state.ollama_custom_endpoint.clone();
+        let backend = (state.inference_provider != InferenceProvider::Gpt).then_some(backend);
         Self {
             shell_preferences,
             system_language: system_language(),
@@ -322,6 +333,7 @@ impl TacetaApp {
             model_list_epoch: 0,
             provider_ui: provider_ui::ProviderUiState::default(),
             agent_ui: agent_ui::AgentUiState::default(),
+            gpt_ui: gpt_ui::GptUiState::default(),
             model_refresh_pending: false,
             models: Vec::new(),
             connection: ConnectionState::Connecting,
@@ -369,9 +381,9 @@ impl TacetaApp {
             return false;
         }
         if self.state.inference_provider == InferenceProvider::Ollama {
-            self.backend = Arc::new(
+            self.backend = Some(Arc::new(
                 OllamaClient::new(endpoint.clone()).with_link_service(Arc::clone(&self.link_service)),
-            );
+            ));
             self.models.clear();
             self.connection = ConnectionState::Connecting;
         }
@@ -445,8 +457,20 @@ impl TacetaApp {
         self.model_list_epoch = self.model_list_epoch.wrapping_add(1);
         let epoch = self.model_list_epoch;
         self.connection = ConnectionState::Connecting;
-        let backend = Arc::clone(&self.backend);
         let result_tx = self.model_result_tx.clone();
+        if self.state.inference_provider == InferenceProvider::Gpt {
+            let client = self.gpt_ui.client.clone();
+            self.runtime.spawn(async move {
+                let result = client.list_models().await;
+                let _ = result_tx.send((epoch, result));
+            });
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            self.model_refresh_pending = false;
+            self.connection = ConnectionState::Unavailable("No inference service is selected".into());
+            return;
+        };
         self.runtime.spawn(async move {
             let result = backend
                 .list_models()
@@ -648,6 +672,7 @@ impl TacetaApp {
     fn drain_background_work(&mut self) {
         self.drain_provider_work();
         self.drain_agent_work();
+        self.drain_gpt_work();
         if let Some(receiver) = &self.model_unload_result {
             let result = match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -978,7 +1003,7 @@ impl TacetaApp {
     }
 
     fn safe_backend_error(&self, error: &str) -> String {
-        if self.state.inference_provider == InferenceProvider::Grok {
+        if self.state.inference_provider != InferenceProvider::Ollama {
             return error.to_owned();
         }
         let language = self.language();
@@ -990,21 +1015,28 @@ impl TacetaApp {
         self.models.iter().find(|model| &model.name == selected)
     }
 
-    fn default_thinking_mode(capability: ThinkingCapability) -> ThinkingMode {
+    fn default_thinking_mode(capability: &ThinkingCapability) -> ThinkingMode {
         match capability {
             ThinkingCapability::None | ThinkingCapability::Unverified => ThinkingMode::Default,
             ThinkingCapability::Toggle => ThinkingMode::On,
             ThinkingCapability::Levels => ThinkingMode::Level(ThinkingLevel::Low),
+            ThinkingCapability::Efforts { supported, default } => default
+                .filter(|effort| supported.contains(effort))
+                .or_else(|| supported.first().copied())
+                .map(ThinkingMode::Effort)
+                .unwrap_or(ThinkingMode::Default),
         }
     }
 
     fn normalized_thinking_mode(
-        capability: ThinkingCapability,
+        capability: &ThinkingCapability,
         mode: ThinkingMode,
     ) -> ThinkingMode {
         match (capability, mode) {
             (ThinkingCapability::Toggle, ThinkingMode::Off | ThinkingMode::On) => mode,
             (ThinkingCapability::Levels, ThinkingMode::Level(_)) => mode,
+            (ThinkingCapability::Efforts { supported, .. }, ThinkingMode::Effort(effort))
+                if supported.contains(&effort) => mode,
             (ThinkingCapability::None | ThinkingCapability::Unverified, ThinkingMode::Default) => {
                 mode
             }
@@ -1021,10 +1053,10 @@ impl TacetaApp {
             .thinking_modes
             .get(&model.name)
             .copied()
-            .unwrap_or_else(|| Self::default_thinking_mode(model.thinking));
+            .unwrap_or_else(|| Self::default_thinking_mode(&model.thinking));
         self.state.thinking_modes.insert(
             model.name,
-            Self::normalized_thinking_mode(model.thinking, current),
+            Self::normalized_thinking_mode(&model.thinking, current),
         );
     }
 
@@ -1035,8 +1067,8 @@ impl TacetaApp {
                     .thinking_modes
                     .get(&model.name)
                     .copied()
-                    .map(|mode| Self::normalized_thinking_mode(model.thinking, mode))
-                    .unwrap_or_else(|| Self::default_thinking_mode(model.thinking))
+                    .map(|mode| Self::normalized_thinking_mode(&model.thinking, mode))
+                    .unwrap_or_else(|| Self::default_thinking_mode(&model.thinking))
             })
             .unwrap_or(ThinkingMode::Default)
     }
@@ -1157,6 +1189,10 @@ impl TacetaApp {
     }
 
     fn start_generation(&mut self) {
+        if self.state.inference_provider == InferenceProvider::Gpt {
+            self.start_gpt_send();
+            return;
+        }
         if self.state.active_conversation().agent_enabled {
             self.start_agent_run(false);
             return;
@@ -1276,7 +1312,9 @@ impl TacetaApp {
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (result_tx, result_rx) = std_mpsc::channel();
-        let backend = Arc::clone(&self.backend);
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
         let task = self.runtime.spawn(async move {
             let result = backend
                 .stream_chat(request, event_tx)
@@ -1297,6 +1335,10 @@ impl TacetaApp {
     }
 
     fn stop_generation(&mut self) {
+        if self.gpt_ui.active.is_some() {
+            self.stop_gpt_run();
+            return;
+        }
         if self.agent_ui.active.is_some() {
             self.stop_agent_run();
             return;
@@ -1622,7 +1664,7 @@ impl TacetaApp {
                             });
 
                             if select_requested {
-                                self.state.active_conversation_id = id;
+                                self.select_saved_conversation(id);
                                 self.screen = Screen::Chat;
                                 self.scroll_to_bottom = true;
                             }
@@ -1726,6 +1768,11 @@ impl TacetaApp {
                         "Delete this chat. Agent event records, if any, are moved to a recovery folder on this Mac.",
                     )
                 ));
+                if self.state.conversations.iter().any(|conversation| conversation.id == confirmation.conversation_id && conversation.is_gpt()) {
+                    ui.label(text(language,
+                        "GPTはこの一覧から削除します。Codexの原文履歴は削除せず、会話IDの控えをこのMacのTaceta/GptBindings/archivedへ退避します。",
+                        "GPT is removed from this list. Codex's original history remains, and the conversation binding is kept in this Mac's Taceta/GptBindings/archived folder."));
+                }
                 if self.is_generating() {
                     ui.label(
                         RichText::new(text(
@@ -1758,8 +1805,11 @@ impl TacetaApp {
             });
 
         if delete_requested {
-            if self.archive_agent_chats(&[confirmation.conversation_id])
+            let previous_provider = self.state.inference_provider;
+            if self.archive_gpt_chats(&[confirmation.conversation_id])
+                && self.archive_agent_chats(&[confirmation.conversation_id])
                 && self.state.delete_conversation(confirmation.conversation_id) {
+                if previous_provider != self.state.inference_provider { self.bind_selected_provider(); }
                 self.screen = Screen::Chat;
                 self.scroll_to_bottom = true;
             }
@@ -1796,6 +1846,11 @@ impl TacetaApp {
                     "Delete the selected {selected_count} chats. Agent event records are moved to a recovery folder on this Mac."
                 ),
             });
+            if self.state.conversations.iter().any(|conversation| confirmation.conversation_ids.contains(&conversation.id) && conversation.is_gpt()) {
+                ui.label(text(language,
+                    "GPTは一覧からのみ削除し、Codexの原文履歴と復元用の会話IDはこのMacに残します。",
+                    "GPT chats are removed from this list; Codex's original history and recovery bindings remain on this Mac."));
+            }
             if self.is_generating() {
                 ui.label(
                     RichText::new(text(
@@ -1828,11 +1883,14 @@ impl TacetaApp {
         });
 
         if delete_requested {
-            if self.archive_agent_chats(&confirmation.conversation_ids) && self
+            let previous_provider = self.state.inference_provider;
+            if self.archive_gpt_chats(&confirmation.conversation_ids)
+                && self.archive_agent_chats(&confirmation.conversation_ids) && self
                 .state
                 .delete_conversations(&confirmation.conversation_ids)
                 > 0
             {
+                if previous_provider != self.state.inference_provider { self.bind_selected_provider(); }
                 self.conversation_bulk_delete_mode = false;
                 self.conversation_bulk_selection.clear();
                 self.screen = Screen::Chat;
@@ -1880,10 +1938,10 @@ impl TacetaApp {
                             ),
                             ConnectionState::Ready => (
                                 theme::palette(ui).success,
-                                if self.state.inference_provider == InferenceProvider::Grok {
-                                    "Grok"
-                                } else {
-                                    text(language, "ローカル接続", "Local ready")
+                                match self.state.inference_provider {
+                                    InferenceProvider::Grok => "Grok",
+                                    InferenceProvider::Gpt => "GPT",
+                                    InferenceProvider::Ollama => text(language, "ローカル接続", "Local ready"),
                                 },
                                 None,
                             ),
@@ -2269,6 +2327,10 @@ impl TacetaApp {
                         let palette = theme::palette(ui);
                         theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
                             ui.strong(text(language, "Web検索", "Web Search"));
+                            if self.state.inference_provider == InferenceProvider::Gpt {
+                                ui.label(text(language, "GPTではTaceta LinkのWeb検索を使いません。", "GPT does not use Taceta Link Web Search."));
+                                return;
+                            }
                             ui.add_space(4.0);
                             ui.label(RichText::new(text(
                                 language,
@@ -2388,6 +2450,11 @@ impl TacetaApp {
                             16,
                         )
                         .show(ui, |ui| {
+                            if self.state.inference_provider == InferenceProvider::Gpt {
+                                ui.strong(text(language, "GPTのコンテキスト", "GPT context"));
+                                self.show_gpt_usage(ui);
+                                return;
+                            }
                             ui.strong(text(language, "モデル格納先", "Model location"));
                             ui.add_space(4.0);
                             ui.label(
@@ -2833,7 +2900,7 @@ impl TacetaApp {
                                                 RichText::new(format!(
                                                     "{} · {}{}{}",
                                                     human_size(model.size),
-                                                    capability_label(model.thinking, language),
+                                                    capability_label(&model.thinking, language),
                                                     if model.vision { " · vision" } else { "" },
                                                     if model.tools { " · tools" } else { "" }
                                                 ))
@@ -2884,6 +2951,10 @@ impl TacetaApp {
     }
 
     fn show_chat(&mut self, root_ui: &mut Ui) {
+        if self.state.inference_provider == InferenceProvider::Gpt {
+            self.show_gpt_chat(root_ui);
+            return;
+        }
         if self.state.active_conversation().agent_enabled {
             self.show_agent_chat(root_ui);
             return;
@@ -3141,7 +3212,7 @@ impl TacetaApp {
                                         egui::Stroke::NONE;
                                     let file_clicked = ui
                                         .add_enabled(
-                                            !self.is_generating() && !self.state.active_conversation().agent_enabled,
+                                            !self.is_generating() && (!self.state.active_conversation().agent_enabled || self.state.inference_provider == InferenceProvider::Gpt),
                                             Button::new("＋")
                                                 .min_size(Vec2::splat(control.row_height))
                                                 .corner_radius(control.row_height / 2.0),
@@ -3198,7 +3269,7 @@ impl TacetaApp {
                                     } else {
                                         text(language, "Web: OFF", "Web: OFF")
                                     };
-                                    if ui
+                                    if self.state.inference_provider != InferenceProvider::Gpt && ui
                                         .add_enabled(
                                             web_available && !self.is_generating(),
                                             Button::new(web_label)
@@ -3387,8 +3458,8 @@ impl TacetaApp {
             .thinking_modes
             .get(&model.name)
             .copied()
-            .unwrap_or_else(|| Self::default_thinking_mode(model.thinking));
-        let current = Self::normalized_thinking_mode(model.thinking, current);
+            .unwrap_or_else(|| Self::default_thinking_mode(&model.thinking));
+        let current = Self::normalized_thinking_mode(&model.thinking, current);
 
         match model.thinking {
             ThinkingCapability::None => {
@@ -3473,6 +3544,23 @@ impl TacetaApp {
                             selected = ThinkingMode::Level(level);
                         }
                     }
+                });
+                self.state.thinking_modes.insert(model.name, selected);
+            }
+            ThinkingCapability::Efforts { supported, .. } => {
+                let mut selected = current;
+                ui.add_enabled_ui(!supported.is_empty(), |ui| {
+                    egui::containers::menu::MenuButton::from_button(
+                        Button::new(thinking_mode_label(language, selected))
+                            .min_size(Vec2::new(0.0, control.row_height))
+                            .right_text("▼")
+                            .corner_radius(radius),
+                    ).ui(ui, |ui| {
+                        for effort in supported {
+                            show_app_shell_menu_row(ui, &mut selected,
+                                ThinkingMode::Effort(effort), effort.as_str());
+                        }
+                    });
                 });
                 self.state.thinking_modes.insert(model.name, selected);
             }
@@ -3610,10 +3698,11 @@ fn composer_editor_content_height(ui: &Ui, draft: &str, wrap_width: f32) -> f32 
 }
 
 impl eframe::App for TacetaApp {
-    fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         self.drain_background_work();
+        self.persist_gpt_thread(frame.storage_mut());
 
-        if self.is_generating() || self.provider_ui.login.is_some() || self.agent_ui.is_recovering()
+        if self.is_generating() || self.provider_ui.login.is_some() || self.gpt_ui.auth_busy() || self.agent_ui.is_recovering()
             || self.model_refresh_pending || self.model_pull.is_some()
             || self.model_unload_result.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -3639,6 +3728,7 @@ impl eframe::App for TacetaApp {
         }
         self.show_conversation_history_dialogs(ui.ctx());
         self.show_agent_approval(ui.ctx());
+        self.show_gpt_requests(ui.ctx());
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -3654,6 +3744,7 @@ impl eframe::App for TacetaApp {
 impl Drop for TacetaApp {
     fn drop(&mut self) {
         self.abort_agent_on_exit();
+        self.abort_gpt_on_exit();
         if let Some(login) = self.provider_ui.login.take() {
             login.task.abort();
         }
@@ -3695,6 +3786,16 @@ fn thinking_mode_label(language: AppShellLanguage, mode: ThinkingMode) -> &'stat
             text(language, "思考: 中", "Thinking: Medium")
         }
         ThinkingMode::Level(ThinkingLevel::High) => text(language, "思考: 高", "Thinking: High"),
+        ThinkingMode::Effort(effort) => match effort {
+            ReasoningEffort::None => text(language, "思考: none", "Thinking: none"),
+            ReasoningEffort::Minimal => text(language, "思考: minimal", "Thinking: minimal"),
+            ReasoningEffort::Low => text(language, "思考: low", "Thinking: low"),
+            ReasoningEffort::Medium => text(language, "思考: medium", "Thinking: medium"),
+            ReasoningEffort::High => text(language, "思考: high", "Thinking: high"),
+            ReasoningEffort::XHigh => text(language, "思考: xhigh", "Thinking: xhigh"),
+            ReasoningEffort::Max => text(language, "思考: max", "Thinking: max"),
+            ReasoningEffort::Ultra => text(language, "思考: ultra", "Thinking: ultra"),
+        },
     }
 }
 
@@ -3773,11 +3874,12 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-fn capability_label(capability: ThinkingCapability, language: AppShellLanguage) -> &'static str {
+fn capability_label(capability: &ThinkingCapability, language: AppShellLanguage) -> &'static str {
     match capability {
         ThinkingCapability::None => text(language, "思考なし", "thinking: none"),
         ThinkingCapability::Toggle => text(language, "思考ON/OFF", "thinking: toggle"),
         ThinkingCapability::Levels => text(language, "思考レベル", "thinking: levels"),
+        ThinkingCapability::Efforts { .. } => text(language, "思考レベル", "thinking: levels"),
         ThinkingCapability::Unverified => text(language, "思考未確認", "thinking: unknown"),
     }
 }
@@ -4545,7 +4647,7 @@ mod model_manager_tests {
 
         let requests = Arc::new(Mutex::new(Vec::new()));
         let mut app = test_app(Arc::new(RecordingServices::default()));
-        app.backend = Arc::new(ModelRouteRecorder { requests: Arc::clone(&requests) });
+        app.backend = Some(Arc::new(ModelRouteRecorder { requests: Arc::clone(&requests) }));
         app.state.inference_provider = InferenceProvider::Grok;
         app.models = vec![model("grok-4.5"), model("grok-4.6")];
         let conversation_id = app.state.active_conversation().id;

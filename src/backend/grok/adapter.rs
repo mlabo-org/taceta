@@ -49,6 +49,7 @@ impl ModelInfo {
             ThinkingMode::Level(ThinkingLevel::Medium) => "medium",
             ThinkingMode::Level(ThinkingLevel::High) => "high",
             ThinkingMode::Off | ThinkingMode::On => return Err("This Grok model does not advertise a boolean Thinking control. Use the model default.".into()),
+            ThinkingMode::Effort(_) => return Err("This Thinking setting belongs to the GPT model catalog. Select a confirmed Grok Thinking level.".into()),
         };
         if !self.efforts.contains(effort) {
             return Err("The selected Thinking level is not confirmed by this Grok model's metadata.".into());

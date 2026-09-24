@@ -1,6 +1,6 @@
 # Taceta
 
-Tacetaは、OllamaとOAuthで接続するGrokを推論先に選べる、macOS専用のネイティブクライアントです。Rustと `eframe` / `egui` で構築され、作業モードではTaceta自身がツール実行、履歴、コンパクション、中断と再開を管理します。
+Tacetaは、Ollama、OAuthで接続するGrok、ChatGPTのOAuthで接続するGPTを選べる、macOS専用のネイティブクライアントです。Rustと `eframe` / `egui` で構築されています。GPTの作業モードはCodex App Serverがコーディング、履歴、コンパクションを担当し、Tacetaが入力・進捗・承認・停止を扱います。OllamaとGrokの作業モードはTaceta自身が実行を管理します。
 
 Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT Web とのやり取りを Taceta から明示的に開始できる独立した Manifest V3 拡張です。Taceta と Taceta Link は OpenAI、xAI、Ollama、Brave、Google の公式製品ではありません。
 
@@ -8,6 +8,7 @@ Taceta Link は、ログイン済みブラウザーで行う検索や ChatGPT We
 
 - Ollama モデルのストリーミング回答
 - GrokのOAuth接続、モデル一覧、ストリーミング回答
+- GPTのChatGPT OAuth接続と、Codexによるコーディング・承認・差分表示・再開
 - 作業フォルダーの読み取り、確認したファイル編集・コマンド実行、中断と再開
 - 原文履歴を残すコンパクション、作業状態の保存、過去の原文検索
 - Thinking の実行設定と trace 表示の独立制御
@@ -46,7 +47,8 @@ Google 検索では、AI による概要があれば生成完了を確認して�
 Taceta (Rust/egui)
   ├─ Chat / Agent ────────────────→ Ollama (resolved endpoint)
   ├─ Chat / Agent (OAuth) ─────────→ Grok inference
-  ├─ Agent ───────────────────────→ workspace tools + durable context
+  ├─ GPT / Coding (OAuth) ─────────→ Codex App Server → OpenAI
+  ├─ Ollama / Grok Agent ──────────→ workspace tools + durable context
   ├─ Brave / Ollama Web Search API ─→ 外部検索 → Ollama (最終回答)
   └─ Taceta Link ──────────────────→ Brave / Chrome
                                       └─ 検索または ChatGPT Web
@@ -60,7 +62,7 @@ Taceta Link は `browser-extension/` の MV3 拡張、Native Messaging Host `org
 
 ## セキュリティとプライバシー
 
-- 通常のチャットと会話履歴はこの Mac のローカルアプリケーションデータに保存します。生成に必要な会話内容と添付は選択中の推論先へ送ります。Grokを選ぶとxAIのサーバーへ送り、作業モードでは必要なファイル内容とコマンド結果も含みます。
+- 通常のチャットと会話履歴はこの Mac のローカルアプリケーションデータに保存します。生成に必要な会話内容と添付は選択中の推論先へ送ります。GrokはxAI、GPTはOpenAIへ送信し、作業モードでは必要なファイル内容とコマンド結果も含みます。
 - Ollamaの既定接続先は `http://127.0.0.1:11434` です。TacetaはOllamaの設定を自動解決でき、Ollamaとモデルは同梱・再配布しません。
 - Web Search を有効にした場合だけ、設定した検索先へ query、または選択した Web executor の request が送られます。送信前に画面で確認できます。
 - API key が必要な検索 provider の key は macOS Keychain に保存します。Cookie やブラウザーの認証 token を読み出したり、エクスポートしたりしません。
@@ -75,6 +77,7 @@ Taceta Link は OpenAI / ChatGPT の公式拡張ではなく、ChatGPT Web の D
 - Rust 1.92 以降（ソースからビルドする場合）
 - Ollamaを使う場合は [Ollama](https://ollama.com/) を別途インストールして起動
 - Grokを使う場合は公式Grok CLIとOAuth接続を受け付けるGrokアカウント
+- GPTを使う場合は公式Codex CLIとCodexを利用できるChatGPTアカウント
 - Taceta Link を使う場合は Brave または Chrome
 
 モデルの取得・削除は Model Manager から利用者が明示的に行います。モデル、Ollama、ブラウザー、検索 API、ChatGPT Web の利用条件は、それぞれの提供元に従います。
@@ -91,6 +94,8 @@ Taceta Link は OpenAI / ChatGPT の公式拡張ではなく、ChatGPT Web の D
 
 ## 作業モードとコンパクション
 
+以下はOllamaとGrokの作業モードです。GPTの作業は後述のCodex接続を使います。
+
 1. 会話上部で「作業」を選び、作業フォルダーを指定します。
 2. ツール対応のOllamaまたはGrokモデルを選び、作業を送信します。
 3. ファイル編集・コマンドの内容が表示されたら、その1回を許可または拒否します。コマンドは作業フォルダーと専用一時領域だけへ書き込み、ネットワークを使用できません。
@@ -101,6 +106,21 @@ Taceta Link は OpenAI / ChatGPT の公式拡張ではなく、ChatGPT Web の D
 作業記録は現在ユーザーの `~/Library/Application Support/Taceta/AgentSessions/` に保存します。会話を削除すると、作業記録は同じ保存領域の復元用フォルダーへ退避します。再開しても、結果不明の編集やコマンドを自動で再実行しません。
 
 Grok OAuthでは選択モデルの通常推論で要約を生成します。APIキー向けの[専用コンパクション](https://docs.x.ai/developers/advanced-api-usage/context-compaction)をOAuth proxyでも使えるとは仮定しません。要約の品質はモデルにも依存し、Codexのサービス側コンパクションとの同等性は未確認です。
+
+## GPTでコーディングする
+
+1. 公式Codex CLIを別途用意し、設定からGPTのOAuth接続を開始します。ブラウザーでChatGPTへのログインを完了してください。
+2. 接続先の「GPT (OAuth)」と、アカウントに返されたモデルを選びます。GPTの新しい会話は作業モードで始まります。
+3. 作業フォルダーを選び、実装・修正したい内容を送信します。回答、コマンドの出力、ファイル変更、差分をTacetaで確認できます。
+4. Codexから承認や質問が届いたらTacetaで回答します。停止、保存済み作業の続行、手動コンパクションも同じ会話で行います。通常の会話には「チャット」を選びます。
+
+GPT接続は公式の[Codex App Server](https://learn.chatgpt.com/docs/app-server)を標準入出力で利用します。TacetaはAPIキー接続を提供せず、OAuthと認証更新はCodexが担当します。認証はmacOS Keychain、Codexの設定と会話は `~/Library/Application Support/Taceta/gpt` の専用領域で管理します。既存のCodexの認証・設定・履歴をコピーしません。CLIが見つからない場合や必要なApp Server機能に対応していない場合は、その不足を表示して停止します。
+
+モデルと推論レベルはアカウントのモデル一覧に従います。推論レベルとThinking表示は独立しています。コンテキストの管理と圧縮はCodexが担当し、容量は通知で取得できた値を表示します。作業の会話IDを保存してから送信するため、再起動後も同じCodex会話を再開できます。GPTの会話に束縛されたモード・作業フォルダーを変更する場合は、元の会話を残して新しい会話に分けます。GPTの会話をTacetaから削除しても、Codex側の原文履歴は復旧用に専用領域へ残ります。
+
+Grok／Ollamaで進めた作業からGPTへ切り替える場合は、同じTacetaの作業とフォルダーを引き継げます。「続行」または次の指示の送信で、新しいCodex会話に元の依頼・追加指示・決定事項・完了／未完了・現在の作業文脈と実行結果を一度だけ渡します。現在のファイルはそのまま使い、元の作業記録も保持します。以前の詳細が必要なときは、その作業だけの原文記録を参照できます。Thinkingや途中で切れた回答、以前の操作承認は引き継ぎません。結果不明の操作を再実行する指示にも変換しません。通常チャットの切り替えやGPTからOllama／Grokへの切り替えでは、会話を分けて保存します。
+
+GPTの作業にはCodexの `workspace-write` と `untrusted` 承認ポリシーを使い、コマンドのネットワーク接続を無効にします。承認が必要な操作はCodexが判断します。これはOllama／Grokの「全編集・全コマンドを個別承認」とは異なり、作業フォルダー外の読み取りを全面的に禁止する設定でもありません。Tacetaは時間と通知されたツール操作数を基準に中断します。操作数は停止の目安であり、並行して開始済みの操作やモデル内部の推論回数の厳密な上限ではありません。通常チャットでは実行環境を渡さず、ファイル操作・コマンド実行を提供しません。Taceta LinkによるWeb検索はGPT接続には付加しません。
 
 ## Ollama接続先
 
@@ -185,7 +205,7 @@ Ollama、ブラウザー、検索 API、ChatGPT Web、モデル、および Rust
 
 # Taceta (English)
 
-Taceta is a native macOS client with Ollama and OAuth-authenticated Grok inference providers. Built with Rust and `eframe` / `egui`, its Agent mode manages tool execution, history, compaction, interruption and resumption within Taceta.
+Taceta is a native macOS client for Ollama, OAuth-authenticated Grok and GPT through ChatGPT OAuth. It is built with Rust and `eframe` / `egui`. Codex App Server owns GPT coding, history and compaction, while Taceta handles input, progress, approvals and stopping. Taceta owns task execution for Ollama and Grok.
 
 Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly start searches and ChatGPT Web interactions in a logged-in browser. Neither project is an official product of OpenAI, xAI, Ollama, Brave, or Google.
 
@@ -193,6 +213,7 @@ Taceta Link is a separate Manifest V3 extension that lets Taceta explicitly star
 
 - Stream responses from Ollama models
 - Grok OAuth sign-in, model discovery and streaming responses
+- GPT through ChatGPT OAuth, with Codex coding, approvals, diffs and resumption
 - Workspace reads, approved edits and commands, interruption and resumption
 - Compaction with original events, structured work state and history search
 - Independently control Thinking execution and Thinking-trace visibility
@@ -229,7 +250,8 @@ Configure language, theme, model management, Web Search, the model location, and
 Taceta (Rust/egui)
   ├─ Chat / Agent ────────────────→ Ollama (resolved endpoint)
   ├─ Chat / Agent (OAuth) ─────────→ Grok inference
-  ├─ Agent ───────────────────────→ workspace tools + durable context
+  ├─ GPT / Coding (OAuth) ─────────→ Codex App Server → OpenAI
+  ├─ Ollama / Grok Agent ──────────→ workspace tools + durable context
   ├─ Brave / Ollama Web Search API ─→ external search → Ollama (final answer)
   └─ Taceta Link ──────────────────→ Brave / Chrome
                                       └─ search or ChatGPT Web
@@ -243,7 +265,7 @@ For a direct search request, the first ChatGPT Web request sends the current com
 
 ## Security and privacy
 
-- Normal chats and conversation history are stored in this Mac's local application data. Conversation context and attachments are sent to the selected inference provider. Selecting Grok sends them to xAI, including file content and command results needed for Agent tasks.
+- Normal chats and conversation history are stored in this Mac's local application data. Conversation context and attachments are sent to the selected provider: xAI for Grok and OpenAI for GPT, including file content and command results needed for coding tasks.
 - Ollama's default endpoint is `http://127.0.0.1:11434`. Taceta can resolve Ollama's configuration automatically and does not bundle or redistribute Ollama or models.
 - Only when Web Search is enabled, the configured search provider receives a query or request. The UI asks for confirmation before sending.
 - Where a search provider requires an API key, it is stored in the macOS Keychain. Browser cookies and authentication tokens are never read or exported.
@@ -258,6 +280,7 @@ Taceta Link is not an official OpenAI / ChatGPT extension. It is an unofficial, 
 - Rust 1.92 or later when building from source
 - For Ollama inference, [Ollama](https://ollama.com/) installed and running separately
 - For Grok inference, the official Grok CLI and an account accepted by the Grok OAuth service
+- For GPT, the official Codex CLI and a ChatGPT account with Codex access
 - Brave or Chrome for Taceta Link
 
 Users explicitly retrieve and remove models through Taceta's Model Manager. Ollama, browsers, search APIs, ChatGPT Web, and models remain subject to their respective provider terms and conditions.
@@ -274,6 +297,8 @@ This connection is unofficial. Account eligibility requires actual sign-in, mode
 
 ## Agent mode and compaction
 
+This section covers Ollama and Grok. GPT uses the Codex integration below.
+
 1. Select Agent above the conversation and choose a workspace.
 2. Select a tool-capable Ollama or Grok model and submit the task.
 3. Review each proposed edit or command and approve or deny that one action. Commands can write only to the workspace and their scratch area, and cannot access the network.
@@ -284,6 +309,21 @@ This connection is unofficial. Account eligibility requires actual sign-in, mode
 Records are stored under the current user's `~/Library/Application Support/Taceta/AgentSessions/`. Deleting a chat moves its Agent records to a recovery folder in the same storage area. Resumption does not automatically repeat an edit or command whose outcome is unknown.
 
 Grok OAuth creates summaries through normal inference with the selected model. Taceta does not assume that the API-key [native compaction endpoint](https://docs.x.ai/developers/advanced-api-usage/context-compaction) is supported by the OAuth proxy. Summary quality depends on the model; equivalence with Codex's service-side compaction is not established.
+
+## Coding with GPT
+
+1. Install the official Codex CLI separately, start GPT OAuth sign-in from Settings, and complete ChatGPT login in the browser.
+2. Select GPT (OAuth) and an available account model. New GPT conversations start in coding mode.
+3. Choose the workspace and describe the implementation or repair. Taceta displays replies, command output, file changes and diffs.
+4. Answer Codex approval requests and questions in Taceta. Stop, continue saved work and compact context in the same conversation. Select Chat for ordinary conversation.
+
+GPT uses the official [Codex App Server](https://learn.chatgpt.com/docs/app-server) over stdio. OAuth and token refresh belong to Codex; Taceta provides no API-key route. Credentials use macOS Keychain, while Codex configuration and history use the isolated `~/Library/Application Support/Taceta/gpt` location. Existing Codex credentials, settings and sessions are not copied. Missing CLI or required App Server capabilities produce an actionable error.
+
+Models and reasoning levels come from the account catalog. Reasoning and trace visibility remain independent. Codex owns context management and compaction; capacity is displayed only when reported. Taceta durably saves the Codex thread ID before sending work and resumes that thread after restart. Changing a bound GPT thread's mode or workspace creates a new conversation while preserving the previous one. Deleting a GPT conversation from Taceta retains Codex's original history in its isolated storage for recovery.
+
+Switching an existing Grok/Ollama coding task to GPT preserves the same Taceta task and workspace. Continue or the next explicit send starts a Codex thread with a one-time handoff of the original request, ordered corrections, decisions, completed and pending work, current context and tool results. Existing files and the original task journal are retained; earlier details remain available in that task's exact original records. Thinking, interrupted prose and prior approvals do not transfer. Unknown-outcome operations are marked for inspection, never replayed automatically. Ordinary chat transitions and GPT-to-Ollama/Grok transitions use separate preserved conversations.
+
+GPT coding uses Codex's `workspace-write` sandbox and `untrusted` approval policy with command network access disabled. Codex decides which actions require approval. This differs from Taceta's per-edit/per-command approvals for Ollama/Grok and does not prohibit all reads outside the workspace. Time and reported tool actions trigger interruption; the action threshold cannot strictly bound already-running parallel actions or hidden model inference calls. Ordinary chat supplies no execution environment or filesystem/command tools. Taceta Link Web Search is not added to GPT.
 
 ## Ollama endpoint
 

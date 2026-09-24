@@ -6,6 +6,7 @@ pub enum InferenceProvider {
     #[default]
     Ollama,
     Grok,
+    Gpt,
 }
 
 impl InferenceProvider {
@@ -13,6 +14,7 @@ impl InferenceProvider {
         match self {
             Self::Ollama => "Ollama",
             Self::Grok => "Grok (OAuth)",
+            Self::Gpt => "GPT (OAuth)",
         }
     }
 }
@@ -98,14 +100,48 @@ pub enum ThinkingMode {
     Off,
     On,
     Level(ThinkingLevel),
+    Effort(ReasoningEffort),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Ultra,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThinkingCapability {
     None,
     Toggle,
     Levels,
     Unverified,
+    /// Options and default advertised by the selected account's model catalog.
+    Efforts {
+        supported: Vec<ReasoningEffort>,
+        default: Option<ReasoningEffort>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -61,6 +61,60 @@ impl Drop for Fixture {
     }
 }
 
+#[test]
+fn gpt_handoff_preserves_task_and_results_without_replaying_or_exporting_partial_output() {
+    let fixture = Fixture::new();
+    fixture.write("work.rs", "// edits already made by the previous provider\n");
+    let id = Uuid::new_v4();
+    let mut session = AgentSession::create(&fixture.store, id, &fixture.workspace).unwrap();
+    session.record(journal::EventData::UserInput {
+        content: "Fix the parser; keep the public API unchanged.".into(),
+    }).unwrap();
+    session.record(journal::EventData::UserInput {
+        content: "Also preserve Japanese input.".into(),
+    }).unwrap();
+    session.record(journal::EventData::WorkStateUpdated {
+        state: WorkState {
+            tasks: vec![
+                WorkItem { id: "parse".into(), description: "Parser repaired".into(), status: WorkItemStatus::Completed },
+                WorkItem { id: "tests".into(), description: "Run integration test".into(), status: WorkItemStatus::Pending },
+            ],
+            decisions: vec!["Keep the existing error type".into()],
+            constraints: vec!["Do not rename public methods".into()],
+            artifacts: vec!["work.rs".into()],
+            resume_point: "Check the integration case".into(),
+        },
+    }).unwrap();
+    let done = AgentToolCall { id: "read-result".into(), name: "read_file".into(), arguments: json!({"path":"work.rs"}) };
+    session.record(journal::EventData::AssistantTurn { turn: AgentTurn {
+        content: "Inspect the changed parser.".into(), tool_calls: vec![done.clone()], ..Default::default()
+    }}).unwrap();
+    session.record(journal::EventData::ToolResult {
+        call_id: done.id, name: done.name, output: "The signature is unchanged.".into(), is_error: false,
+    }).unwrap();
+    let pending = AgentToolCall { id: "unknown-command".into(), name: "run_command".into(), arguments: json!({"command":"test parser"}) };
+    session.record(journal::EventData::AssistantTurn { turn: AgentTurn {
+        content: String::new(), tool_calls: vec![pending.clone()], ..Default::default()
+    }}).unwrap();
+    session.record(journal::EventData::ToolStarted { call: pending }).unwrap();
+    session.record(journal::EventData::InterruptedOutput { content: "PRIVATE_PARTIAL_MARKER".into() }).unwrap();
+    let count = session.journal.records.len();
+    let exported = session.export_handoff(&fixture.workspace).unwrap();
+    let handoff: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    assert_eq!(handoff["source_session_id"], id.to_string());
+    assert_eq!(handoff["original_user_instructions"][0]["content"], "Fix the parser; keep the public API unchanged.");
+    assert_eq!(handoff["original_user_instructions"][1]["content"], "Also preserve Japanese input.");
+    assert_eq!(handoff["model_maintained_work_state"]["tasks"][1]["status"], "Pending");
+    assert!(exported.contains("The signature is unchanged."));
+    assert!(exported.contains("Keep the existing error type"));
+    assert_eq!(handoff["unresolved_operations"][0]["execution_started"], true);
+    assert!(handoff["unresolved_operations"][0]["disposition"].as_str().unwrap().contains("never replay"));
+    assert!(!exported.contains("PRIVATE_PARTIAL_MARKER"));
+    assert_eq!(session.journal.records.len(), count);
+    assert_eq!(fs::read_to_string(fixture.workspace.join("work.rs")).unwrap(), "// edits already made by the previous provider\n");
+    assert!(session.export_handoff(&fixture.base).is_err());
+}
+
 struct ScriptModel {
     turns: Mutex<VecDeque<AgentTurn>>,
     requests: Mutex<Vec<AgentRequest>>,
