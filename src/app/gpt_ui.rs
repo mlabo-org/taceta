@@ -51,6 +51,7 @@ struct GptLoginTask {
     task: JoinHandle<()>,
     events: mpsc::UnboundedReceiver<GptLoginEvent>,
     result: std_mpsc::Receiver<Result<(), String>>,
+    browser_opened: bool,
 }
 
 pub(super) struct GptUiState {
@@ -207,10 +208,19 @@ impl TacetaApp {
         ui.label(text(language,
             "GPTは公式Codex CLIのOAuth認証と実行機能を使います。APIキーは使いません。認証とCodexの原文履歴はTaceta専用の保存先を使います。",
             "GPT uses the official Codex CLI for OAuth and execution. No API key is used. Authentication and original Codex history use Taceta's own storage."));
+        self.show_gpt_login_controls(ui, true);
+    }
+
+    fn show_gpt_login_controls(&mut self, ui: &mut Ui, account_settings: bool) {
+        let language = self.language();
         ui.horizontal_wrapped(|ui| {
-            if self.gpt_ui.login.is_some() {
+            if let Some(login) = &self.gpt_ui.login {
                 ui.spinner();
-                ui.label(text(language, "ブラウザーでGPTへのログインを完了してください。", "Complete GPT sign-in in your browser."));
+                ui.label(if login.browser_opened {
+                    text(language, "ブラウザーでChatGPTへのログインを完了してください。", "Complete ChatGPT sign-in in your browser.")
+                } else {
+                    text(language, "ChatGPTのログイン画面を開いています…", "Opening ChatGPT sign-in…")
+                });
                 if ui.button(text(language, "中止", "Cancel")).clicked() {
                     if let Some(login) = self.gpt_ui.login.take() {
                         login.task.abort();
@@ -221,12 +231,19 @@ impl TacetaApp {
             } else if self.gpt_ui.logout.is_some() {
                 ui.spinner();
                 ui.label(text(language, "GPT接続を解除しています…", "Disconnecting GPT…"));
+            } else if !account_settings && matches!(self.connection, ConnectionState::Ready) {
+                ui.label(text(language, "ChatGPT接続済み", "ChatGPT connected"));
             } else {
                 if ui.add_enabled(!self.is_generating(), Button::new(text(language,
-                    "GPTに接続（OAuth）", "Connect GPT (OAuth)"))).clicked() {
+                    "ChatGPTにログイン", "Sign in with ChatGPT"))).clicked() {
                     self.start_gpt_login();
                 }
-                if ui.add_enabled(!self.is_generating(), Button::new(text(language,
+                if !account_settings {
+                    ui.label(text(language,
+                        "ChatGPTアカウントで接続すると、利用できるモデルが表示されます。",
+                        "Connect your ChatGPT account to see available models."));
+                }
+                if account_settings && ui.add_enabled(!self.is_generating(), Button::new(text(language,
                     "GPT接続を解除", "Disconnect GPT"))).clicked() {
                     let client = self.gpt_ui.client.clone();
                     let (tx, rx) = std_mpsc::channel();
@@ -246,7 +263,7 @@ impl TacetaApp {
             let outcome = client.sign_in(tx).await;
             let _ = result_tx.send(outcome);
         });
-        self.gpt_ui.login = Some(GptLoginTask { task, events, result });
+        self.gpt_ui.login = Some(GptLoginTask { task, events, result, browser_opened: false });
         self.notice = None;
     }
 
@@ -318,6 +335,7 @@ impl TacetaApp {
                 }
             });
             if self.state.inference_provider != InferenceProvider::Gpt { return; }
+            self.show_gpt_login_controls(ui, false);
             ui.label(RichText::new(text(language,
                 "GPTの会話はCodexの履歴を使います。モードや作業フォルダーを変えると新しい会話を作ります。",
                 "GPT conversations use Codex history. Changing mode or workspace starts a new conversation.")).small().weak());
@@ -379,7 +397,7 @@ impl TacetaApp {
         let language = self.language();
         let Some(model) = self.selected_model().cloned() else {
             self.notice = Some(Notice { kind: NoticeKind::Warning,
-                text: text(language, "設定からGPTに接続し、モデルを選んでください。", "Connect GPT in Settings and select a model.").into() });
+                text: text(language, "「ChatGPTにログイン」から接続し、モデルを選んでください。", "Use Sign in with ChatGPT, then select a model.").into() });
             return false;
         };
         let conversation = self.state.active_conversation();
@@ -507,6 +525,8 @@ impl TacetaApp {
                     if let Err(error) = Command::new("/usr/bin/open").arg(url).spawn() {
                         if let Some(login) = self.gpt_ui.login.take() { login.task.abort(); }
                         outcome = Some(Err(format!("Could not open the GPT sign-in page: {error}")));
+                    } else if let Some(login) = &mut self.gpt_ui.login {
+                        login.browser_opened = true;
                     }
                 }
                 GptLoginEvent::Progress(progress) => self.notice = Some(Notice { kind: NoticeKind::Info, text: progress }),

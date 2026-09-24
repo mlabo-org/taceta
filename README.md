@@ -109,7 +109,7 @@ Grok OAuthでは選択モデルの通常推論で要約を生成します。API�
 
 ## GPTでコーディングする
 
-1. 公式Codex CLIを別途用意し、設定からGPTのOAuth接続を開始します。ブラウザーでChatGPTへのログインを完了してください。
+1. 公式Codex CLIを別途用意し、GPT画面の「ChatGPTにログイン」を押します。開いたブラウザーでログインを完了すると、利用できるモデルを自動で取得します。設定画面からも同じログインを開始できます。
 2. 接続先の「GPT (OAuth)」と、アカウントに返されたモデルを選びます。GPTの新しい会話は作業モードで始まります。
 3. 作業フォルダーを選び、実装・修正したい内容を送信します。回答、コマンドの出力、ファイル変更、差分をTacetaで確認できます。
 4. Codexから承認や質問が届いたらTacetaで回答します。停止、保存済み作業の続行、手動コンパクションも同じ会話で行います。通常の会話には「チャット」を選びます。
@@ -312,7 +312,7 @@ Grok OAuth creates summaries through normal inference with the selected model. T
 
 ## Coding with GPT
 
-1. Install the official Codex CLI separately, start GPT OAuth sign-in from Settings, and complete ChatGPT login in the browser.
+1. Install the official Codex CLI separately and choose Sign in with ChatGPT in the GPT conversation view. Complete browser login; available models are loaded automatically. The same sign-in control is also available in Settings.
 2. Select GPT (OAuth) and an available account model. New GPT conversations start in coding mode.
 3. Choose the workspace and describe the implementation or repair. Taceta displays replies, command output, file changes and diffs.
 4. Answer Codex approval requests and questions in Taceta. Stop, continue saved work and compact context in the same conversation. Select Chat for ordinary conversation.
