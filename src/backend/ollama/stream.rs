@@ -52,6 +52,7 @@ where
             prompt_tokens: None,
             completion_tokens: None,
             total_duration_ns: None,
+            reached_output_limit: false,
         },
         tool_calls: Vec::new(),
         content: String::new(),
@@ -88,6 +89,7 @@ where
                 }
             }
             if item.done {
+                result.stats.reached_output_limit = item.done_reason.as_deref() == Some("length");
                 result.done_reason = item.done_reason;
                 result.stats.prompt_tokens = item.prompt_eval_count;
                 result.stats.completion_tokens = item.eval_count;
@@ -117,6 +119,7 @@ where
             }
         }
         if item.done {
+            result.stats.reached_output_limit = item.done_reason.as_deref() == Some("length");
             result.done_reason = item.done_reason;
             result.stats.prompt_tokens = item.prompt_eval_count;
             result.stats.completion_tokens = item.eval_count;
@@ -148,6 +151,19 @@ mod tests {
             assert!(result.content.contains("unsupported old answer"));
             assert_eq!(rx.recv().await, Some(GenerationEvent::ThinkingDelta("checking source".into())));
             assert!(rx.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_cut_off_at_the_output_limit_is_reported_as_such() {
+        for (reason, cut_off) in [("length", true), ("stop", false)] {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let input = format!(
+                "{{\"message\":{{\"content\":\"partial\"}},\"done\":true,\"done_reason\":\"{reason}\"}}\n"
+            );
+            let pieces = [Ok::<_, std::convert::Infallible>(bytes::Bytes::from(input))];
+            let result = consume(stream::iter(pieces), tx).await.unwrap();
+            assert_eq!(result.stats.reached_output_limit, cut_off, "{reason}");
         }
     }
 
