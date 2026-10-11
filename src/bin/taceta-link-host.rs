@@ -12,7 +12,8 @@ fn main() -> Result<(), ProtocolError> {
     loop {
         let request: Envelope<serde_json::Value> = match read_frame(&mut input) {
             Ok(value) => value,
-            Err(ProtocolError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            // The browser closed the Native Messaging port between messages.
+            Err(ProtocolError::Closed) => break,
             Err(error) => return Err(error),
         };
         if let Err(error) = validate_envelope(&request, env!("CARGO_PKG_VERSION")) {
