@@ -680,10 +680,13 @@ impl TacetaApp {
             // task mode, and turns it has not received are kept after it.
             if conversation.agent_enabled && conversation.provider.unwrap_or_default() == InferenceProvider::Ollama {
                 conversation.workspace = Some(snapshot.workspace.clone());
-                let not_in_record: Vec<ChatMessage> = conversation
+                // Before the first run of a conversation that began elsewhere,
+                // none of its messages are in the record yet.
+                let in_record = conversation
                     .task_seen_messages
-                    .and_then(|seen| conversation.messages.get(seen..))
-                    .unwrap_or_default()
+                    .unwrap_or(if imported.is_empty() { conversation.messages.len() } else { 0 })
+                    .min(conversation.messages.len());
+                let not_in_record: Vec<ChatMessage> = conversation.messages[in_record..]
                     .iter()
                     .filter(|message| !imported.contains(&message.id))
                     .cloned()
@@ -694,6 +697,22 @@ impl TacetaApp {
                     .enumerate()
                     .filter_map(|(index, message)| transcript_message(id, index, message))
                     .collect();
+                // Record entries placed ahead of messages that stay outside
+                // the record move those messages. Positions other engines
+                // and the summary remembered past that point no longer hold,
+                // so they fall back to the last one that does: a turn may be
+                // handed over twice, never skipped.
+                if !not_in_record.is_empty() && conversation.messages.len() != in_record {
+                    for session in conversation.cli_sessions.values_mut() {
+                        session.seen_messages = session.seen_messages.min(in_record);
+                    }
+                    if let Some(session) = conversation.gpt.as_mut() {
+                        session.seen_messages = session.seen_messages.min(in_record);
+                    }
+                    if let Some(summary) = conversation.summary.as_mut() {
+                        summary.covers_messages = summary.covers_messages.min(in_record);
+                    }
+                }
                 conversation.task_seen_messages = Some(conversation.messages.len());
                 conversation.messages.extend(not_in_record);
             }
@@ -1071,6 +1090,24 @@ mod tests {
         app.remember_agent_snapshot(record(&["task answer", "asked elsewhere", "answered elsewhere", "next task answer"]), &imported);
         assert_eq!(contents(&app), ["task answer", "asked elsewhere", "answered elsewhere", "next task answer"]);
         assert_eq!(app.state.active_conversation().task_seen_messages, Some(4));
+
+        // A stopped turn from another engine is never imported. When later
+        // record entries land ahead of it, what that engine had seen is
+        // counted only up to where positions still hold.
+        let conversation = app.state.active_conversation_mut();
+        let mut stopped = ChatMessage::new_assistant("half");
+        stopped.interrupted = true;
+        conversation.messages.push(stopped);
+        conversation.cli_sessions.insert(
+            InferenceProvider::Claude,
+            crate::persistence::CliSession { session_id: "s".into(), seen_messages: 5 },
+        );
+        conversation.summary = Some(taceta::prior_context::Summary { text: "so far".into(), covers_messages: 5 });
+        app.remember_agent_snapshot(record(&["task answer", "asked elsewhere", "answered elsewhere", "next task answer", "one more"]), &[]);
+        assert_eq!(contents(&app), ["task answer", "asked elsewhere", "answered elsewhere", "next task answer", "one more", "half"]);
+        let conversation = app.state.active_conversation();
+        assert_eq!(conversation.cli_sessions[&InferenceProvider::Claude].seen_messages, 4);
+        assert_eq!(conversation.summary.as_ref().unwrap().covers_messages, 4);
     }
 
     #[test]
