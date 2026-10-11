@@ -11,8 +11,11 @@ export class OwnedScope {
     if (!ids) return null;
     if (!validLedger(ids)) { await this.chrome.storage.local.remove(OWNED_SCOPE_KEY); return null; }
     const [group, tab] = await Promise.all([exactOrNull(() => this.chrome.tabGroups.get(ids.groupId)), exactOrNull(() => this.chrome.tabs.get(ids.tabId))]);
-    if (!group && !tab) { await this.chrome.storage.local.remove(OWNED_SCOPE_KEY); return null; }
-    if ((group && (group.id !== ids.groupId || typeof group.windowId !== "number")) || (tab && (tab.id !== ids.tabId || typeof tab.windowId !== "number" || tab.groupId < 0))) throw new Error("stored_owned_scope_changed");
+    // Stored numeric IDs outlive a browser restart and can then name an
+    // unrelated tab. Adopt the record only while that tab is still in the
+    // recorded group; otherwise forget the record and close nothing.
+    const stillOwned = tab && tab.id === ids.tabId && typeof tab.windowId === "number" && group?.id === ids.groupId && tab.groupId === ids.groupId;
+    if (!stillOwned) { await this.chrome.storage.local.remove(OWNED_SCOPE_KEY); return null; }
     this.ledger = {windowId:ids.windowId, groupId:ids.groupId, tabId:ids.tabId};
     return this.ledger;
   }
