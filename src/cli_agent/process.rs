@@ -6,9 +6,10 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
 };
+use std::pin::Pin;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, Command},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    process::{Child, Command},
     sync::mpsc,
     task::JoinHandle,
 };
@@ -51,9 +52,9 @@ pub fn usual_install_dirs() -> Vec<PathBuf> {
 /// Owns the child's process group. Stopping or dropping it ends the CLI and
 /// every tool process it started, and never touches another process.
 pub struct CliProcess {
-    child: Child,
+    child: Option<Child>,
     group: Option<i32>,
-    stdin: Option<ChildStdin>,
+    stdin: Option<Pin<Box<dyn AsyncWrite + Send>>>,
     lines: mpsc::UnboundedReceiver<Result<Value, String>>,
     reader: JoinHandle<()>,
 }
@@ -77,9 +78,23 @@ impl CliProcess {
         let group = child.id().and_then(|id| i32::try_from(id).ok());
         let stdin = child.stdin.take().ok_or("The CLI's input is unavailable.")?;
         let stdout = child.stdout.take().ok_or("The CLI's output is unavailable.")?;
+        let mut process = Self::from_io(stdout, stdin);
+        process.child = Some(child);
+        process.group = group;
+        Ok(process)
+    }
+
+    /// The same line protocol over any pair of streams, with no process
+    /// behind it. Drivers use this to exercise their logic against a scripted
+    /// peer.
+    pub fn from_io<R, W>(output: R, input: W) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Send + 'static,
+    {
         let (sender, lines) = mpsc::unbounded_channel();
         let reader = tokio::spawn(async move {
-            let mut output = BufReader::new(stdout).lines();
+            let mut output = BufReader::new(output).lines();
             loop {
                 let message = match output.next_line().await {
                     Ok(Some(line)) if line.trim().is_empty() => continue,
@@ -94,7 +109,7 @@ impl CliProcess {
                 }
             }
         });
-        Ok(Self { child, group, stdin: Some(stdin), lines, reader })
+        Self { child: None, group: None, stdin: Some(Box::pin(input)), lines, reader }
     }
 
     pub async fn send(&mut self, message: &Value) -> Result<(), String> {
@@ -125,14 +140,18 @@ impl CliProcess {
                 libc::kill(-group, libc::SIGKILL);
             }
         }
-        let _ = self.child.start_kill();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
     }
 
     /// Ends the CLI and its tool processes, and waits for it to be gone.
     pub async fn shutdown(mut self) {
         self.close_input();
         self.kill();
-        let _ = self.child.wait().await;
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.wait().await;
+        }
     }
 }
 
@@ -191,6 +210,21 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("the CLI's child process outlived shutdown");
+    }
+
+    #[tokio::test]
+    async fn the_same_protocol_runs_over_in_memory_streams() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (ours, theirs) = tokio::io::duplex(1024);
+        let (their_read, mut their_write) = tokio::io::split(theirs);
+        let (our_read, our_write) = tokio::io::split(ours);
+        let mut process = CliProcess::from_io(our_read, our_write);
+        process.send(&json!({"ask": 1})).await.unwrap();
+        let mut received = String::new();
+        BufReader::new(their_read).read_line(&mut received).await.unwrap();
+        assert_eq!(received, "{\"ask\":1}\n");
+        their_write.write_all(b"{\"answer\":2}\n").await.unwrap();
+        assert_eq!(process.next().await, Some(Ok(json!({"answer": 2}))));
     }
 
     #[test]
