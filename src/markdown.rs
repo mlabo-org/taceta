@@ -1689,17 +1689,20 @@ fn script_text(source: &str, superscript: bool) -> Option<String> {
 }
 
 fn script_character(character: char, superscript: bool) -> Option<char> {
-    let normal = "0123456789+-=()abdeghijklmnoprstuvx";
-    let supers = "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ᵃᵇᵈᵉᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛˣ";
-    let subs = "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐᵦ_dₑ_gₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ";
-    let index = normal
-        .chars()
-        .position(|candidate| candidate == character)?;
-    if superscript {
-        supers.chars().nth(index)
-    } else {
-        subs.chars().nth(index).filter(|mapped| *mapped != '_')
-    }
+    // (plain, superscript, subscript). Unicode has no subscript b, d or g.
+    const SCRIPTS: [(char, char, Option<char>); 35] = [
+        ('0', '⁰', Some('₀')), ('1', '¹', Some('₁')), ('2', '²', Some('₂')), ('3', '³', Some('₃')),
+        ('4', '⁴', Some('₄')), ('5', '⁵', Some('₅')), ('6', '⁶', Some('₆')), ('7', '⁷', Some('₇')),
+        ('8', '⁸', Some('₈')), ('9', '⁹', Some('₉')), ('+', '⁺', Some('₊')), ('-', '⁻', Some('₋')),
+        ('=', '⁼', Some('₌')), ('(', '⁽', Some('₍')), (')', '⁾', Some('₎')), ('a', 'ᵃ', Some('ₐ')),
+        ('b', 'ᵇ', None), ('d', 'ᵈ', None), ('e', 'ᵉ', Some('ₑ')), ('g', 'ᵍ', None),
+        ('h', 'ʰ', Some('ₕ')), ('i', 'ⁱ', Some('ᵢ')), ('j', 'ʲ', Some('ⱼ')), ('k', 'ᵏ', Some('ₖ')),
+        ('l', 'ˡ', Some('ₗ')), ('m', 'ᵐ', Some('ₘ')), ('n', 'ⁿ', Some('ₙ')), ('o', 'ᵒ', Some('ₒ')),
+        ('p', 'ᵖ', Some('ₚ')), ('r', 'ʳ', Some('ᵣ')), ('s', 'ˢ', Some('ₛ')), ('t', 'ᵗ', Some('ₜ')),
+        ('u', 'ᵘ', Some('ᵤ')), ('v', 'ᵛ', Some('ᵥ')), ('x', 'ˣ', Some('ₓ')),
+    ];
+    let (_, raised, lowered) = SCRIPTS.iter().find(|(plain, _, _)| *plain == character)?;
+    if superscript { Some(*raised) } else { *lowered }
 }
 
 fn heading_size(ui: &Ui, level: HeadingLevel) -> f32 {
@@ -1723,6 +1726,24 @@ fn heading_size(ui: &Ui, level: HeadingLevel) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scripts_map_each_letter_to_its_own_glyph_or_stay_as_written() {
+        assert_eq!(latex_to_unicode("x_i"), "xᵢ");
+        assert_eq!(latex_to_unicode("a_n"), "aₙ");
+        assert_eq!(latex_to_unicode("x^2"), "x²");
+        assert_eq!(latex_to_unicode("\\sum_{i=1}^{n}"), "∑ᵢ₌₁ⁿ");
+        for character in "aehijklmnoprstuvx".chars() {
+            let lowered = script_character(character, false).unwrap();
+            assert_ne!(lowered, character);
+            assert!(!lowered.is_ascii());
+        }
+        for character in "bdg".chars() {
+            assert_eq!(script_character(character, false), None);
+        }
+        let unscripted = latex_to_unicode("x_d");
+        assert!(unscripted.contains('d') && !unscripted.contains('ₑ'), "{unscripted}");
+    }
 
     #[test]
     fn chat_layout_wrapped_styled_links_open_only_their_text() {
