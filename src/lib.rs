@@ -4,6 +4,7 @@ pub mod browser_harness;
 pub mod cli_agent;
 pub mod domain;
 pub mod gpt;
+pub mod prior_context;
 pub mod taceta_link_installer;
 pub mod taceta_link_service;
 pub mod web_search;
