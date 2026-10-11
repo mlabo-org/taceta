@@ -1486,7 +1486,7 @@ impl TacetaApp {
                     .frame(egui::Frame::new().fill(palette.sidebar).inner_margin(egui::Margin::symmetric(0, 8)))
                     .show_inside(ui, |ui| {
                         let selected = matches!(self.screen, Screen::Settings | Screen::Models);
-                        if sidebar_row(ui, &format!("⚙  {}", text(language, "設定", "Settings")), selected, 0.0).clicked() {
+                        if sidebar_row(ui, &format!("⚙  {}", text(language, "設定", "Settings")), selected).clicked() {
                             self.screen = Screen::Settings;
                         }
                     });
@@ -1499,7 +1499,7 @@ impl TacetaApp {
                 ui.add_space(12.0);
 
                 ui.add_enabled_ui(!generating && !self.conversation_bulk_delete_mode, |ui| {
-                    if sidebar_row(ui, &format!("＋  {}", text(language, "新しいチャット", "New chat")), false, 0.0).clicked() {
+                    if sidebar_row(ui, &format!("＋  {}", text(language, "新しいチャット", "New chat")), false).clicked() {
                         self.state.start_new_conversation();
                         self.screen = Screen::Chat;
                     }
@@ -1575,18 +1575,21 @@ impl TacetaApp {
                 ScrollArea::vertical()
                     .id_salt("conversation-history")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (id, title, empty) in history {
+                    // Only the rows in view exist, so rows scrolled away
+                    // cannot be reached by the pointer or assistive tools.
+                    .show_rows(ui, SIDEBAR_ROW_HEIGHT, history.len(), |ui, visible| {
+                        for (id, title, empty) in &history[visible] {
+                            let (id, empty) = (*id, *empty);
                             let display_title = if empty {
                                 text(language, "新しいチャット", "New chat")
                             } else {
-                                &title
+                                title.as_str()
                             };
                             if self.conversation_bulk_delete_mode {
                                 ui.horizontal(|ui| {
                                     let mut checked = self.conversation_bulk_selection.contains(&id);
                                     let checkbox_changed = ui.checkbox(&mut checked, "").changed();
-                                    let row_clicked = sidebar_row(ui, display_title, checked, 0.0).clicked();
+                                    let row_clicked = sidebar_row(ui, display_title, checked).clicked();
                                     if row_clicked {
                                         checked = !checked;
                                     }
@@ -1602,13 +1605,20 @@ impl TacetaApp {
                             }
                             let mut rename_requested = false;
                             let mut delete_requested = false;
-                            let row = sidebar_row(ui, display_title, id == active_id, SIDEBAR_ROW_MENU_WIDTH);
+                            let row = sidebar_row(ui, display_title, id == active_id);
                             // The row's actions appear on the row the pointer
                             // is on, the current one, and the one whose menu is open.
                             if ui.rect_contains_pointer(row.rect) || id == active_id || open_menu == Some(id) {
                                 let menu_rect = egui::Rect::from_min_max(
                                     egui::pos2(row.rect.right() - SIDEBAR_ROW_MENU_WIDTH, row.rect.top()),
                                     row.rect.max,
+                                );
+                                // The title runs under this corner, so it is
+                                // covered with the row's own fill first.
+                                ui.painter().rect_filled(
+                                    menu_rect,
+                                    8.0,
+                                    if id == active_id { palette.selected } else { palette.hover },
                                 );
                                 let mut menu_ui = ui.new_child(
                                     egui::UiBuilder::new()
@@ -1655,7 +1665,6 @@ impl TacetaApp {
                                     });
                             }
                         }
-                        ui.add_space(8.0);
                     });
             });
     }
@@ -3638,32 +3647,22 @@ impl TacetaApp {
     }
 }
 
-/// One full-width row of the sidebar: text on the left, filled only when it
-/// is current or under the pointer. `trailing` reserves room on the right.
-fn sidebar_row(ui: &mut Ui, label: &str, selected: bool, trailing: f32) -> egui::Response {
+/// One full-width row of the sidebar: a button with its text on the left,
+/// filled only when it is current or under the pointer.
+fn sidebar_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
     let palette = theme::palette(ui);
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), SIDEBAR_ROW_HEIGHT),
-        egui::Sense::click(),
-    );
-    let enabled = ui.is_enabled();
-    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, label));
-    if selected {
-        ui.painter().rect_filled(rect, 8.0, palette.selected);
-    } else if enabled && ui.rect_contains_pointer(rect) {
-        ui.painter().rect_filled(rect, 8.0, palette.hover);
-    }
-    let text_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 10.0, rect.top()),
-        egui::pos2(rect.right() - 8.0 - trailing, rect.bottom()),
-    );
-    let mut text_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(text_rect)
-            .layout(Layout::left_to_right(Align::Center)),
-    );
-    text_ui.add(egui::Label::new(label).truncate().selectable(false));
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    let size = Vec2::new(ui.available_width(), SIDEBAR_ROW_HEIGHT);
+    ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
+        let visuals = ui.visuals_mut();
+        visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+        visuals.widgets.hovered.weak_bg_fill = palette.hover;
+        visuals.widgets.active.weak_bg_fill = palette.selected;
+        visuals.selection.bg_fill = palette.selected;
+        visuals.selection.stroke.color = palette.contrast_text;
+        // The growing gap after the text keeps the text on the left.
+        ui.add(Button::selectable(selected, (label, egui::Atom::grow())).truncate().min_size(size))
+    })
+    .inner
 }
 
 /// The row of controls under the composer that says where and how the next
@@ -3827,7 +3826,7 @@ impl eframe::App for TacetaApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        theme::apply_text_contrast(ui);
+        theme::apply_style(ui);
         self.show_sidebar(ui);
         self.show_top_bar(ui);
 
