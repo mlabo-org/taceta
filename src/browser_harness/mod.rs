@@ -148,6 +148,8 @@ pub enum ProtocolError {
     /// The peer closed the stream between frames.
     #[error("connection closed")]
     Closed,
+    #[error("another Taceta is already serving the browser link at {0}")]
+    SocketInUse(PathBuf),
     #[error("invalid JSON frame: {0}")]
     InvalidJson(#[from] serde_json::Error),
     #[error("unsupported schema version {0}")]
@@ -343,6 +345,11 @@ impl SocketServer {
             if !metadata.file_type().is_socket() {
                 return Err(ProtocolError::InvalidSocketPath(path));
             }
+            // A socket that still answers belongs to a running Taceta; only a
+            // leftover from an earlier run is replaced.
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                return Err(ProtocolError::SocketInUse(path));
+            }
             std::fs::remove_file(&path)?;
         }
         let listener = std::os::unix::net::UnixListener::bind(&path)?;
@@ -504,6 +511,25 @@ mod tests {
             validate_socket_path(&default_socket_root().unwrap(), &p),
             Err(ProtocolError::InvalidSocketPath(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_socket_is_not_taken_over_but_a_leftover_one_is_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let path = dir.join("t.sock");
+        let first = SocketServer::bind(&dir, &path).unwrap();
+        assert!(matches!(
+            SocketServer::bind(&dir, &path),
+            Err(ProtocolError::SocketInUse(_))
+        ));
+        assert!(path.exists());
+        drop(first);
+        // A crash leaves the socket file behind with nothing listening on it.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        assert!(SocketServer::bind(&dir, &path).is_ok());
     }
 
     #[cfg(unix)]
