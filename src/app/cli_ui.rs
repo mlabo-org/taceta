@@ -12,15 +12,10 @@ use taceta::{
         RunOutcome, RunRequest, RunStatus, ToolItem, ToolStatus, claude::ClaudeCode, grok::GrokCli,
     },
     domain::ActionRecord,
-    prior_context::{prior_context, with_prior_context},
+    prior_context::with_prior_context,
 };
 use tokio::sync::watch;
 
-/// Share of a model's context, in characters, that earlier conversation may
-/// take when it is handed to a session that has not seen it.
-const PRIOR_CONTEXT_CHARS_PER_TOKEN: usize = 2;
-/// Used when a CLI does not report its model's context size.
-const ASSUMED_CONTEXT_TOKENS: usize = 200_000;
 /// Decisions are ignored briefly after a request appears, so a click meant
 /// for the previous request cannot answer this one.
 const APPROVAL_SETTLE: Duration = Duration::from_millis(600);
@@ -91,23 +86,6 @@ pub(super) fn model_descriptor(option: ModelOption) -> ModelDescriptor {
         vision: false,
         tools: true,
         context_length: option.context_window.and_then(|window| u32::try_from(window).ok()),
-    }
-}
-
-/// The prompt a session receives: the request itself, preceded by the turns
-/// of this conversation the session has not seen.
-fn prompt_for_session(
-    earlier: &[ChatMessage],
-    seen_messages: usize,
-    prompt: &str,
-    context_tokens: Option<u32>,
-) -> (String, usize) {
-    let unseen = earlier.get(seen_messages.min(earlier.len())..).unwrap_or_default();
-    let budget = context_tokens.map_or(ASSUMED_CONTEXT_TOKENS, |tokens| tokens as usize)
-        * PRIOR_CONTEXT_CHARS_PER_TOKEN;
-    match prior_context(unseen, budget) {
-        Some(context) => (with_prior_context(&context, prompt), context.omitted_messages),
-        None => (prompt.to_owned(), 0),
     }
 }
 
@@ -270,38 +248,35 @@ impl TacetaApp {
             ThinkingMode::Effort(effort) => Some(effort.as_str().to_owned()),
             _ => None,
         };
+        let session = self.state.active_conversation().cli_sessions.get(&provider).cloned();
+        // Turns this session has not seen go with the request. The draft
+        // stays in place while they first have to be summarized.
+        let Some(earlier) = self.handover_or_compact(
+            session.as_ref().map_or(0, |session| session.seen_messages),
+            super::compaction::handover_budget(model.as_ref().and_then(|model| model.context_length)),
+            {
+                let (agent, workspace) = (agent.clone(), workspace.clone());
+                let model = model.as_ref().map(|model| model.name.clone());
+                move || super::compaction::Summarizer::Cli { agent, model, workspace }
+            },
+        ) else {
+            return;
+        };
         let prompt = std::mem::take(&mut self.state.draft);
+        let session_prompt = match &earlier {
+            Some(earlier) => with_prior_context(earlier, &prompt),
+            None => prompt.clone(),
+        };
         let conversation_id = self.state.active_conversation_id;
         let conversation = self.state.active_conversation_mut();
         if conversation.should_generate_title() {
             conversation.title = conversation_title(&prompt, "Taceta");
         }
-        let session = conversation.cli_sessions.get(&provider).cloned();
-        let (session_prompt, omitted) = prompt_for_session(
-            &conversation.messages,
-            session.as_ref().map_or(0, |session| session.seen_messages),
-            &prompt,
-            model.as_ref().and_then(|model| model.context_length),
-        );
         conversation.messages.push(ChatMessage::new_user(prompt));
         let assistant = ChatMessage::new_assistant("");
         let assistant_id = assistant.id;
         conversation.messages.push(assistant);
-        if omitted > 0 {
-            self.notice = Some(Notice {
-                kind: NoticeKind::Warning,
-                text: match language {
-                    AppShellLanguage::Japanese => format!(
-                        "これまでの会話のうち、古い {omitted} 件はこの接続先の文脈に収まらないため渡していません。"
-                    ),
-                    AppShellLanguage::English => format!(
-                        "The {omitted} oldest messages did not fit this engine's context and were not handed over."
-                    ),
-                },
-            });
-        } else {
-            self.notice = None;
-        }
+        self.notice = None;
         let request = RunRequest {
             session_id: session.map(|session| session.session_id),
             workspace,
@@ -668,6 +643,7 @@ fn show_diff_text(ui: &mut Ui, text: &str) {
 mod tests {
     use super::*;
     use crate::app::model_manager_tests::{RecordingServices, test_app};
+    use taceta::prior_context::{Plan, plan};
 
     fn active_fixture(app: &mut TacetaApp) -> (mpsc::UnboundedSender<Event>, mpsc::UnboundedReceiver<Control>, std_mpsc::Sender<RunOutcome>) {
         let (event_tx, events) = mpsc::unbounded_channel();
@@ -745,7 +721,9 @@ mod tests {
         let conversation = app.state.active_conversation();
         assert!(conversation.messages.last().unwrap().interrupted);
         assert_eq!(conversation.cli_sessions[&InferenceProvider::Claude].seen_messages, 2);
-        let handed_over = prior_context(&conversation.messages, 10_000).unwrap().text;
+        let Plan::Ready(Some(handed_over)) = plan(None, &conversation.messages, 0, 10_000) else {
+            panic!("the conversation fits and must be handed over as it is");
+        };
         assert!(handed_over.contains("do it") && !handed_over.contains("half"));
     }
 
@@ -778,28 +756,6 @@ mod tests {
         assert_eq!(controls.try_recv().unwrap(), Control::Approval { id: first.id, approved: true });
         assert_eq!(controls.try_recv().unwrap(), Control::Approval { id: third.id, approved: false });
         assert!(controls.try_recv().is_err());
-    }
-
-    #[test]
-    fn a_session_is_given_only_the_turns_it_has_not_seen() {
-        let earlier = vec![
-            ChatMessage::new_user("first question"),
-            ChatMessage::new_assistant("first answer"),
-            ChatMessage::new_user("asked elsewhere"),
-            ChatMessage::new_assistant("answered elsewhere"),
-        ];
-        // A session that is current gets the request alone.
-        assert_eq!(prompt_for_session(&earlier, 4, "next", None), ("next".to_owned(), 0));
-        // One that missed two turns gets exactly those.
-        let (prompt, omitted) = prompt_for_session(&earlier, 2, "next", None);
-        assert_eq!(omitted, 0);
-        assert!(prompt.contains("asked elsewhere") && prompt.contains("answered elsewhere"));
-        assert!(!prompt.contains("first question"));
-        assert!(prompt.ends_with("Current request:\nnext"));
-        // A new session gets everything.
-        assert!(prompt_for_session(&earlier, 0, "next", None).0.contains("first question"));
-        // A count beyond the record (messages were deleted) is not an error.
-        assert_eq!(prompt_for_session(&earlier, 9, "next", None), ("next".to_owned(), 0));
     }
 
     #[test]

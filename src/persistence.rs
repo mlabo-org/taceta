@@ -84,6 +84,9 @@ pub struct Conversation {
     /// the record has been written back once; messages after this count came
     /// from another engine and are imported into the record on the next run.
     pub task_seen_messages: Option<usize>,
+    /// Stands in for the oldest messages when the conversation is handed to
+    /// an engine it would not otherwise fit. The messages are kept.
+    pub summary: Option<taceta::prior_context::Summary>,
 }
 
 impl Default for Conversation {
@@ -103,6 +106,7 @@ impl Default for Conversation {
             cli_sessions: HashMap::new(),
             cli_usage: None,
             task_seen_messages: None,
+            summary: None,
         }
     }
 }
