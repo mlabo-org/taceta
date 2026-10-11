@@ -3227,6 +3227,20 @@ impl TacetaApp {
                 });
             });
         });
+        // What the answer did stays with it under every provider's view.
+        if !message.actions.is_empty() {
+            ui.add_space(6.0);
+            for (index, action) in message.actions.iter().enumerate() {
+                cli_ui::show_action(
+                    ui,
+                    (message.id, index),
+                    if action.succeeded { ActionMark::Done } else { ActionMark::Failed },
+                    &action.title,
+                    &action.detail,
+                    action.diff.as_deref(),
+                );
+            }
+        }
         ui.add_space(MESSAGE_GAP);
     }
 

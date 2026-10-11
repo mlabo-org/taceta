@@ -548,16 +548,6 @@ impl TacetaApp {
             }
             for message in &conversation.messages {
                 app.show_message(ui, message, false);
-                for (index, action) in message.actions.iter().enumerate() {
-                    show_action(
-                        ui,
-                        (message.id, index),
-                        if action.succeeded { super::ActionMark::Done } else { super::ActionMark::Failed },
-                        &action.title,
-                        &action.detail,
-                        action.diff.as_deref(),
-                    );
-                }
             }
             if let Some(active) = &app.cli_ui.active {
                 if active.conversation_id == conversation.id {
@@ -655,7 +645,7 @@ impl TacetaApp {
     }
 }
 
-fn show_action(
+pub(super) fn show_action(
     ui: &mut Ui,
     id: impl std::hash::Hash,
     mark: super::ActionMark,
