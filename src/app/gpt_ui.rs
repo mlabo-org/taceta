@@ -295,14 +295,18 @@ impl TacetaApp {
         };
         // Turns another engine answered are handed to the thread with this
         // request. A pending task handoff already carries its own context.
-        let mut omitted_turns = 0;
-        if let (GptAction::Send { text, .. }, false) = (&mut request.action, pending_handoff) {
+        if let (GptAction::Send { .. }, false) = (&request.action, pending_handoff) {
             let seen = conversation.gpt.as_ref().map_or(0, |session| session.seen_messages);
-            let unseen = conversation.messages.get(seen.min(conversation.messages.len())..).unwrap_or_default();
-            let budget = model.context_length.map_or(400_000, |tokens| tokens as usize * 2);
-            if let Some(context) = taceta::prior_context::prior_context(unseen, budget) {
-                omitted_turns = context.omitted_messages;
-                *text = taceta::prior_context::with_prior_context(&context, text);
+            let (client, summary_model) = (self.gpt_ui.client.clone(), request.model.clone());
+            let Some(earlier) = self.handover_or_compact(
+                seen,
+                super::compaction::handover_budget(model.context_length),
+                move || super::compaction::Summarizer::Gpt { client, model: summary_model },
+            ) else {
+                return false;
+            };
+            if let (Some(earlier), GptAction::Send { text, .. }) = (earlier, &mut request.action) {
+                *text = taceta::prior_context::with_prior_context(&earlier, text);
             }
         }
         let handoff_root = if pending_handoff {
@@ -352,13 +356,7 @@ impl TacetaApp {
             pending_thread_save: None,
             binding_needs_save: false, save_error: None, submitted_prompt,
         });
-        self.notice = (omitted_turns > 0).then(|| Notice {
-            kind: NoticeKind::Warning,
-            text: match language {
-                AppShellLanguage::Japanese => format!("これまでの会話のうち、古い {omitted_turns} 件はこの接続先の文脈に収まらないため渡していません。"),
-                AppShellLanguage::English => format!("The {omitted_turns} oldest messages did not fit this engine's context and were not handed over."),
-            },
-        });
+        self.notice = None;
         self.scroll_to_bottom = true;
         true
     }

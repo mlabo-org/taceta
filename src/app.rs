@@ -9,6 +9,7 @@ use std::{
 
 mod agent_ui;
 mod cli_ui;
+mod compaction;
 mod gpt_ui;
 mod provider_ui;
 
@@ -135,6 +136,7 @@ pub struct TacetaApp {
     agent_ui: agent_ui::AgentUiState,
     gpt_ui: gpt_ui::GptUiState,
     cli_ui: cli_ui::CliUiState,
+    compaction: Option<compaction::ActiveCompaction>,
     model_refresh_pending: bool,
     models: Vec<ModelDescriptor>,
     connection: ConnectionState,
@@ -318,6 +320,7 @@ impl TacetaApp {
             agent_ui: agent_ui::AgentUiState::new(data_roots.agent_sessions),
             gpt_ui: gpt_ui::GptUiState::new(data_roots.gpt_bindings),
             cli_ui: cli_ui::CliUiState::new(data_roots.grok_approval_plugin),
+            compaction: None,
             model_refresh_pending: false,
             models: Vec::new(),
             connection: ConnectionState::Connecting,
@@ -676,6 +679,7 @@ impl TacetaApp {
         self.drain_agent_work();
         self.drain_gpt_work();
         self.drain_cli_work();
+        self.drain_compaction();
         if let Some(receiver) = &self.model_unload_result {
             let result = match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -1284,6 +1288,23 @@ impl TacetaApp {
             return;
         }
 
+        // Ollama keeps no session, so every request carries the conversation.
+        // When that no longer fits the context, its older part is summarized
+        // first and the draft stays in place until the summary is stored.
+        let context_length = model.context_length.map_or(self.state.context_length, |limit| limit.min(self.state.context_length));
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        if self
+            .handover_or_compact(0, compaction::handover_budget(Some(context_length)), {
+                let (backend, model) = (backend.clone(), model.name.clone());
+                move || compaction::Summarizer::Local { backend, model, context_length }
+            })
+            .is_none()
+        {
+            return;
+        }
+
         let draft = std::mem::take(&mut self.state.draft);
         let attachments = std::mem::take(&mut self.state.pending_attachments);
         let attachment_fallback = attachments
@@ -1299,7 +1320,18 @@ impl TacetaApp {
         }
         let conversation_id = conversation.id;
         conversation.messages.push(user_message);
-        let request_messages = conversation.messages.clone();
+        let request_messages = match &conversation.summary {
+            Some(summary) => {
+                let covered = summary.covers_messages.min(conversation.messages.len());
+                let mut messages = vec![ChatMessage::new_system(format!(
+                    "Summary of the conversation up to this point:\n{}",
+                    summary.text
+                ))];
+                messages.extend_from_slice(&conversation.messages[covered..]);
+                messages
+            }
+            None => conversation.messages.clone(),
+        };
         let assistant_message = ChatMessage::new_assistant("");
         let assistant_id = assistant_message.id;
         conversation.messages.push(assistant_message);
@@ -1320,9 +1352,6 @@ impl TacetaApp {
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (result_tx, result_rx) = std_mpsc::channel();
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
         self.ollama_used |= self.state.inference_provider == InferenceProvider::Ollama;
         let task = self.runtime.spawn(async move {
             let result = backend.stream_chat(request, event_tx).await;
@@ -1341,6 +1370,10 @@ impl TacetaApp {
     }
 
     fn stop_generation(&mut self) {
+        if self.compaction.is_some() {
+            self.stop_compaction();
+            return;
+        }
         if self.gpt_ui.active.is_some() {
             self.stop_gpt_run();
             return;
@@ -4606,6 +4639,43 @@ mod model_manager_tests {
         assert_eq!(app.models.len(), 1);
         assert!(matches!(app.notice.as_ref().unwrap().kind, NoticeKind::Info));
         assert!(app.can_unload_model());
+    }
+
+    #[test]
+    fn a_conversation_too_long_for_the_model_is_summarized_before_the_request_goes_out() {
+        let services = Arc::new(RecordingServices::default());
+        let mut app = test_app(services.clone());
+        app.models = vec![model("chosen-model")];
+        app.state.selected_model = Some("chosen-model".into());
+        app.state.context_length = 2_000;
+        let conversation = app.state.active_conversation_mut();
+        for turn in 0..3 {
+            conversation.messages.push(ChatMessage::new_user(format!("question {turn} {}", "あ".repeat(400))));
+            conversation.messages.push(ChatMessage::new_assistant(format!("answer {turn} {}", "い".repeat(400))));
+        }
+        app.state.draft = "next".into();
+
+        app.start_generation();
+        // Nothing goes out, and nothing is taken from the user, until the summary exists.
+        assert!(app.generation.is_none() && app.is_generating());
+        assert_eq!(app.state.draft, "next");
+        assert_eq!(app.state.active_conversation().messages.len(), 6);
+
+        wait_until(|| {
+            app.drain_background_work();
+            services.operations.lock().unwrap().last().is_some_and(|operation| operation == "chat:next")
+        });
+        let operations = services.operations.lock().unwrap().clone();
+        assert!(operations.len() > 1);
+        assert!(operations[..operations.len() - 1].iter().all(|operation| operation.starts_with("chat:You are compressing")));
+        let conversation = app.state.active_conversation();
+        let summary = conversation.summary.as_ref().unwrap();
+        assert_eq!(summary.text, "Test answer");
+        assert!((1..6).contains(&summary.covers_messages));
+        // The summary stands in for the old messages; they are not removed.
+        assert!(conversation.messages[0].content.starts_with("question 0"));
+        assert_eq!(conversation.messages[6].content, "next");
+        assert!(app.state.draft.is_empty());
     }
 
     #[test]

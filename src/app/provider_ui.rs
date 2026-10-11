@@ -3,7 +3,7 @@ use super::*;
 impl TacetaApp {
     pub(super) fn is_generating(&self) -> bool {
         self.generation.is_some() || self.agent_ui.active.is_some() || self.gpt_ui.active.is_some()
-            || self.cli_ui.active.is_some()
+            || self.cli_ui.active.is_some() || self.compaction.is_some()
     }
 
     fn can_change_provider(&self) -> bool {
