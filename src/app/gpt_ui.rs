@@ -554,9 +554,7 @@ impl TacetaApp {
             self.notice = Some(match result {
                 Ok(()) => {
                     if self.state.inference_provider == InferenceProvider::Gpt {
-                        self.model_list_epoch = self.model_list_epoch.wrapping_add(1);
-                        self.model_refresh_pending = false;
-                        self.models.clear();
+                        self.invalidate_model_list();
                         self.connection = ConnectionState::Unavailable(text(self.language(), "GPTへの再接続が必要です。", "Reconnect GPT to continue.").into());
                     }
                     Notice { kind: NoticeKind::Info,

@@ -58,11 +58,7 @@ impl TacetaApp {
             }
             InferenceProvider::Gpt => None,
         };
-        // A model list belongs to the request that produced it. A late reply
-        // from the previous endpoint cannot replace this provider's models.
-        self.model_list_epoch = self.model_list_epoch.wrapping_add(1);
-        self.model_refresh_pending = false;
-        self.models.clear();
+        self.invalidate_model_list();
         self.notice = None;
         self.refresh_models();
     }
@@ -155,9 +151,7 @@ impl TacetaApp {
                     match self.provider_ui.grok.sign_out() {
                         Ok(()) => {
                             if self.state.inference_provider == InferenceProvider::Grok {
-                                self.model_list_epoch = self.model_list_epoch.wrapping_add(1);
-                                self.model_refresh_pending = false;
-                                self.models.clear();
+                                self.invalidate_model_list();
                                 self.state.selected_model = None;
                                 self.connection = ConnectionState::Unavailable(
                                     text(
@@ -253,6 +247,7 @@ impl TacetaApp {
             match outcome {
                 Ok(()) => {
                     if self.state.inference_provider == InferenceProvider::Grok {
+                        self.invalidate_model_list();
                         self.refresh_models();
                     } else {
                         self.select_provider(InferenceProvider::Grok);
@@ -395,5 +390,27 @@ mod tests {
         assert!(!app.model_refresh_pending);
         assert!(matches!(app.connection, ConnectionState::Ready));
         assert!(!app.can_unload_model());
+    }
+
+    #[test]
+    fn changing_the_ollama_endpoint_discards_the_list_request_still_in_flight() {
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        app.model_list_epoch = 4;
+        app.model_refresh_pending = true;
+        let endpoint = OllamaEndpoint::resolve_from_values(OllamaEndpointMode::Custom, "http://127.0.0.1:23456", None, None).unwrap();
+        assert!(app.bind_ollama_endpoint(endpoint));
+        assert!(!app.model_refresh_pending);
+        app.model_result_tx
+            .send((4, Ok(vec![ModelDescriptor {
+                name: "from-the-old-endpoint".into(),
+                size: 0,
+                thinking: ThinkingCapability::Unverified,
+                vision: false,
+                tools: true,
+                context_length: None,
+            }])))
+            .unwrap();
+        app.drain_background_work();
+        assert!(app.models.is_empty());
     }
 }
