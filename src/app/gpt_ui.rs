@@ -59,16 +59,12 @@ pub(super) struct GptUiState {
     pub active: Option<ActiveGpt>,
     login: Option<GptLoginTask>,
     logout: Option<std_mpsc::Receiver<Result<(), String>>>,
-    bindings_root: Result<PathBuf, String>,
+    bindings_root: PathBuf,
     reverse_transfer: Option<GptReverseTransfer>,
 }
 
-impl Default for GptUiState {
-    fn default() -> Self {
-        #[cfg(not(test))]
-        let bindings_root = crate::persistence::gpt_bindings_root();
-        #[cfg(test)]
-        let bindings_root = Ok(std::env::temp_dir().join(format!("taceta-gpt-ui-{}", Uuid::new_v4())));
+impl GptUiState {
+    pub(super) fn new(bindings_root: PathBuf) -> Self {
         Self {
             client: GptClient::new(),
             active: None,
@@ -97,16 +93,7 @@ impl TacetaApp {
             return;
         }
         let Some(workspace) = conversation.workspace.clone() else { return; };
-        let roots = self.agent_ui.data_root.clone().and_then(|agent_root| {
-            self.gpt_ui.bindings_root.clone().map(|binding_root| (agent_root, binding_root))
-        });
-        let (agent_root, binding_root) = match roots {
-            Ok(roots) => roots,
-            Err(error) => {
-                self.notice = Some(Notice { kind: NoticeKind::Error, text: error });
-                return;
-            }
-        };
+        let (agent_root, binding_root) = (self.agent_ui.data_root.clone(), self.gpt_ui.bindings_root.clone());
         let thread_id = conversation.gpt.as_ref().and_then(|session| session.thread_id.clone());
         let client = self.gpt_ui.client.clone();
         let (cancel, mut cancelled) = watch::channel(false);
@@ -434,13 +421,7 @@ impl TacetaApp {
             _ => None,
         };
         let handoff_root = if pending_handoff {
-            match self.agent_ui.data_root.clone() {
-                Ok(root) => Some(root),
-                Err(error) => {
-                    self.notice = Some(Notice { kind: NoticeKind::Error, text: error });
-                    return false;
-                }
-            }
+            Some(self.agent_ui.data_root.clone())
         } else { None };
         let conversation = self.state.active_conversation_mut();
         conversation.provider = Some(InferenceProvider::Gpt);
@@ -619,11 +600,9 @@ impl TacetaApp {
         if active.pending_thread_save.is_none() && !active.binding_needs_save { return; }
         let thread_id = active.pending_thread_save.take();
         active.binding_needs_save = false;
-        let saved = self.gpt_ui.bindings_root.as_ref().map_err(Clone::clone).and_then(|root| {
-            let conversation = self.state.conversations.iter().find(|conversation| conversation.id == active.conversation_id)
-                .ok_or_else(|| "The GPT conversation to save is missing".to_owned())?;
-            crate::persistence::save_gpt_binding(root, conversation)
-        });
+        let saved = self.state.conversations.iter().find(|conversation| conversation.id == active.conversation_id)
+            .ok_or_else(|| "The GPT conversation to save is missing".to_owned())
+            .and_then(|conversation| crate::persistence::save_gpt_binding(&self.gpt_ui.bindings_root, conversation));
         if let Err(error) = saved {
             let _ = active.cancel.send(true);
             active.approvals.clear();
@@ -668,8 +647,7 @@ impl TacetaApp {
                 }
             }
             if session.thread_id.is_some() {
-                let saved = self.gpt_ui.bindings_root.as_ref().map_err(Clone::clone)
-                    .and_then(|root| crate::persistence::save_gpt_binding(root, conversation));
+                let saved = crate::persistence::save_gpt_binding(&self.gpt_ui.bindings_root, conversation);
                 if let Err(save_error) = saved { error = Some(save_error); }
             }
         }
@@ -808,8 +786,7 @@ impl TacetaApp {
     pub(super) fn archive_gpt_chats(&mut self, ids: &[Uuid]) -> bool {
         for id in ids {
             if !self.state.conversations.iter().any(|conversation| conversation.id == *id && conversation.has_gpt_history()) { continue; }
-            let result = self.gpt_ui.bindings_root.as_ref().map_err(Clone::clone)
-                .and_then(|root| crate::persistence::archive_gpt_binding(root, *id));
+            let result = crate::persistence::archive_gpt_binding(&self.gpt_ui.bindings_root, *id);
             if let Err(error) = result {
                 self.notice = Some(Notice { kind: NoticeKind::Error, text: error });
                 return false;
@@ -1252,7 +1229,7 @@ mod tests {
         assert!(controls.try_recv().is_err());
         app.persist_gpt_thread(None);
         assert!(matches!(controls.try_recv().unwrap(), GptControl::ThreadSaved { thread_id } if thread_id == "saved-before-turn"));
-        let root = app.gpt_ui.bindings_root.as_ref().unwrap();
+        let root = &app.gpt_ui.bindings_root;
         let mut recovered = PersistedAppState::default();
         crate::persistence::recover_gpt_bindings(&mut recovered, root).unwrap();
         assert!(recovered.conversations.iter().any(|conversation| conversation.gpt.as_ref().is_some_and(|gpt| gpt.thread_id.as_deref() == Some("saved-before-turn"))));
@@ -1261,7 +1238,7 @@ mod tests {
 
         let mut blocked = test_app(Arc::new(RecordingServices::default()));
         let (_tx, mut controls, cancel) = active_fixture(&mut blocked);
-        let path = blocked.gpt_ui.bindings_root.as_ref().unwrap().clone();
+        let path = blocked.gpt_ui.bindings_root.clone();
         fs::write(&path, "a file cannot be a history directory").unwrap();
         blocked.apply_gpt_event(GptEvent::ThreadReady { thread_id: "must-not-start".into() });
         blocked.persist_gpt_thread(None);

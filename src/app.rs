@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, mpsc as std_mpsc},
     time::Duration,
@@ -141,6 +141,7 @@ pub struct TacetaApp {
     ollama_endpoint_mode_draft: OllamaEndpointMode,
     ollama_custom_endpoint_draft: String,
     model_storage_path: PathBuf,
+    home: PathBuf,
     generation: Option<ActiveGeneration>,
     external_preview_ids: HashSet<Uuid>,
     notice: Option<Notice>,
@@ -199,8 +200,15 @@ impl TacetaApp {
         let loaded = load_app_state(creation_context.storage);
         let unreadable_state = loaded.unreadable;
         let mut state = loaded.state;
-        let gpt_recovery = crate::persistence::gpt_bindings_root()
-            .and_then(|root| crate::persistence::recover_gpt_bindings(&mut state, &root));
+        // Everything Taceta stores per user hangs off the home directory, so
+        // its absence is decided once, here.
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+            .expect("Taceta needs the current user's home directory (HOME)");
+        let data_roots = DataRoots::for_user(&home);
+        let gpt_recovery =
+            crate::persistence::recover_gpt_bindings(&mut state, &data_roots.gpt_bindings);
         let endpoint_result =
             OllamaEndpoint::resolve(state.ollama_endpoint_mode, &state.ollama_custom_endpoint);
         let (ollama_endpoint, initial_endpoint_error) = match endpoint_result {
@@ -214,10 +222,6 @@ impl TacetaApp {
             .and_then(|path| path.parent().map(PathBuf::from))
             .and_then(|path| path.parent().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("/Applications/Taceta.app"));
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"));
-
         let mut app = Self::with_services(
             state,
             shell_preferences,
@@ -229,6 +233,7 @@ impl TacetaApp {
             Arc::new(OllamaModelManager::new(ollama_endpoint)),
             link_service,
             Installer::new(home, app_bundle),
+            data_roots,
         );
         // Startup owns local materialization and Native Messaging registration.
         // Browser activation and internal-page navigation remain explicit user steps.
@@ -296,6 +301,7 @@ impl TacetaApp {
         model_manager: Arc<dyn ModelManager>,
         link_service: Arc<TacetaLinkService>,
         link_installer: Installer,
+        data_roots: DataRoots,
     ) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -321,15 +327,16 @@ impl TacetaApp {
             model_result_rx,
             model_list_epoch: 0,
             provider_ui: provider_ui::ProviderUiState::default(),
-            agent_ui: agent_ui::AgentUiState::default(),
-            gpt_ui: gpt_ui::GptUiState::default(),
+            agent_ui: agent_ui::AgentUiState::new(data_roots.agent_sessions),
+            gpt_ui: gpt_ui::GptUiState::new(data_roots.gpt_bindings),
             model_refresh_pending: false,
             models: Vec::new(),
             connection: ConnectionState::Connecting,
             ollama_endpoint,
             ollama_endpoint_mode_draft,
             ollama_custom_endpoint_draft,
-            model_storage_path: resolve_model_storage_path(),
+            model_storage_path: data_roots.model_storage,
+            home: data_roots.home,
             generation: None,
             external_preview_ids: HashSet::new(),
             notice: None,
@@ -416,7 +423,7 @@ impl TacetaApp {
                     self.state.ollama_custom_endpoint = endpoint.base_url().to_owned();
                 }
                 self.bind_ollama_endpoint(endpoint);
-                self.model_storage_path = resolve_model_storage_path();
+                self.model_storage_path = resolve_model_storage_path(&self.home);
                 self.notice = Some(Notice {
                     kind: NoticeKind::Info,
                     text: text(
@@ -3875,7 +3882,28 @@ fn thinking_mode_label(language: AppShellLanguage, mode: ThinkingMode) -> &'stat
     }
 }
 
-fn resolve_model_storage_path() -> PathBuf {
+/// Per-user locations, resolved once at startup and handed to the parts that
+/// own them.
+struct DataRoots {
+    home: PathBuf,
+    agent_sessions: PathBuf,
+    gpt_bindings: PathBuf,
+    model_storage: PathBuf,
+}
+
+impl DataRoots {
+    fn for_user(home: &Path) -> Self {
+        let taceta = home.join("Library/Application Support/Taceta");
+        Self {
+            home: home.to_path_buf(),
+            agent_sessions: taceta.join("AgentSessions"),
+            gpt_bindings: taceta.join("GptBindings"),
+            model_storage: resolve_model_storage_path(home),
+        }
+    }
+}
+
+fn resolve_model_storage_path(home: &Path) -> PathBuf {
     if let Some(path) = std::env::var_os("OLLAMA_MODELS").filter(|value| !value.is_empty()) {
         return PathBuf::from(path);
     }
@@ -3890,11 +3918,7 @@ fn resolve_model_storage_path() -> PathBuf {
         }
     }
 
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/Shared"))
-        .join(".ollama")
-        .join("models")
+    home.join(".ollama").join("models")
 }
 
 fn ollama_endpoint_source_label(
@@ -4517,6 +4541,12 @@ mod model_manager_tests {
             services,
             Arc::new(TacetaLinkService::default()),
             Installer::new("/tmp/taceta-test-unused-home", "/tmp/Taceta.app"),
+            DataRoots {
+                home: PathBuf::from("/tmp/taceta-test-unused-home"),
+                agent_sessions: std::env::temp_dir().join(format!("taceta-ui-{}", Uuid::new_v4())),
+                gpt_bindings: std::env::temp_dir().join(format!("taceta-gpt-ui-{}", Uuid::new_v4())),
+                model_storage: PathBuf::from("/tmp/taceta-test-unused-home/.ollama/models"),
+            },
         )
     }
 

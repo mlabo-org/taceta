@@ -23,20 +23,13 @@ pub(super) struct ActiveAgent {
 pub(super) struct AgentUiState {
     pub active: Option<ActiveAgent>,
     snapshots: HashMap<Uuid, SessionSnapshot>,
-    pub(super) data_root: Result<PathBuf, String>,
+    pub(super) data_root: PathBuf,
     recovery_started: bool,
     recovery: Option<std_mpsc::Receiver<Vec<Result<SessionSnapshot, String>>>>,
 }
 
-impl Default for AgentUiState {
-    fn default() -> Self {
-        #[cfg(not(test))]
-        let data_root = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join("Library/Application Support/Taceta/AgentSessions"))
-            .ok_or_else(|| "The current user's home directory is unavailable".to_owned());
-        #[cfg(test)]
-        let data_root = Ok(std::env::temp_dir().join(format!("taceta-ui-{}", Uuid::new_v4())));
+impl AgentUiState {
+    pub(super) fn new(data_root: PathBuf) -> Self {
         Self {
             active: None,
             snapshots: HashMap::new(),
@@ -224,16 +217,7 @@ impl TacetaApp {
         if !resume && self.state.draft.trim().is_empty() {
             return;
         }
-        let data_root = match &self.agent_ui.data_root {
-            Ok(root) => root.clone(),
-            Err(error) => {
-                self.notice = Some(Notice {
-                    kind: NoticeKind::Error,
-                    text: error.clone(),
-                });
-                return;
-            }
-        };
+        let data_root = self.agent_ui.data_root.clone();
         let id = self.state.active_conversation_id;
         let prior = importable_messages(&self.state.active_conversation().messages);
         let prompt = if resume {
@@ -335,9 +319,7 @@ impl TacetaApp {
             return;
         }
         self.agent_ui.recovery_started = true;
-        let Ok(root) = self.agent_ui.data_root.clone() else {
-            return;
-        };
+        let root = self.agent_ui.data_root.clone();
         let (tx, rx) = std_mpsc::channel();
         self.runtime.spawn_blocking(move || {
             let snapshots = match AgentSession::list_ids(&root) {
@@ -647,23 +629,7 @@ impl TacetaApp {
             !self.state.conversations.iter().any(|conversation| conversation.id == *id && conversation.is_gpt()
                 && !conversation.gpt.as_ref().is_some_and(|session| session.handoff_from_taceta))
         }).collect::<Vec<_>>();
-        let root = match &self.agent_ui.data_root {
-            Ok(root) => root.clone(),
-            Err(error) => {
-                if ids.iter().any(|id| {
-                    self.state.conversations.iter().any(|conversation| {
-                        conversation.id == *id && conversation.workspace.is_some()
-                    })
-                }) {
-                    self.notice = Some(Notice {
-                        kind: NoticeKind::Error,
-                        text: error.clone(),
-                    });
-                    return false;
-                }
-                return true;
-            }
-        };
+        let root = self.agent_ui.data_root.clone();
         for id in &ids {
             if let Err(error) = AgentSession::archive(&root, *id) {
                 self.notice = Some(Notice {
