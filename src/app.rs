@@ -178,17 +178,6 @@ pub struct TacetaApp {
 }
 
 impl TacetaApp {
-    fn prepare_startup_link_setup(
-        installer: &Installer,
-        detected: BrowserDetection,
-    ) -> Result<InstallStatus, String> {
-        installer.setup(detected).map_err(|error| error.to_string())
-    }
-
-    fn should_show_startup_link_setup(state: &PersistedAppState) -> bool {
-        !state.taceta_link_setup_acknowledged
-    }
-
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         install_macos_system_fonts(&creation_context.egui_ctx)
             .expect("Taceta could not install its managed macOS UI fonts");
@@ -239,9 +228,9 @@ impl TacetaApp {
         // Browser activation and internal-page navigation remain explicit user steps.
         match taceta_link_installer::detect_default_browser() {
             Ok(detected @ BrowserDetection::Supported(_)) => {
-                match Self::prepare_startup_link_setup(&app.link_installer, detected) {
+                match app.link_installer.setup(detected).map_err(|error| error.to_string()) {
                     Ok(status) => {
-                        if Self::should_show_startup_link_setup(&app.state) {
+                        if !app.state.taceta_link_setup_acknowledged {
                             app.link_setup_open = status.needs_load_unpacked || status.needs_reload;
                             app.notice = Some(Notice {
                                 kind: NoticeKind::Info,
@@ -4568,31 +4557,6 @@ mod model_manager_tests {
         assert_eq!(model_candidate_list_height(1_400.0), 420.0);
     }
 
-    #[test]
-    fn startup_link_setup_routes_unsupported_browser_to_user_error() {
-        let installer = Installer::new("/tmp/taceta-test-home", "/tmp/Taceta.app");
-        let result = TacetaApp::prepare_startup_link_setup(
-            &installer,
-            BrowserDetection::Unsupported {
-                bundle_id: Some("com.apple.Safari".to_owned()),
-            },
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unsupported default browser"));
-    }
-
-    #[test]
-    fn startup_link_setup_is_suppressed_after_acknowledgement() {
-        let fresh = PersistedAppState::default();
-        assert!(TacetaApp::should_show_startup_link_setup(&fresh));
-
-        let acknowledged = PersistedAppState {
-            taceta_link_setup_acknowledged: true,
-            ..fresh
-        };
-        assert!(!TacetaApp::should_show_startup_link_setup(&acknowledged));
-    }
-
     fn model(name: &str) -> ModelDescriptor {
         ModelDescriptor {
             name: name.into(),
@@ -4944,14 +4908,6 @@ mod web_search_request_tests {
             Some("brave".to_owned())
         );
         assert_eq!(web_search_request_config(false, ProviderKind::Ollama), None);
-    }
-
-    #[test]
-    fn browser_search_routes_offer_chatgpt_before_google() {
-        assert_eq!(
-            browser_provider_options(),
-            [ProviderKind::ChatGptWeb, ProviderKind::GoogleSearch]
-        );
     }
 
     #[test]

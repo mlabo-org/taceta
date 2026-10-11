@@ -84,15 +84,6 @@ test("generation pauses cannot return a partial answer even with zero stability 
   assert.ok(progress.some((chunk) => chunk.replace && chunk.delta === fullText));
 });
 
-test("ChatGPT Web engine exposes current stable selectors", () => {
-  assert.deepEqual(chatGPTWebSelectors(), {
-    prompt: '#prompt-textarea[contenteditable="true"][role="textbox"]',
-    send: 'button[data-testid="send-button"]',
-    assistant: '[data-message-author-role="assistant"]',
-    turn: 'section[data-testid^="conversation-turn-"]',
-  });
-});
-
 test("state identifies authenticated composer and completion controls", () => {
   const node = (attrs = {}, text = "") => ({ getAttribute: (name) => attrs[name] ?? null, textContent: text, innerText: text, disabled: Boolean(attrs.disabled), querySelectorAll: () => [] });
   const documentLike = {

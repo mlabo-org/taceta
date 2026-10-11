@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(v["path"], "/tmp/Taceta.app/Contents/MacOS/taceta-link-host");
     }
     #[test]
-    fn materialize_and_uninstall_are_bounded() {
+    fn materialize_replaces_the_owned_copy_and_drops_stale_files() {
         let root = std::env::temp_dir().join(format!("taceta-installer-{}", std::process::id()));
         let src = root.join("app/Contents/Resources/TacetaLink");
         fs::create_dir_all(&src).unwrap();

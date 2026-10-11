@@ -10,7 +10,9 @@ import { CdpExecutor } from "./cdp.js";
 test("browser workflow surface contains two search routes and page fetching only", async () => {
   assert.deepEqual([...WORKFLOWS].sort(), ["chatgpt_web", "google_search", "page_fetch"]);
   const manifest = JSON.parse(await readFile(new URL("manifest.json", import.meta.url), "utf8"));
-  assert.equal(manifest.permissions.includes("search"), false);
+  // The reviewed permission surface. A change here needs a matching reason in the README.
+  assert.deepEqual([...manifest.permissions].sort(), ["alarms", "debugger", "nativeMessaging", "scripting", "storage", "tabGroups", "tabs", "webNavigation"]);
+  assert.deepEqual(manifest.host_permissions, ["https://*/*"]);
 });
 
 test("protocol is one versioned envelope and rejects old raw browser wire",()=>{
