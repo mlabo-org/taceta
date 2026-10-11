@@ -6,6 +6,7 @@
 //! nothing outside a driver sees that protocol.
 
 pub mod claude;
+pub mod grok;
 pub mod process;
 
 use std::{future::Future, path::PathBuf, pin::Pin};
