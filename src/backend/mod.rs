@@ -16,6 +16,10 @@ pub enum BackendError {
     Request(#[from] reqwest::Error),
     #[error("invalid Ollama response: {0}")]
     Protocol(String),
+    /// Web Search, page fetch, or Taceta Link failed. The local inference
+    /// connection is not implicated, and no answer may be kept for the turn.
+    #[error("{0}")]
+    Web(String),
     #[error("generation cancelled")]
     Cancelled,
     #[error("Ollama endpoint is unavailable")]

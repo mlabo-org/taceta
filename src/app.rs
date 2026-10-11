@@ -20,7 +20,7 @@ use eframe::egui::{
 };
 use taceta::{
     backend::{
-        InferenceBackend, ModelManager, OllamaClient, OllamaEndpoint, OllamaEndpointError,
+        BackendError, InferenceBackend, ModelManager, OllamaClient, OllamaEndpoint, OllamaEndpointError,
         OllamaEndpointMode, OllamaEndpointSource, OllamaModelManager,
     },
     domain::{
@@ -107,7 +107,7 @@ struct ActiveGeneration {
     assistant_id: Uuid,
     task: JoinHandle<()>,
     events: mpsc::UnboundedReceiver<GenerationEvent>,
-    result: std_mpsc::Receiver<Result<(), String>>,
+    result: std_mpsc::Receiver<Result<(), BackendError>>,
 }
 
 struct ActiveModelPull {
@@ -869,14 +869,21 @@ impl TacetaApp {
                 self.apply_generation_event(conversation_id, assistant_id, event);
             }
             if let Some(generation_result) = result {
-                self.external_preview_ids.remove(&assistant_id);
+                let external_preview_remains = self.external_preview_ids.remove(&assistant_id);
                 match generation_result {
                     Ok(()) => {
                         self.connection = ConnectionState::Ready;
                         self.notice = None;
                     }
                     Err(error) => {
-                        if is_web_search_error(&error) {
+                        let web_failure = matches!(error, BackendError::Web(_));
+                        let error = error.to_string();
+                        // Text still shown from the browser was never accepted
+                        // as an answer, whichever side failed.
+                        if external_preview_remains && !web_failure {
+                            self.remove_message(conversation_id, assistant_id);
+                        }
+                        if web_failure {
                             // Web providers are independent of the local
                             // inference connection. Remove the transient
                             // assistant placeholder so a provider failure is
@@ -1325,10 +1332,7 @@ impl TacetaApp {
             return;
         };
         let task = self.runtime.spawn(async move {
-            let result = backend
-                .stream_chat(request, event_tx)
-                .await
-                .map_err(|error| error.to_string());
+            let result = backend.stream_chat(request, event_tx).await;
             let _ = result_tx.send(result);
         });
 
@@ -3930,23 +3934,6 @@ fn capability_label(capability: &ThinkingCapability, language: AppShellLanguage)
     }
 }
 
-fn is_web_search_error(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    [
-        "web search",
-        "web provider",
-        "web routing",
-        "web_fetch",
-        "web_search",
-        "tool support",
-        "tool call",
-        "keychain credential",
-        "taceta link",
-    ]
-    .iter()
-    .any(|marker| error.contains(marker))
-}
-
 fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
     let lower = error.to_ascii_lowercase();
     for browser in ["Brave", "Chrome"] {
@@ -4027,7 +4014,7 @@ fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
     if lower.contains("ambiguous") {
         return text(language, "ChatGPT Webの送信結果を確認できませんでした。自動再送はしていません。明示的に再試行してください。", "The ChatGPT Web submission outcome is unknown. It was not retried automatically; retry explicitly.").to_owned();
     }
-    if lower.contains("does not support fetching") {
+    if lower.contains("cannot read external pages") {
         return text(language, "ChatGPT Webは個別ページ取得に対応していません。検索結果だけで再試行してください。", "ChatGPT Web does not support individual page fetching. Retry with search results only.").to_owned();
     }
     text(
@@ -4795,6 +4782,66 @@ mod model_manager_tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1_024), "1.0 KB");
     }
+
+    /// Finishes a turn whose assistant placeholder shows `shown`, optionally as
+    /// browser preview text, and returns whether the placeholder survived.
+    fn finish_turn(app: &mut TacetaApp, shown: &str, browser_preview: bool, error: BackendError) -> bool {
+        app.connection = ConnectionState::Ready;
+        let conversation_id = app.state.active_conversation_id;
+        let assistant = ChatMessage::new(Role::Assistant, "");
+        let assistant_id = assistant.id;
+        app.state.active_conversation_mut().messages.push(assistant);
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (result_tx, result) = std_mpsc::channel();
+        let delta = shown.to_owned();
+        event_tx
+            .send(if browser_preview {
+                GenerationEvent::ExternalContentDelta { delta, replace: true }
+            } else {
+                GenerationEvent::ContentDelta(delta)
+            })
+            .unwrap();
+        result_tx.send(Err(error)).unwrap();
+        app.generation = Some(ActiveGeneration {
+            conversation_id,
+            assistant_id,
+            task: app.runtime.spawn(async {}),
+            events,
+            result,
+        });
+        app.drain_background_work();
+        app.state.active_conversation().messages.iter().any(|message| message.id == assistant_id)
+    }
+
+    #[test]
+    fn web_failures_never_keep_an_answer_or_mark_the_local_engine_unavailable() {
+        use taceta::taceta_link_service::LinkError;
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        for failure in [
+            LinkError::AuthRequired.to_string(),
+            LinkError::PerformedOrUnknown.to_string(),
+            LinkError::Unavailable.to_string(),
+            LinkError::Protocol("chatgpt_web workflow_failed: No tab with id".into()).to_string(),
+            "the selected browser workflow cannot read external pages".to_owned(),
+        ] {
+            let kept = finish_turn(&mut app, "partial browser text", true, BackendError::Web(failure.clone()));
+            assert!(!kept, "{failure}");
+            assert!(matches!(app.connection, ConnectionState::Ready), "{failure}");
+            assert!(app.notice.is_some(), "{failure}");
+        }
+    }
+
+    #[test]
+    fn local_failures_discard_browser_preview_but_keep_the_models_own_partial_answer() {
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        let failure = || BackendError::Protocol("stream ended before completion".into());
+
+        assert!(!finish_turn(&mut app, "partial browser text", true, failure()));
+        assert!(matches!(app.connection, ConnectionState::Unavailable(_)));
+
+        assert!(finish_turn(&mut app, "partial model answer", false, failure()));
+        assert_eq!(app.state.active_conversation().messages.last().unwrap().content, "partial model answer");
+    }
 }
 
 #[cfg(test)]
@@ -4824,14 +4871,6 @@ mod web_search_request_tests {
 
     #[test]
     fn provider_failures_are_separate_from_local_connection_failures() {
-        assert!(is_web_search_error("web provider request failed"));
-        assert!(is_web_search_error(
-            "web routing returned invalid JSON; nothing was sent to the browser"
-        ));
-        assert!(is_web_search_error(
-            "selected model does not advertise tool support"
-        ));
-        assert!(!is_web_search_error("Ollama endpoint is unavailable"));
         assert!(
             web_search_error_message(
                 "web routing returned invalid JSON; nothing was sent to the browser",
@@ -4852,7 +4891,6 @@ mod web_search_request_tests {
             web_search_error_message("Keychain credential is not configured for Ollama", language)
                 .contains("Ollama Web Search APIキーが未設定です")
         );
-        assert!(!is_web_search_error("Ollama endpoint is unavailable"));
     }
 
     #[test]
@@ -4861,10 +4899,9 @@ mod web_search_request_tests {
             ("Brave", AppShellLanguage::Japanese, "ブラウザーを起動してから"),
             ("Chrome", AppShellLanguage::English, "Start the browser"),
         ] {
-            let error = taceta::backend::BackendError::Protocol(
+            let error = taceta::backend::BackendError::Web(
                 taceta::taceta_link_service::LinkError::BrowserNotRunning(browser).to_string(),
             ).to_string();
-            assert!(is_web_search_error(&error));
             let notice = web_search_error_message(&error, language);
             assert!(notice.contains(browser));
             assert!(notice.contains(action));
