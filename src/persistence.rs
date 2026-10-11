@@ -87,6 +87,8 @@ pub struct Conversation {
     /// Stands in for the oldest messages when the conversation is handed to
     /// an engine it would not otherwise fit. The messages are kept.
     pub summary: Option<taceta::prior_context::Summary>,
+    /// What was typed here and not sent, kept while another conversation is open.
+    pub draft: String,
 }
 
 impl Default for Conversation {
@@ -107,6 +109,7 @@ impl Default for Conversation {
             cli_usage: None,
             task_seen_messages: None,
             summary: None,
+            draft: String::new(),
         }
     }
 }
@@ -288,9 +291,9 @@ impl PersistedAppState {
 
     pub fn start_new_conversation(&mut self) {
         let conversation = Conversation::for_provider(self.inference_provider);
+        self.active_conversation_mut().draft = std::mem::take(&mut self.draft);
         self.active_conversation_id = conversation.id;
         self.conversations.insert(0, conversation);
-        self.draft.clear();
         self.pending_attachments.clear();
     }
 
@@ -351,9 +354,13 @@ impl PersistedAppState {
         };
         let provider = conversation.provider.unwrap_or(self.inference_provider);
         self.remember_provider_model(provider);
-        self.active_conversation_id = id;
-        self.draft.clear();
-        self.pending_attachments.clear();
+        if id != self.active_conversation_id {
+            // An unsent draft stays with the conversation it was typed in.
+            self.active_conversation_mut().draft = std::mem::take(&mut self.draft);
+            self.active_conversation_id = id;
+            self.draft = std::mem::take(&mut self.active_conversation_mut().draft);
+            self.pending_attachments.clear();
+        }
         true
     }
 
@@ -989,5 +996,23 @@ mod tests {
 
         assert_eq!(restored.ollama_endpoint_mode, OllamaEndpointMode::Custom);
         assert_eq!(restored.ollama_custom_endpoint, "http://127.0.0.1:23456");
+    }
+
+    #[test]
+    fn an_unsent_draft_stays_with_its_conversation() {
+        let mut state = PersistedAppState::default();
+        let first = state.active_conversation_id;
+        state.draft = "not sent yet".into();
+        state.start_new_conversation();
+        assert!(state.draft.is_empty());
+        state.draft = "second draft".into();
+        let second = state.active_conversation_id;
+        assert!(state.select_conversation(first));
+        assert_eq!(state.draft, "not sent yet");
+        // Selecting the conversation that is already open changes nothing.
+        assert!(state.select_conversation(first));
+        assert_eq!(state.draft, "not sent yet");
+        assert!(state.select_conversation(second));
+        assert_eq!(state.draft, "second draft");
     }
 }
