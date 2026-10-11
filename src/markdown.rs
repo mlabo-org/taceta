@@ -35,33 +35,65 @@ pub fn show(ui: &mut Ui, markdown: &str) {
     render_children(ui, &children, 0, &mut context);
 }
 
-const MARKDOWN_CACHE_LIMIT: usize = 32;
+/// The cache holds every message of a long conversation, so that drawing
+/// a frame never parses again what the last frame parsed. It is bounded by
+/// the text it holds rather than by a small count: with a count below the
+/// number of messages on screen, each frame would evict and re-parse them.
+const MARKDOWN_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const MARKDOWN_CACHE_MAX_ENTRIES: usize = 4096;
 
+struct CachedDocument {
+    source: String,
+    document: Arc<Node>,
+    last_used: u64,
+}
+
+#[derive(Default)]
 struct ParseCache {
-    entries: HashMap<u64, (String, Arc<Node>)>,
-    order: VecDeque<u64>,
+    entries: HashMap<u64, CachedDocument>,
+    bytes: usize,
+    clock: u64,
 }
 
 impl ParseCache {
     fn get_or_insert(&mut self, markdown: &str) -> Arc<Node> {
+        self.clock += 1;
         let key = cache_key(markdown);
-        if let Some((source, document)) = self.entries.get(&key)
-            && source == markdown
+        if let Some(entry) = self.entries.get_mut(&key)
+            && entry.source == markdown
         {
-            self.order.retain(|candidate| *candidate != key);
-            self.order.push_back(key);
-            return Arc::clone(document);
+            entry.last_used = self.clock;
+            return Arc::clone(&entry.document);
         }
         let document = Arc::new(parse(markdown));
-        self.entries.insert(key, (markdown.to_owned(), Arc::clone(&document)));
-        self.order.retain(|candidate| *candidate != key);
-        self.order.push_back(key);
-        while self.order.len() > MARKDOWN_CACHE_LIMIT {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
+        let entry = CachedDocument { source: markdown.to_owned(), document: Arc::clone(&document), last_used: self.clock };
+        self.bytes += entry.source.len();
+        if let Some(replaced) = self.entries.insert(key, entry) {
+            self.bytes -= replaced.source.len();
+        }
+        self.evict_least_recently_used();
+        document
+    }
+
+    /// The partial texts of an answer that is still arriving are never asked
+    /// for again, so they are the first to go.
+    fn evict_least_recently_used(&mut self) {
+        if self.bytes <= MARKDOWN_CACHE_MAX_BYTES && self.entries.len() <= MARKDOWN_CACHE_MAX_ENTRIES {
+            return;
+        }
+        let mut by_age: Vec<(u64, u64)> = self.entries.iter().map(|(key, entry)| (entry.last_used, *key)).collect();
+        by_age.sort_unstable();
+        for (_, key) in by_age {
+            // The newest entry stays even when it alone exceeds the limit.
+            if self.entries.len() <= 1
+                || (self.bytes <= MARKDOWN_CACHE_MAX_BYTES / 2 && self.entries.len() <= MARKDOWN_CACHE_MAX_ENTRIES / 2)
+            {
+                break;
+            }
+            if let Some(removed) = self.entries.remove(&key) {
+                self.bytes -= removed.source.len();
             }
         }
-        document
     }
 }
 
@@ -73,10 +105,7 @@ fn cache_key(value: &str) -> u64 {
 
 fn markdown_cache() -> &'static Mutex<ParseCache> {
     static CACHE: OnceLock<Mutex<ParseCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(ParseCache {
-        entries: HashMap::new(),
-        order: VecDeque::new(),
-    }))
+    CACHE.get_or_init(|| Mutex::new(ParseCache::default()))
 }
 
 fn cached_parse(markdown: &str) -> Arc<Node> {
@@ -1369,6 +1398,10 @@ fn highlighted_code_job(ui: &Ui, language: Option<&str>, code: &str) -> LayoutJo
     job
 }
 
+/// Enough highlighted blocks for a long conversation; below the number on
+/// screen, every frame would highlight the evicted ones again.
+const CODE_CACHE_LIMIT: usize = 512;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CodeCacheKey {
     language: String,
@@ -1393,7 +1426,7 @@ impl CodeCache {
         self.entries.insert(key.clone(), job);
         self.order.retain(|candidate| candidate != &key);
         self.order.push_back(key);
-        while self.order.len() > MARKDOWN_CACHE_LIMIT {
+        while self.order.len() > CODE_CACHE_LIMIT {
             if let Some(oldest) = self.order.pop_front() {
                 self.entries.remove(&oldest);
             }
@@ -2203,6 +2236,34 @@ HTML
         assert_eq!(latex_to_unicode("x^2"), "x²");
         assert_eq!(latex_to_unicode("\\leq"), "\\leq");
         assert_eq!(latex_to_unicode("a \\le b"), "a ≤ b");
+    }
+
+    #[test]
+    fn a_long_conversation_stays_parsed_between_frames() {
+        let mut cache = ParseCache::default();
+        let messages: Vec<String> = (0..200).map(|index| format!("message {index} **bold**")).collect();
+        let first: Vec<_> = messages.iter().map(|message| cache.get_or_insert(message)).collect();
+        // The next frame asks for the same texts and gets the same documents.
+        for (message, parsed) in messages.iter().zip(&first) {
+            assert!(Arc::ptr_eq(parsed, &cache.get_or_insert(message)));
+        }
+    }
+
+    #[test]
+    fn text_that_is_no_longer_asked_for_leaves_the_cache_first() {
+        let mut cache = ParseCache::default();
+        let kept = "the answer everyone still reads";
+        let original = cache.get_or_insert(kept);
+        // An arriving answer leaves one partial text behind per update.
+        let chunk = "x".repeat(64 * 1024);
+        let mut partial = String::new();
+        for _ in 0..(MARKDOWN_CACHE_MAX_BYTES / chunk.len() / 8) {
+            partial.push_str(&chunk);
+            cache.get_or_insert(&partial);
+            cache.get_or_insert(kept);
+        }
+        assert!(cache.bytes <= MARKDOWN_CACHE_MAX_BYTES);
+        assert!(Arc::ptr_eq(&original, &cache.get_or_insert(kept)));
     }
 
     #[test]
