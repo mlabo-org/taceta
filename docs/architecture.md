@@ -18,7 +18,7 @@ Web ON + Send は現在入力をローカルで判定し、その入力に対す
 
 ## インストール責務
 
-アプリは macOS のデフォルトブラウザーを検出し、初期対応の Brave / Chrome に限って、拡張を Taceta Application Support 配下へ materialize します。Native Messaging Host をそのユーザー専用のブラウザー領域へ登録し、version と固定 ID `hefhkgbiiajifedgjlbiklclooifkidg` を検証してから、拡張管理ページを開きます。利用者は Developer mode を ON にし、Load unpacked / Add で materialized `browser-extension` directory を選びます。この最後の browser approval は自動化しません。更新時は拡張管理ページで Reload を案内します。Safari 等は Brave / Chrome の導入とデフォルト設定へ案内し、未対応ブラウザーへの登録は行いません。
+アプリは macOS のデフォルトブラウザーを検出し、初期対応の Brave / Chrome に限って、拡張を Taceta Application Support 配下へ materialize します。Native Messaging Host をそのユーザー専用のブラウザー領域へ登録します。この materialize と登録は起動のたびに行います。登録の前に version の一致を確認し、登録する manifest は固定 ID `hefhkgbiiajifedgjlbiklclooifkidg` だけを許可します。固定 ID が manifest の key から導かれる値と一致することは、テストで検証します。拡張管理ページは自動では開きません。利用者は Developer mode を ON にし、Load unpacked / Add で materialized `browser-extension` directory を選びます。この最後の browser approval は自動化しません。更新時は拡張管理ページで Reload を案内します。Safari 等は Brave / Chrome の導入とデフォルト設定へ案内し、未対応ブラウザーへの登録は行いません。
 
 ## Grok接続と作業実行
 
@@ -78,7 +78,7 @@ Web ON + Send routes the current input locally and always creates one web turn f
 
 ## Installation responsibility
 
-The app detects the macOS default browser and supports Brave and Chrome initially. It materializes the extension under Taceta Application Support, registers the per-user Native Messaging Host, verifies version and fixed ID `hefhkgbiiajifedgjlbiklclooifkidg`, and opens the extension-management page. The user turns on Developer mode and chooses Load unpacked / Add for the materialized `browser-extension` directory. This final browser approval remains manual; it is not silently automated. Updates guide the user to press Reload. Safari and other unsupported browsers are directed to install Brave or Chrome and make one the default; no registration is attempted for an unsupported browser.
+The app detects the macOS default browser and supports Brave and Chrome initially. It materializes the extension under Taceta Application Support, and registers the per-user Native Messaging Host. Materialization and registration run at every start. Versions are checked before registration, and the registered manifest allows only the fixed ID `hefhkgbiiajifedgjlbiklclooifkidg`. That this ID is the one derived from the manifest key is verified by a test. The extension-management page is not opened automatically. The user turns on Developer mode and chooses Load unpacked / Add for the materialized `browser-extension` directory. This final browser approval remains manual; it is not silently automated. Updates guide the user to press Reload. Safari and other unsupported browsers are directed to install Brave or Chrome and make one the default; no registration is attempted for an unsupported browser.
 
 ## Grok connection and Agent execution
 
