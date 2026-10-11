@@ -534,13 +534,28 @@ pub fn delete_keychain_secret(account: &str) -> Result<(), WebError> {
     }
 }
 
-pub fn has_keychain_secret(account: &str) -> bool {
-    let account = match account {
-        "brave" => "brave",
-        "ollama" => "ollama",
-        _ => return false,
-    };
-    keychain_secret(account).is_some()
+/// Whether a provider key is stored, without reading the key itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeychainStatus {
+    Configured,
+    Missing,
+    /// The Keychain could not be asked: locked, access refused, or the lookup failed to run.
+    Unavailable,
+}
+
+pub fn keychain_status(account: &'static str) -> KeychainStatus {
+    // `security` exits with 44 (errSecItemNotFound) when no such item exists.
+    const ITEM_NOT_FOUND: i32 = 44;
+    match Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => KeychainStatus::Configured,
+        Ok(status) if status.code() == Some(ITEM_NOT_FOUND) => KeychainStatus::Missing,
+        _ => KeychainStatus::Unavailable,
+    }
 }
 
 /// Validates a URL before it is handed to a network-capable web provider or
