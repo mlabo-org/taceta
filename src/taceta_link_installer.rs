@@ -13,7 +13,7 @@ use thiserror::Error;
 
 pub const EXTENSION_ID: &str = "hefhkgbiiajifedgjlbiklclooifkidg";
 pub const HOST_NAME: &str = "org.mlabo.taceta.link";
-pub const EXTENSION_VERSION: &str = "0.1.0";
+pub const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RESOURCE_DIR_NAME: &str = "TacetaLink";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -413,6 +413,45 @@ fn launchservices_default_bundle_id() -> Result<String, InstallerError> {
 mod tests {
     use super::*;
     use std::fs;
+    /// The identities that must agree are spread over several source files;
+    /// this is the comparison that ships with every test run.
+    #[test]
+    fn extension_identity_and_versions_agree_across_the_repository() {
+        use base64::Engine;
+        use sha2::Digest;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |path: &str| fs::read_to_string(root.join(path)).unwrap();
+        let json = |path: &str| serde_json::from_str::<serde_json::Value>(&read(path)).unwrap();
+
+        let manifest = json("browser-extension/manifest.json");
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(manifest["key"].as_str().unwrap())
+            .unwrap();
+        // Chromium IDs spell the first 32 SHA-256 hex digits with a-p.
+        let id: String = sha2::Sha256::digest(key)
+            .iter()
+            .take(16)
+            .flat_map(|byte| [byte >> 4, byte & 0x0f])
+            .map(|nibble| char::from(b'a' + nibble))
+            .collect();
+        assert_eq!(id, EXTENSION_ID);
+        let template = json("browser-extension/native-host-manifest.template.json");
+        assert_eq!(template["name"], HOST_NAME);
+        assert_eq!(template["allowed_origins"][0], format!("chrome-extension://{EXTENSION_ID}/"));
+
+        let version = env!("CARGO_PKG_VERSION");
+        let protocol = crate::browser_harness::PROTOCOL_VERSION;
+        assert_eq!(manifest["version"], version);
+        assert_eq!(read("browser-extension/VERSION").trim(), version);
+        let contract = json("protocol/contract.json");
+        assert_eq!(contract["properties"]["product_version"]["const"], version);
+        assert_eq!(contract["properties"]["protocol_version"]["const"], protocol);
+        let script = read("browser-extension/protocol.js");
+        assert!(script.contains(&format!("export const PRODUCT_VERSION = \"{version}\";")));
+        assert!(script.contains(&format!("export const PROTOCOL_VERSION = {protocol};")));
+        assert!(!read("browser-extension/background.js").contains(&format!("\"{version}\"")));
+    }
+
     #[test]
     fn maps_browsers() {
         assert_eq!(
