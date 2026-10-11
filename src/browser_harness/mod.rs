@@ -277,22 +277,26 @@ impl Lifecycle {
     }
 }
 
-pub fn default_socket_path() -> Result<PathBuf, ProtocolError> {
+/// The private per-user directory that holds Taceta's socket.
+pub fn default_socket_root() -> Result<PathBuf, ProtocolError> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| ProtocolError::InvalidSocketPath(PathBuf::from("$HOME")))?;
-    Ok(PathBuf::from(home).join("Library/Application Support/Taceta/taceta-link.sock"))
+    Ok(PathBuf::from(home).join("Library/Application Support/Taceta"))
 }
 
-pub fn validate_socket_path(path: &Path) -> Result<(), ProtocolError> {
+pub fn default_socket_path() -> Result<PathBuf, ProtocolError> {
+    Ok(default_socket_root()?.join("taceta-link.sock"))
+}
+
+/// Accepts only a socket directly inside `root`, with a user-only directory
+/// and a user-only endpoint.
+pub fn validate_socket_path(root: &Path, path: &Path) -> Result<(), ProtocolError> {
     let path = path.to_path_buf();
-    let home =
-        std::env::var_os("HOME").ok_or_else(|| ProtocolError::InvalidSocketPath(path.clone()))?;
-    let expected_root = PathBuf::from(home).join("Library/Application Support/Taceta");
-    if !path.starts_with(&expected_root) || path.parent() != Some(expected_root.as_path()) {
+    if path.parent() != Some(root) {
         return Err(ProtocolError::InvalidSocketPath(path));
     }
-    let parent = std::fs::metadata(&expected_root)
-        .map_err(|_| ProtocolError::MissingSocket(expected_root.clone()))?;
+    let parent = std::fs::metadata(root)
+        .map_err(|_| ProtocolError::MissingSocket(root.to_path_buf()))?;
     let parent_mode = std::os::unix::fs::MetadataExt::mode(&parent) & 0o777;
     if parent_mode != 0o700 {
         return Err(ProtocolError::InsecureDirectoryMode(parent_mode));
@@ -324,16 +328,13 @@ pub struct SocketServer {
 
 #[cfg(unix)]
 impl SocketServer {
-    pub fn bind(path: &Path) -> Result<Self, ProtocolError> {
+    pub fn bind(root: &Path, path: &Path) -> Result<Self, ProtocolError> {
         let path = path.to_path_buf();
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| ProtocolError::InvalidSocketPath(path.clone()))?;
-        let root = PathBuf::from(home).join("Library/Application Support/Taceta");
-        if path.parent() != Some(root.as_path()) {
+        if path.parent() != Some(root) {
             return Err(ProtocolError::InvalidSocketPath(path));
         }
-        std::fs::create_dir_all(&root)?;
-        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        std::fs::create_dir_all(root)?;
+        std::fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
         if path.exists() {
             let metadata = std::fs::symlink_metadata(&path)?;
             if !metadata.file_type().is_socket() {
@@ -365,11 +366,12 @@ impl Drop for SocketServer {
 #[cfg(unix)]
 impl ConnectionManager {
     pub fn connect(
+        root: &Path,
         path: &Path,
         product_version: impl Into<String>,
         session_id: Uuid,
     ) -> Result<Self, ProtocolError> {
-        validate_socket_path(path)?;
+        validate_socket_path(root, path)?;
         Ok(Self {
             stream: std::os::unix::net::UnixStream::connect(path)?,
             session_id,
@@ -488,7 +490,7 @@ mod tests {
     fn socket_path_rejects_outside_root() {
         let p = PathBuf::from("/tmp/taceta-link.sock");
         assert!(matches!(
-            validate_socket_path(&p),
+            validate_socket_path(&default_socket_root().unwrap(), &p),
             Err(ProtocolError::InvalidSocketPath(_))
         ));
     }
@@ -496,8 +498,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn socket_roundtrip_preserves_correlation() {
-        let path = default_socket_path().unwrap().with_file_name("t.sock");
-        let server = SocketServer::bind(&path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let path = dir.join("t.sock");
+        let server = SocketServer::bind(&dir, &path).unwrap();
         let session = Uuid::new_v4();
         let thread = std::thread::spawn(move || {
             let mut stream = server.accept().unwrap();
@@ -511,7 +515,7 @@ mod tests {
             response.request_id = request.request_id;
             write_frame(&mut stream, &response).unwrap();
         });
-        let mut manager = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let mut manager = ConnectionManager::connect(&dir, &path, "0.1.0", session).unwrap();
         let request = Envelope::new(
             "0.1.0",
             session,
