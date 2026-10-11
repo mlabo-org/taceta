@@ -888,3 +888,54 @@ async fn cancellation_and_total_deadline_are_terminal_without_claiming_completio
                 && message.content.contains("One permitted read"))
     );
 }
+
+#[test]
+fn a_session_from_a_newer_build_is_refused_unchanged_and_can_still_be_archived() {
+    let fixture = Fixture::new();
+    let id = Uuid::new_v4();
+    let session = AgentSession::create(&fixture.store, id, &fixture.workspace).unwrap();
+    assert!(session.is_untouched());
+    let first = session.journal.directory.join(format!("{:020}.json", 1));
+    drop(session);
+
+    let original = fs::read_to_string(&first).unwrap();
+    assert!(original.contains(&format!("\"format\":{}", journal::FORMAT)));
+    let newer = original.replace(
+        &format!("\"format\":{}", journal::FORMAT),
+        &format!("\"format\":{}", journal::FORMAT + 1),
+    );
+    fs::write(&first, &newer).unwrap();
+    let error = AgentSession::open(&fixture.store, id).err().unwrap();
+    assert!(error.contains("newer Taceta"), "{error}");
+    assert_eq!(fs::read_to_string(&first).unwrap(), newer);
+
+    // The unreadable session can still be moved out of the way.
+    AgentSession::archive(&fixture.store, id).unwrap();
+    assert!(!fixture.store.join(id.to_string()).exists());
+    let archived: Vec<_> = fs::read_dir(fixture.store.join("archive")).unwrap().flatten().collect();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(
+        fs::read_to_string(archived[0].path().join(format!("{:020}.json", 1))).unwrap(),
+        newer
+    );
+}
+
+#[test]
+fn a_session_written_before_the_format_field_existed_still_opens() {
+    let fixture = Fixture::new();
+    let id = Uuid::new_v4();
+    let session = AgentSession::create(&fixture.store, id, &fixture.workspace).unwrap();
+    let first = session.journal.directory.join(format!("{:020}.json", 1));
+    drop(session);
+    let without_field = fs::read_to_string(&first)
+        .unwrap()
+        .replace(&format!(",\"format\":{}", journal::FORMAT), "");
+    assert!(!without_field.contains("format"));
+    fs::write(&first, without_field).unwrap();
+    let mut session = AgentSession::open(&fixture.store, id).unwrap();
+    assert!(session.is_untouched());
+    session
+        .import_messages(vec![AgentMessage::text(AgentRole::User, "earlier chat")])
+        .unwrap();
+    assert!(!session.is_untouched());
+}

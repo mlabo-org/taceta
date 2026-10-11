@@ -13,12 +13,23 @@ use std::{
 };
 
 const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+/// Raised when a record's meaning changes in a way an older build would
+/// misread. A build refuses sessions with a higher format than its own.
+pub(super) const FORMAT: u32 = 1;
+
+fn first_format() -> u32 {
+    1
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum EventData {
     Created {
         id: Uuid,
         workspace: PathBuf,
+        /// Record format the session was created with. Sessions written
+        /// before the field existed are format 1.
+        #[serde(default = "first_format")]
+        format: u32,
     },
     ImportedMessages {
         messages: Vec<AgentMessage>,
@@ -163,6 +174,7 @@ impl Journal {
         journal.append(EventData::Created {
             id,
             workspace: workspace.to_owned(),
+            format: FORMAT,
         })?;
         File::open(root)
             .and_then(|f| f.sync_all())
@@ -170,12 +182,18 @@ impl Journal {
         Ok(journal)
     }
 
-    pub fn open(root: &Path, id: Uuid) -> Result<Self, String> {
+    /// The session's directory, checked to be private, without reading its records.
+    pub fn locate(root: &Path, id: Uuid) -> Result<PathBuf, String> {
         private_directory(root)?;
         let directory = fs::canonicalize(root)
             .map_err(|e| e.to_string())?
             .join(id.to_string());
         private_directory(&directory)?;
+        Ok(directory)
+    }
+
+    pub fn open(root: &Path, id: Uuid) -> Result<Self, String> {
+        let directory = Self::locate(root, id)?;
         let mut files = Vec::new();
         let mut partials = Vec::new();
         for entry in fs::read_dir(&directory).map_err(|e| e.to_string())? {
@@ -217,7 +235,13 @@ impl Journal {
             records.push(record);
         }
         match records.first().map(|r| &r.event) {
-            Some(EventData::Created { id: stored, .. }) if *stored == id => {}
+            Some(EventData::Created { id: stored, format, .. }) if *stored == id => {
+                if *format > FORMAT {
+                    return Err(format!(
+                        "This task was saved by a newer Taceta (record format {format}); it was left unchanged"
+                    ));
+                }
+            }
             _ => {
                 return Err(
                     "Session has no valid creation record; existing data was retained".into(),
@@ -232,13 +256,19 @@ impl Journal {
     }
 
     pub fn lock(&self) -> Result<SessionLock, String> {
+        Self::lock_directory(&self.directory)
+    }
+
+    /// Takes the session's run lock by directory, so a session whose records
+    /// cannot be read can still be moved aside safely.
+    pub fn lock_directory(directory: &Path) -> Result<SessionLock, String> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(self.directory.join("run.lock"))
+            .open(directory.join("run.lock"))
             .map_err(|e| e.to_string())?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
         if !meta.is_file()
