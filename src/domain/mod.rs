@@ -190,10 +190,9 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub thinking: ThinkingMode,
     pub context_length: u32,
+    /// The provider chosen for this request when Web Search is on.
     #[serde(default)]
-    pub tools: Option<serde_json::Value>,
-    #[serde(default)]
-    pub web_search_provider: Option<String>,
+    pub web_search_provider: Option<crate::web_search::ProviderKind>,
     #[serde(default = "default_max_search_results")]
     pub max_search_results: u8,
     #[serde(default = "default_chatgpt_web_request_limit")]
@@ -251,7 +250,6 @@ pub enum GenerationEvent {
     ContentDelta(String),
     ReplaceContent(String),
     ExternalContentDelta { delta: String, replace: bool },
-    ToolCall(serde_json::Value),
     SearchProgress(String),
     Citation(String),
     Completed(GenerationStats),

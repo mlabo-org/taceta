@@ -957,7 +957,6 @@ impl TacetaApp {
                     message.content.push_str(&delta);
                 });
             }
-            GenerationEvent::ToolCall(_) => {}
             GenerationEvent::SearchProgress(progress) => {
                 // Progress is intentionally kept out of the transcript.  It is
                 // transient status, not conversation content, and therefore
@@ -1305,15 +1304,7 @@ impl TacetaApp {
             messages: request_messages,
             thinking: self.selected_thinking_mode(),
             context_length: self.state.context_length,
-            tools: if web_search_enabled {
-                Some(web_search::tool_definitions())
-            } else {
-                None
-            },
-            web_search_provider: web_search_request_config(
-                web_search_enabled,
-                self.state.web_search_provider,
-            ),
+            web_search_provider: web_search_enabled.then_some(self.state.web_search_provider),
             max_search_results: self.state.max_search_results,
             chatgpt_web_request_limit: self.state.chatgpt_web_request_limit,
             fetch_search_pages: self.state.fetch_search_pages,
@@ -4111,10 +4102,6 @@ fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
     .to_owned()
 }
 
-fn web_search_request_config(enabled: bool, provider: ProviderKind) -> Option<String> {
-    enabled.then(|| provider.wire_value().to_owned())
-}
-
 fn browser_provider_options() -> [ProviderKind; 2] {
     [ProviderKind::ChatGptWeb, ProviderKind::GoogleSearch]
 }
@@ -4916,19 +4903,6 @@ mod model_manager_tests {
 #[cfg(test)]
 mod web_search_request_tests {
     use super::*;
-
-    #[test]
-    fn request_uses_stable_provider_value_only_when_enabled() {
-        assert_eq!(
-            web_search_request_config(true, ProviderKind::Brave),
-            Some("brave".to_owned())
-        );
-        assert_eq!(
-            web_search_request_config(true, ProviderKind::Brave),
-            Some("brave".to_owned())
-        );
-        assert_eq!(web_search_request_config(false, ProviderKind::Ollama), None);
-    }
 
     #[test]
     fn provider_failures_are_separate_from_local_connection_failures() {

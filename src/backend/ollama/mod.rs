@@ -6,6 +6,7 @@ mod lifecycle;
 mod memory;
 mod router;
 mod stream;
+mod web_tools;
 
 pub use client::{OllamaClient, OllamaModelManager};
 pub use endpoint::{

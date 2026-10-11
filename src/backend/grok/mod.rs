@@ -114,8 +114,7 @@ impl GrokClient {
 
     async fn chat(&self, request: ChatRequest, events: UnboundedSender<GenerationEvent>) -> Result<(), String> {
         let work = async {
-            if request.web_search_provider.is_some() || request.web_authorization.is_some()
-                || request.tools.as_ref().is_some_and(|tools| !tools.is_null() && !tools.as_array().is_some_and(Vec::is_empty)) {
+            if request.web_search_provider.is_some() || request.web_authorization.is_some() {
                 return Err("Web search is not available in Grok chat. Use Taceta's agent tools through the explicit agent workflow.".into());
             }
             let model = self.model(&request.model).await?;

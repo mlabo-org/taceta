@@ -3,6 +3,7 @@ use super::{
     capability,
     endpoint::OllamaEndpoint,
     lifecycle, memory, router, stream,
+    web_tools::{self, ToolCall},
 };
 use crate::{
     backend::{BackendError, BackendFuture, InferenceBackend, ModelManager},
@@ -12,7 +13,7 @@ use crate::{
         normalize_chatgpt_web_request_limit,
     },
     taceta_link_service::{self, ChatGptPromptSource, LinkProgress, TacetaLinkService},
-    web_search::{self, ProviderKind, ToolCall, WebSearchProvider},
+    web_search::{self, ProviderKind, WebSearchProvider},
 };
 use futures_util::StreamExt;
 use std::collections::HashSet;
@@ -261,7 +262,10 @@ impl InferenceBackend for OllamaClient {
             }
             lifecycle::ensure_ready(&client.http, &client.endpoint).await?;
             memory::release_all_but(&client.http, &client.endpoint, &request.model).await?;
-            let tools = validate_tools(request.tools.as_ref())?;
+            if request.web_search_provider == Some(ProviderKind::Unknown) {
+                return Err(BackendError::Web("unsupported web search provider".into()));
+            }
+            let tools = request.web_search_provider.map(|_| web_tools::definitions());
             let mut routing_thinking = crate::domain::ThinkingCapability::Unverified;
             if tools.is_some() {
                 let show: ShowResponse = client
@@ -280,11 +284,7 @@ impl InferenceBackend for OllamaClient {
                 }
                 routing_thinking = capability::classify(&request.model, &show.details.family);
             }
-            let provider_kind = request
-                .web_search_provider
-                .as_deref()
-                .map(parse_provider)
-                .transpose()?;
+            let provider_kind = request.web_search_provider;
             let link_workflow = provider_kind.and_then(link_workflow);
             let provider = if link_workflow.is_some() {
                 None
@@ -419,8 +419,7 @@ impl InferenceBackend for OllamaClient {
                 });
                 let mut chatgpt_web_budget_exhausted = false;
                 for (index, raw) in streamed.tool_calls.into_iter().enumerate() {
-                    let call = web_search::parse_tool_call(&raw)
-                        .map_err(|e| BackendError::Web(e.to_string()))?;
+                    let call = web_tools::parse_call(&raw)?;
                     let (content, urls) = if index >= MAX_TOOL_CALLS_PER_ROUND {
                         let _ = events.send(GenerationEvent::SearchProgress(
                             "このラウンドの検索上限に達しました".into(),
@@ -587,30 +586,6 @@ fn message_is_model_context(message: &ChatMessage) -> bool {
     !message.interrupted
 }
 
-fn validate_tools(
-    tools: Option<&serde_json::Value>,
-) -> Result<Option<serde_json::Value>, BackendError> {
-    let Some(value) = tools else { return Ok(None) };
-    let Some(items) = value.as_array() else {
-        return Err(BackendError::Web(
-            "web tools must be a JSON array".into(),
-        ));
-    };
-    if items.is_empty()
-        || items.iter().any(|item| {
-            !matches!(
-                item["function"]["name"].as_str(),
-                Some("web_search" | "web_fetch")
-            )
-        })
-    {
-        return Err(BackendError::Web(
-            "unsupported web tool configuration".into(),
-        ));
-    }
-    Ok(Some(value.clone()))
-}
-
 async fn determine_web_route(
     client: &OllamaClient,
     request: &ChatRequest,
@@ -641,7 +616,7 @@ fn initial_web_search_call(
     request: &ChatRequest,
     route: &router::WebRouteDecision,
 ) -> Result<Option<(ToolCall, ForcedSearchTrigger)>, BackendError> {
-    if request.tools.is_none() {
+    if request.web_search_provider.is_none() {
         return Ok(None);
     }
     let (query, trigger) = match route {
@@ -900,18 +875,6 @@ impl ChatGptWebRequestBudget {
             ordinal: self.used,
             exhausted_after: self.used >= self.limit,
         }
-    }
-}
-
-fn parse_provider(value: &str) -> Result<ProviderKind, BackendError> {
-    match value {
-        "Brave" | "brave" => Ok(ProviderKind::Brave),
-        "Ollama" | "ollama" => Ok(ProviderKind::Ollama),
-        "Google Search" | "google_search" => Ok(ProviderKind::GoogleSearch),
-        "ChatGPT Web" | "chatgpt_web" => Ok(ProviderKind::ChatGptWeb),
-        _ => Err(BackendError::Web(
-            "unsupported web search provider".into(),
-        )),
     }
 }
 
@@ -1655,8 +1618,7 @@ mod tests {
             messages: vec![ChatMessage::new_assistant("岸田氏が現在の首相です")],
             thinking: ThinkingMode::On,
             context_length: 8192,
-            tools: Some(web_search::tool_definitions()),
-            web_search_provider: Some("chatgpt_web".into()),
+            web_search_provider: Some(ProviderKind::ChatGptWeb),
             max_search_results: 5,
             chatgpt_web_request_limit: 1,
             fetch_search_pages: false,
@@ -1705,8 +1667,7 @@ mod tests {
             messages: Vec::new(),
             thinking: ThinkingMode::Default,
             context_length: 8192,
-            tools: Some(web_search::tool_definitions()),
-            web_search_provider: Some("google_search".into()),
+            web_search_provider: Some(ProviderKind::GoogleSearch),
             max_search_results: 5,
             chatgpt_web_request_limit: 1,
             fetch_search_pages: false,
@@ -2077,9 +2038,9 @@ mod tests {
             tools.as_array().unwrap().iter()
                 .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned()).collect()
         };
-        let with_fetch = offered_web_tools(web_search::tool_definitions(), true);
+        let with_fetch = offered_web_tools(web_tools::definitions(), true);
         assert_eq!(names(&with_fetch), ["web_search", "web_fetch"]);
-        let search_only = offered_web_tools(web_search::tool_definitions(), false);
+        let search_only = offered_web_tools(web_tools::definitions(), false);
         assert_eq!(names(&search_only), ["web_search"]);
         assert!(!serde_json::to_string(&search_only).unwrap().contains("web_fetch"));
 
@@ -2088,30 +2049,6 @@ mod tests {
         assert!(!messages[0].content.contains("web_fetch"));
         prepare_web_research(&mut messages, false);
         assert_eq!(messages.len(), 1);
-    }
-
-    #[test]
-    fn web_tool_configuration_rejects_unknown_tools() {
-        assert!(validate_tools(Some(&serde_json::json!({"type":"function"}))).is_err());
-        assert!(
-            validate_tools(Some(&serde_json::json!([{
-                "type":"function", "function":{"name":"shell"}
-            }])))
-            .is_err()
-        );
-        assert!(
-            validate_tools(Some(&serde_json::json!([{
-                "type":"function", "function":{"name":"web_search"}
-            }])))
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn provider_configuration_is_explicit_and_unknown_values_fail() {
-        assert_eq!(parse_provider("brave").unwrap(), ProviderKind::Brave);
-        assert_eq!(parse_provider("ollama").unwrap(), ProviderKind::Ollama);
-        assert!(parse_provider("google").is_err());
     }
 
     #[test]
@@ -2127,12 +2064,10 @@ mod tests {
         for provider in [ProviderKind::Brave, ProviderKind::Ollama, ProviderKind::Unknown] {
             assert_eq!(link_workflow(provider), None);
         }
-        assert!(parse_provider("default_search").is_err());
     }
 
     #[test]
     fn web_synthesis_requires_initial_search_without_reading_history() {
-        let tools = Some(web_search::tool_definitions());
         let mut request = ChatRequest {
             model: "qwen3.8".into(),
             messages: vec![
@@ -2142,8 +2077,7 @@ mod tests {
             ],
             thinking: ThinkingMode::Default,
             context_length: 4096,
-            tools: tools.clone(),
-            web_search_provider: Some("chatgpt_web".into()),
+            web_search_provider: Some(ProviderKind::ChatGptWeb),
             max_search_results: 5,
             chatgpt_web_request_limit: 1,
             fetch_search_pages: false,
@@ -2169,7 +2103,7 @@ mod tests {
             "2026年9月3日時点の情報を、出典元URL付きで教えて"
         );
 
-        request.tools = None;
+        request.web_search_provider = None;
         assert!(
             initial_web_search_call(
                 &request,
