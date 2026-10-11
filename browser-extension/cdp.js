@@ -2,26 +2,6 @@ import { CDP } from "./workflows.js";
 
 const NAVIGATION_TIMEOUT_MS = 120_000;
 
-function pageScript(source) {
-  if (source.includes("extractReadableDocument")) return function extractReadableDocument(fallbackUrl = "") {
-    const textOf = (node) => String(node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
-    const bodyText = textOf(document.body);
-    if (/(captcha|unusual traffic|robot|ロボット|人間であること)/i.test(bodyText)) return { __error: "captcha_detected" };
-    const toPublicHttps = (value) => { try { const url = new URL(value || fallbackUrl, location.href); return url.protocol === "https:" && !url.username && !url.password ? url.href : null; } catch { return null; } };
-    const canonical = document.querySelector('link[rel="canonical"]')?.href;
-    const url = toPublicHttps(canonical || fallbackUrl);
-    if (!url) return { __error: "page_url_unavailable" };
-    const root = document.querySelector("article, main, [role='main']") || document.body;
-    const text = textOf(root);
-    if (!text) return { __error: "page_text_unavailable" };
-    const maximum = 120000;
-    return { url, title: String(document.title || "").trim(), text: text.slice(0, maximum), truncated: text.length > maximum, citations: [url] };
-  };
-  if (source.includes("node.replaceChildren")) return function fillComposer(value) { const node = document.querySelector('#prompt-textarea[contenteditable="true"][role="textbox"]'); if (!node) return { __error: "composer_missing" }; node.focus(); node.replaceChildren(document.createTextNode(value)); node.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value })); return null; };
-  if (source.includes("send-button") && source.includes("click")) return function clickSend() { document.querySelector('button[data-testid="send-button"]')?.click(); return null; };
-  return null;
-}
-
 export class CdpExecutor {
   constructor(chromeApi, scope) { this.chrome = chromeApi; this.scope = scope; this.attached = new Set(); this.navigationPending = false; }
   async attach() { const id = this.scope.ledger?.tabId; this.scope.validate(this.scope.ledger); await this.chrome.debugger.attach({ tabId: id }, "1.3"); await this.chrome.debugger.sendCommand({ tabId: id }, CDP.enable); this.attached.add(id); return id; }
@@ -29,5 +9,5 @@ export class CdpExecutor {
   async detach() { const id = this.scope.ledger?.tabId; if (!id || !this.attached.has(id)) return; await this.chrome.debugger.detach({ tabId: id }); this.attached.delete(id); }
   page() { return { navigate: (url) => this.send("navigate", { url }), goto: async (url, timeoutMs) => { await this.send("navigate", { url }); await this.waitForLoad(timeoutMs); }, waitForLoad: (timeout) => this.waitForLoad(timeout), waitForLoadState: (options) => this.waitForLoad(options?.timeoutMs), evaluate: (fn, ...args) => this.evaluate(fn, args) }; }
   async waitForLoad(timeout = NAVIGATION_TIMEOUT_MS) { const id = this.scope.ledger?.tabId; this.scope.validate(this.scope.ledger); const pending = this.navigationPending; const isComplete = async () => (await this.chrome.tabs.get(id))?.status === "complete"; if (!pending && await isComplete()) return; const event = this.chrome.webNavigation?.onCompleted; if (event?.addListener) { await new Promise((resolve, reject) => { const timer = setTimeout(() => { event.removeListener(listener); reject(Object.assign(new Error("navigation_timeout"), { code: "search_timeout" })); }, timeout || NAVIGATION_TIMEOUT_MS); const listener = (details) => { if (details?.tabId !== id || details.frameId !== 0) return; clearTimeout(timer); event.removeListener(listener); resolve(); }; event.addListener(listener); }); this.navigationPending = false; return; } const deadline = Date.now() + (timeout || NAVIGATION_TIMEOUT_MS); while (Date.now() < deadline) { if (await isComplete()) { this.navigationPending = false; return; } await new Promise((resolve) => setTimeout(resolve, 50)); } throw Object.assign(new Error("navigation_timeout"), { code: "search_timeout" }); }
-  async evaluate(fn, args = []) { if (typeof fn !== "function") throw new Error("page_evaluate_function_required"); const id = this.scope.ledger?.tabId; this.scope.validate(this.scope.ledger); const tab = await this.chrome.tabs.get(id); if (!tab || tab.id !== id || typeof tab.windowId !== "number" || tab.incognito === true || typeof tab.url !== "string") throw new Error("page_context_unavailable"); const func = pageScript(fn.toString()) || fn; let results; try { results = await this.chrome.scripting.executeScript({ target: { tabId: id }, func, args }); } catch (error) { throw Object.assign(new Error(String(error?.message || "page_evaluate_failed")), { code: error?.code || "page_evaluate_failed" }); } const value = results?.[0]?.result; if (value?.__error) throw Object.assign(new Error(value.__error), { code: value.__error }); return value; }
+  async evaluate(fn, args = []) { if (typeof fn !== "function") throw new Error("page_evaluate_function_required"); const id = this.scope.ledger?.tabId; this.scope.validate(this.scope.ledger); const tab = await this.chrome.tabs.get(id); if (!tab || tab.id !== id || typeof tab.windowId !== "number" || tab.incognito === true || typeof tab.url !== "string") throw new Error("page_context_unavailable"); let results; try { results = await this.chrome.scripting.executeScript({ target: { tabId: id }, func: fn, args }); } catch (error) { throw Object.assign(new Error(String(error?.message || "page_evaluate_failed")), { code: error?.code || "page_evaluate_failed" }); } const value = results?.[0]?.result; if (value?.__error) throw Object.assign(new Error(value.__error), { code: value.__error }); return value; }
 }

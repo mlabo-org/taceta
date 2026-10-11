@@ -1,7 +1,6 @@
 import { safeUrl } from "../selectors.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const MAX_TEXT_CHARS = 120_000;
 
 export class PageFetchError extends Error {
   constructor(code, message = code) {
@@ -11,39 +10,40 @@ export class PageFetchError extends Error {
   }
 }
 
-function pageText(node) {
-  return String(node?.innerText || node?.textContent || "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function publicUrl(value, fallback = "") {
-  const candidate = safeUrl(value || fallback);
-  return candidate || null;
-}
-
 /**
- * Extracts a bounded, readable page snapshot. It deliberately returns text
- * only: scripts, forms, cookies, and page instructions remain in the browser.
+ * Runs inside the fetched page, so it must not use anything from this module.
+ * Returns a bounded, readable snapshot as text only: scripts, forms, cookies,
+ * and page instructions remain in the browser. The reported URL is the one the
+ * tab actually loaded, never a URL the page declares about itself.
  */
-export function extractReadableDocument(documentLike, fallbackUrl = "") {
-  const bodyText = pageText(documentLike?.body);
-  if (/(captcha|unusual traffic|robot|ロボット|人間であること)/i.test(bodyText)) {
-    throw new PageFetchError("captcha_detected");
-  }
-  const canonical = documentLike?.querySelector?.('link[rel="canonical"]')?.href;
-  const url = publicUrl(canonical, fallbackUrl);
-  if (!url) throw new PageFetchError("page_url_unavailable");
-
-  const root = documentLike?.querySelector?.("article, main, [role='main']") || documentLike?.body;
-  const text = pageText(root);
-  if (!text) throw new PageFetchError("page_text_unavailable");
-  const truncated = text.length > MAX_TEXT_CHARS;
+export function readPageDocument() {
+  const textOf = (node) => String(node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
+  // Check challenge surfaces, not words in the page's own text.
+  const challenge = document.querySelector(
+    '#captcha-form, form[action*="/sorry/"], iframe[src*="recaptcha"], iframe[src*="hcaptcha.com"], iframe[src*="challenges.cloudflare.com"]',
+  );
+  if (challenge) return { __error: "captcha_detected" };
+  let url = null;
+  try {
+    const loaded = new URL(location.href);
+    const host = loaded.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const octets = host.split(".").map(Number);
+    const privateV4 = octets.length === 4 && octets.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)
+      && (octets[0] === 10 || octets[0] === 127 || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
+        || (octets[0] === 192 && octets[1] === 168) || (octets[0] === 169 && octets[1] === 254));
+    const local = host === "localhost" || host === "localhost.localdomain" || host === "::1" || privateV4;
+    if (loaded.protocol === "https:" && !loaded.username && !loaded.password && !local) url = loaded.href;
+  } catch { url = null; }
+  if (!url) return { __error: "page_url_unavailable" };
+  const root = document.querySelector("article, main, [role='main']") || document.body;
+  const text = textOf(root);
+  if (!text) return { __error: "page_text_unavailable" };
+  const maximum = 120000;
   return {
     url,
-    title: pageText(documentLike?.querySelector?.("title")) || "",
-    text: text.slice(0, MAX_TEXT_CHARS),
-    truncated,
+    title: String(document.title || "").trim(),
+    text: text.slice(0, maximum),
+    truncated: text.length > maximum,
     citations: [url],
   };
 }
@@ -69,8 +69,7 @@ export async function fetchPage({ tab, url, timeoutMs = DEFAULT_TIMEOUT_MS }) {
     await waitForTab(tab, timeoutMs);
   }
   if (typeof tab.evaluate !== "function") throw new PageFetchError("owned_tab_required");
-  return tab.evaluate(
-    (documentLike, fallbackUrl) => extractReadableDocument(documentLike, fallbackUrl),
-    target,
-  );
+  const snapshot = await tab.evaluate(readPageDocument);
+  if (snapshot?.__error) throw new PageFetchError(snapshot.__error);
+  return snapshot;
 }
