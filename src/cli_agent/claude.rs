@@ -421,7 +421,7 @@ impl Turn {
             let (detail, diff) = describe_input(name, input);
             let item = ToolItem {
                 id: id.to_owned(),
-                title: name.to_owned(),
+                title: tool_title(name, input),
                 detail,
                 diff,
                 status: ToolStatus::Running,
@@ -622,6 +622,24 @@ fn describe_input(tool: &str, input: &Value) -> (String, Option<String>) {
         _ => {}
     }
     (compact_input(input), None)
+}
+
+/// What a tool call is about, for a list of actions: the tool and the
+/// first line of its command, file, pattern or address.
+fn tool_title(tool: &str, input: &Value) -> String {
+    const SUBJECT_CHARS: usize = 80;
+    let subject = ["command", "file_path", "path", "pattern", "url", "query", "description"]
+        .iter()
+        .find_map(|key| input.get(*key).and_then(Value::as_str))
+        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+        .map(str::trim);
+    match subject {
+        Some(subject) if subject.chars().count() > SUBJECT_CHARS => {
+            format!("{tool}: {}…", subject.chars().take(SUBJECT_CHARS).collect::<String>())
+        }
+        Some(subject) => format!("{tool}: {subject}"),
+        None => tool.to_owned(),
+    }
 }
 
 fn render_diff(path: &str, removed: &str, added: &str) -> String {
@@ -853,7 +871,7 @@ mod tests {
     fn write_item(status: ToolStatus, detail: &str) -> ToolItem {
         ToolItem {
             id: "toolu_1".to_owned(),
-            title: "Write".to_owned(),
+            title: "Write: c1.txt".to_owned(),
             detail: detail.to_owned(),
             diff: Some("c1.txt\n+ hello\n+ world".to_owned()),
             status,
