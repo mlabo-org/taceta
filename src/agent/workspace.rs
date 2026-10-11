@@ -1956,7 +1956,7 @@ mod tests {
         for mode in ["cancel", "timeout", "drop"] {
             let workspace = Fixture::new();
             let prepared = workspace.tools().prepare(&call("run_command", json!({
-                "command":"/bin/sh -c 'while :; do printf tick >> heartbeat; /bin/sleep 0.05; done' & printf '%s' \"$!\" > child.pid; printf '%s' \"$TMPDIR\" > temporary.path; wait",
+                "command":"/bin/sh -c 'while :; do printf tick >> heartbeat; /bin/sleep 0.05; done' & child=$!; printf '%s' \"$TMPDIR\" > temporary.path; printf '%s' \"$child\" > child.pid; wait",
                 "timeout_ms":if mode == "timeout" { 700 } else { 5000 }
             }))).unwrap();
             let (sender, receiver) = watch::channel(false);
