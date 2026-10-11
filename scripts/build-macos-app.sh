@@ -67,6 +67,12 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 	<string>$PACKAGE_VERSION</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Taceta and the tools it starts for a task read and change files in the workspace you chose.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Taceta and the tools it starts for a task read and change files in the workspace you chose.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Taceta and the tools it starts for a task read and change files in the workspace you chose.</string>
 </dict>
 </plist>
 PLIST
