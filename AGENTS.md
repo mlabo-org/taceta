@@ -48,7 +48,7 @@ Validate the browser extension when its source, protocol, or packaged resources 
 
 ```bash
 node browser-extension/validate.mjs
-node --test browser-extension/*.test.mjs browser-extension/engines/*.test.mjs
+node --test browser-extension/*.test.mjs
 ```
 
 Materialize the release app through the repository-owned build script:
