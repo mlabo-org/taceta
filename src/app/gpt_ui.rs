@@ -593,7 +593,12 @@ impl TacetaApp {
                 }
                 for item in &session.tools {
                     super::show_action_row(ui, ("gpt-tool", conversation.id, &item.id),
-                        if item.completed { super::ActionMark::Done } else { super::ActionMark::Running }, &item.title, false,
+                        // Without a turn in progress, an action that never
+                        // reported back was cut off, not still running.
+                        if item.completed { super::ActionMark::Done }
+                        else if app.gpt_ui.active.as_ref().is_some_and(|active| active.conversation_id == conversation.id) { super::ActionMark::Running }
+                        else { super::ActionMark::Stopped },
+                        &item.title, false,
                         |ui| {
                             ScrollArea::both().id_salt(("gpt-output", &item.id)).max_height(480.0)
                                 .show(ui, |ui| { ui.monospace(&item.detail); });
