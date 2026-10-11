@@ -501,7 +501,7 @@ impl TacetaApp {
                 ));
             }
             for message in &conversation.messages {
-                app.show_message(ui, message, app.is_generating());
+                app.show_message(ui, message, false);
                 for (index, action) in message.actions.iter().enumerate() {
                     show_action(
                         ui,
@@ -529,9 +529,23 @@ impl TacetaApp {
                             tool.diff.as_deref(),
                         );
                     }
+                    // Says what is happening now, so a long turn is not a blank wait.
+                    let answer = conversation.messages.iter().find(|message| message.id == active.assistant_id);
+                    let running = active.tools.iter().rev().find(|tool| tool.status == ToolStatus::Running);
+                    let status = match (running, answer) {
+                        (Some(tool), _) => format!("{}: {}", text(language, "実行中", "Running"), tool.title),
+                        (None, Some(answer)) if !answer.content.is_empty() => {
+                            text(language, "回答を書いています…", "Writing the answer…").to_owned()
+                        }
+                        (None, _) if !active.tools.is_empty() => {
+                            text(language, "次の手順を考えています…", "Deciding the next step…").to_owned()
+                        }
+                        (None, Some(answer)) if !answer.thinking.is_empty() => text(language, "考えています…", "Thinking…").to_owned(),
+                        _ => text(language, "応答を待っています…", "Waiting for a response…").to_owned(),
+                    };
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(text(language, "作業中…", "Working…"));
+                        ui.label(RichText::new(status).weak());
                     });
                 }
             }
