@@ -740,13 +740,16 @@ impl TacetaApp {
                     if let Some(transcript) = transcript_message(id, index, message) {
                         app.show_message(ui, &transcript, false);
                     } else if message.role == AgentRole::Tool || external_tool_evidence(message).is_some() {
-                        egui::CollapsingHeader::new(
+                        super::show_action_row(
+                            ui,
+                            ("agent-tool", id, index),
+                            super::ActionMark::Done,
                             message.tool_name.as_deref().unwrap_or("Tool result"),
-                        )
-                        .id_salt(("agent-tool", id, index))
-                        .show(ui, |ui| {
-                            ui.label(external_tool_evidence(message).unwrap_or_else(|| message.content.clone()));
-                        });
+                            false,
+                            |ui| {
+                                ui.label(external_tool_evidence(message).unwrap_or_else(|| message.content.clone()));
+                            },
+                        );
                     }
                 }
             } else {

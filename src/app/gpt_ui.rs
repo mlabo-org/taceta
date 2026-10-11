@@ -92,7 +92,7 @@ impl TacetaApp {
                 ui.spinner();
                 ui.label(text(language, "GPT接続を解除しています…", "Disconnecting GPT…"));
             } else if !account_settings && matches!(self.connection, ConnectionState::Ready) {
-                ui.label(text(language, "ChatGPT接続済み", "ChatGPT connected"));
+                ui.label(RichText::new(text(language, "ChatGPT接続済み", "ChatGPT connected")).small().weak());
             } else {
                 if ui.add_enabled(!self.is_generating(), Button::new(text(language,
                     "ChatGPTにログイン", "Sign in with ChatGPT"))).clicked() {
@@ -214,11 +214,6 @@ impl TacetaApp {
                     "Chat disables access to the working environment. Taceta Link is not used.")
             }).small().weak());
             self.show_gpt_usage(ui);
-            if let Some(active) = &self.gpt_ui.active {
-                if active.conversation_id == self.state.active_conversation_id {
-                    ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label(&active.progress); });
-                }
-            }
         });
     }
 
@@ -592,23 +587,28 @@ impl TacetaApp {
             for message in &conversation.messages { app.show_message(ui, message, false); }
             if let Some(session) = &conversation.gpt {
                 if app.state.show_thinking_trace && !session.thinking.is_empty() {
-                    egui::CollapsingHeader::new(text(language, "思考過程", "Thinking trace"))
-                        .id_salt(("gpt-thinking", conversation.id)).default_open(true).show(ui, |ui| { ui.label(&session.thinking); });
+                    super::show_action_row(ui, ("gpt-thinking", conversation.id), super::ActionMark::Section,
+                        text(language, "思考過程", "Thinking trace"), true,
+                        |ui| { ui.label(RichText::new(session.thinking.trim_end()).weak()); });
                 }
                 for item in &session.tools {
-                    egui::CollapsingHeader::new(format!("{} {}", if item.completed { "✓" } else { "…" }, item.title))
-                        .id_salt(("gpt-tool", conversation.id, &item.id)).show(ui, |ui| {
+                    super::show_action_row(ui, ("gpt-tool", conversation.id, &item.id),
+                        if item.completed { super::ActionMark::Done } else { super::ActionMark::Running }, &item.title, false,
+                        |ui| {
                             ScrollArea::both().id_salt(("gpt-output", &item.id)).max_height(480.0)
                                 .show(ui, |ui| { ui.monospace(&item.detail); });
                         });
                 }
                 if !session.diff.is_empty() {
-                    egui::CollapsingHeader::new(text(language, "ファイルの変更差分", "File changes"))
-                        .id_salt(("gpt-diff", conversation.id)).show(ui, |ui| {
-                            ScrollArea::both().max_height(480.0).show(ui, |ui| { ui.monospace(&session.diff); });
-                        });
+                    super::show_action_row(ui, ("gpt-diff", conversation.id), super::ActionMark::Section,
+                        text(language, "ファイルの変更差分", "File changes"), false,
+                        |ui| { ScrollArea::both().max_height(480.0).show(ui, |ui| { ui.monospace(&session.diff); }); });
                 }
                 if let Some(error) = &session.error { ui.colored_label(theme::palette(ui).error, error); }
+            }
+            // What the running turn is doing, where the answer will appear.
+            if let Some(active) = app.gpt_ui.active.as_ref().filter(|active| active.conversation_id == conversation.id) {
+                ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label(RichText::new(&active.progress).weak()); });
             }
         });
     }

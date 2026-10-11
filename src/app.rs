@@ -1576,9 +1576,22 @@ impl TacetaApp {
                     .id_salt("conversation-history")
                     .auto_shrink([false, false])
                     // Only the rows in view exist, so rows scrolled away
-                    // cannot be reached by the pointer or assistive tools.
-                    .show_rows(ui, SIDEBAR_ROW_HEIGHT, history.len(), |ui, visible| {
-                        for (id, title, empty) in &history[visible] {
+                    // cannot be reached by the pointer or assistive tools,
+                    // and none lies under the footer below the list.
+                    .show_viewport(ui, |ui, viewport| {
+                        let pitch = SIDEBAR_ROW_HEIGHT + ui.spacing().item_spacing.y;
+                        ui.set_height((pitch * history.len() as f32 - ui.spacing().item_spacing.y).max(0.0));
+                        let first = ((viewport.min.y / pitch).floor().max(0.0) as usize).min(history.len());
+                        let last = ((viewport.max.y / pitch).ceil().max(0.0) as usize).clamp(first, history.len());
+                        let top = ui.max_rect().top() + first as f32 * pitch;
+                        let rows = egui::Rect::from_min_max(
+                            egui::pos2(ui.max_rect().left(), top),
+                            egui::pos2(ui.max_rect().right(), top + (last - first) as f32 * pitch),
+                        );
+                        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rows));
+                        let ui = &mut ui;
+                        ui.skip_ahead_auto_ids(first);
+                        for (id, title, empty) in &history[first..last] {
                             let (id, empty) = (*id, *empty);
                             let display_title = if empty {
                                 text(language, "新しいチャット", "New chat")
@@ -1605,10 +1618,11 @@ impl TacetaApp {
                             }
                             let mut rename_requested = false;
                             let mut delete_requested = false;
-                            let row = sidebar_row(ui, display_title, id == active_id);
+                            let current = id == active_id && self.screen == Screen::Chat;
+                            let row = sidebar_row(ui, display_title, current);
                             // The row's actions appear on the row the pointer
                             // is on, the current one, and the one whose menu is open.
-                            if ui.rect_contains_pointer(row.rect) || id == active_id || open_menu == Some(id) {
+                            if ui.rect_contains_pointer(row.rect) || current || open_menu == Some(id) {
                                 let menu_rect = egui::Rect::from_min_max(
                                     egui::pos2(row.rect.right() - SIDEBAR_ROW_MENU_WIDTH, row.rect.top()),
                                     row.rect.max,
@@ -1618,7 +1632,7 @@ impl TacetaApp {
                                 ui.painter().rect_filled(
                                     menu_rect,
                                     8.0,
-                                    if id == active_id { palette.selected } else { palette.hover },
+                                    if current { palette.selected } else { palette.hover },
                                 );
                                 let mut menu_ui = ui.new_child(
                                     egui::UiBuilder::new()
@@ -2169,6 +2183,7 @@ impl TacetaApp {
             16,
         )
         .show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.strong(text(language, "ローカル接続", "Local connection"));
             ui.add_space(4.0);
             ui.label(
@@ -2297,8 +2312,8 @@ impl TacetaApp {
         let language = self.language();
         let selected_model_context = self.selected_model().and_then(|model| model.context_length);
         CentralPanel::default().show_inside(root_ui, |ui| {
-            ScrollArea::vertical().show(ui, |ui| {
-                let width = ui.available_width().min(680.0);
+            ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let width = (ui.available_width() - 2.0 * READING_COLUMN_MARGIN).clamp(1.0, READING_COLUMN_WIDTH);
                 ui.horizontal(|ui| {
                     ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
                     ui.vertical(|ui| {
@@ -2328,6 +2343,7 @@ impl TacetaApp {
                             16,
                         )
                         .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             ui.strong(text(language, "表示", "Appearance"));
                             ui.add_space(12.0);
                             let change = show_app_shell_preferences(
@@ -2346,6 +2362,7 @@ impl TacetaApp {
                         ui.add_space(14.0);
                         let palette = theme::palette(ui);
                         theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             ui.strong(text(language, "モデル", "Models"));
                             ui.add_space(4.0);
                             ui.label(RichText::new(text(language, "インストール済みモデルを取得・確認・削除します。", "Download, inspect, and delete installed models.")).weak());
@@ -2358,6 +2375,7 @@ impl TacetaApp {
                         ui.add_space(14.0);
                         let palette = theme::palette(ui);
                         theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             ui.strong(text(language, "Web検索", "Web Search"));
                             if self.state.inference_provider == InferenceProvider::Gpt {
                                 ui.label(text(language, "GPTではTaceta LinkのWeb検索を使いません。", "GPT does not use Taceta Link Web Search."));
@@ -2496,6 +2514,7 @@ impl TacetaApp {
                             16,
                         )
                         .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             if self.state.inference_provider == InferenceProvider::Gpt {
                                 ui.strong(text(language, "GPTのコンテキスト", "GPT context"));
                                 self.show_gpt_usage(ui);
@@ -2673,18 +2692,29 @@ impl TacetaApp {
         if self.state.inference_provider != InferenceProvider::Ollama {
             let language = self.language();
             CentralPanel::default().show_inside(root_ui, |ui| {
-                ui.label(text(language, "モデル管理はOllamaのモデルが対象です。", "Model management is for Ollama models."));
-                if ui.button(text(language, "Ollamaに切り替える", "Switch to Ollama")).clicked() {
-                    self.select_provider(InferenceProvider::Ollama);
-                }
+                let width = (ui.available_width() - 2.0 * READING_COLUMN_MARGIN).clamp(1.0, READING_COLUMN_WIDTH);
+                ui.horizontal(|ui| {
+                    ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+                    ui.vertical(|ui| {
+                        ui.set_width(width);
+                        ui.add_space(28.0);
+                        ui.heading(text(language, "モデル管理", "Model Manager"));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(text(language, "モデル管理はOllamaのモデルが対象です。", "Model management is for Ollama models.")).weak());
+                        ui.add_space(12.0);
+                        if ui.button(text(language, "Ollamaに切り替える", "Switch to Ollama")).clicked() {
+                            self.select_provider(InferenceProvider::Ollama);
+                        }
+                    });
+                });
             });
             return;
         }
         let language = self.language();
         let candidate_list_height = model_candidate_list_height(root_ui.available_height());
         CentralPanel::default().show_inside(root_ui, |ui| {
-            ScrollArea::vertical().show(ui, |ui| {
-                let width = ui.available_width().min(820.0);
+            ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let width = (ui.available_width() - 2.0 * READING_COLUMN_MARGIN).clamp(1.0, READING_COLUMN_WIDTH);
                 ui.horizontal(|ui| {
                     ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
                     ui.vertical(|ui| {
@@ -3682,6 +3712,52 @@ pub(super) fn controls_strip(root_ui: &mut Ui, add_contents: impl FnOnce(&mut Ui
                 });
             });
         });
+}
+
+/// How an action shown in a conversation ended, or that it has not yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ActionMark {
+    Running,
+    Done,
+    Failed,
+    /// A section that is not an action, such as a thinking trace or a diff.
+    Section,
+}
+
+/// One action or section in a conversation: a quiet one-line row that opens
+/// to show its details. The title stays on one line however long it is.
+pub(super) fn show_action_row(
+    ui: &mut Ui,
+    id: impl std::hash::Hash,
+    mark: ActionMark,
+    title: &str,
+    default_open: bool,
+    add_body: impl FnOnce(&mut Ui),
+) {
+    let palette = theme::palette(ui);
+    let (symbol, color) = match mark {
+        ActionMark::Running => ("…", palette.weak_text),
+        ActionMark::Done => ("✓", palette.success),
+        ActionMark::Failed => ("✗", palette.error),
+        ActionMark::Section => ("", palette.weak_text),
+    };
+    let title = title.lines().find(|line| !line.trim().is_empty()).unwrap_or_default().trim();
+    theme::card(palette.thinking, palette.thinking, 8, 6).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            egui::Id::new(("taceta-action-row", id)),
+            default_open,
+        )
+        .show_header(ui, |ui| {
+            if !symbol.is_empty() {
+                ui.label(RichText::new(symbol).color(color));
+            }
+            ui.add(egui::Label::new(RichText::new(title).small().color(palette.weak_text)).truncate());
+        })
+        .body(|ui| add_body(ui));
+    });
+    ui.add_space(4.0);
 }
 
 fn show_notice_card(ui: &mut Ui, text_value: &str, color: egui::Color32) -> (bool, egui::Response) {
