@@ -118,10 +118,13 @@ impl CliAgent for GrokCli {
                 Ok(path) => path,
                 Err(error) => return RunOutcome::failed(session_id, error),
             };
-            if request.approval == ApprovalPolicy::AskEveryTime {
-                if let Err(error) = write_approval_plugin(&plugin_dir) {
-                    return RunOutcome::failed(session_id, error);
-                }
+            let written = match request.approval {
+                ApprovalPolicy::AskEveryTime => write_approval_plugin(&plugin_dir),
+                ApprovalPolicy::NoTools => write_refusal_plugin(&refusal_plugin_dir(&plugin_dir)),
+                ApprovalPolicy::FollowCli => Ok(()),
+            };
+            if let Err(error) = written {
+                return RunOutcome::failed(session_id, error);
             }
             let args = agent_args(request.approval, &plugin_dir);
             let process = match CliProcess::spawn(&executable, &args, &request.workspace) {
@@ -159,13 +162,20 @@ async fn read_version(executable: &Path) -> Result<Option<String>, String> {
         .map(str::to_owned))
 }
 
-/// Arguments for starting the CLI as an ACP agent. Taceta's approval hook is
-/// loaded as a plugin only when every action must be asked about.
+/// Arguments for starting the CLI as an ACP agent. Taceta's hook is loaded
+/// as a plugin when every action must be asked about, or refused.
 fn agent_args(approval: ApprovalPolicy, plugin_dir: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["agent".into()];
-    if approval == ApprovalPolicy::AskEveryTime {
-        args.push("--plugin-dir".into());
-        args.push(plugin_dir.as_os_str().to_owned());
+    match approval {
+        ApprovalPolicy::AskEveryTime => {
+            args.push("--plugin-dir".into());
+            args.push(plugin_dir.as_os_str().to_owned());
+        }
+        ApprovalPolicy::NoTools => {
+            args.push("--plugin-dir".into());
+            args.push(refusal_plugin_dir(plugin_dir).into_os_string());
+        }
+        ApprovalPolicy::FollowCli => {}
     }
     args.push("stdio".into());
     args
@@ -196,10 +206,33 @@ esac
     )
 }
 
+/// The CLI has no switch that starts it without tools, so a conversation
+/// without tools refuses each call through the same documented hook.
+const REFUSAL_SCRIPT: &str = r#"#!/bin/sh
+# Written by Taceta. Refuses every tool: this conversation has none.
+cat > /dev/null
+printf '%s\n' '{"decision":"deny","reason":"This conversation has no tools. Answer from the conversation itself."}'
+"#;
+
+/// The refusing plugin lives beside the asking one.
+fn refusal_plugin_dir(approval_plugin_dir: &Path) -> PathBuf {
+    let mut name = approval_plugin_dir.file_name().unwrap_or_default().to_os_string();
+    name.push("NoTools");
+    approval_plugin_dir.with_file_name(name)
+}
+
+fn write_approval_plugin(dir: &Path) -> Result<(), String> {
+    write_hook_plugin(dir, &ask_script())
+}
+
+fn write_refusal_plugin(dir: &Path) -> Result<(), String> {
+    write_hook_plugin(dir, REFUSAL_SCRIPT)
+}
+
 /// Writes `<dir>/hooks/hooks.json` and `<dir>/hooks/ask.sh`, replacing any
 /// stale content. The directories and the script are readable by the user
 /// only.
-fn write_approval_plugin(dir: &Path) -> Result<(), String> {
+fn write_hook_plugin(dir: &Path, script: &str) -> Result<(), String> {
     if !dir.is_absolute() {
         return Err(format!(
             "The approval plugin directory must be absolute: {}",
@@ -222,7 +255,7 @@ fn write_approval_plugin(dir: &Path) -> Result<(), String> {
     create_private_dir(dir)?;
     create_private_dir(&hooks_dir)?;
     replace_file(&hooks_dir.join("hooks.json"), hooks_text.as_bytes(), 0o600)?;
-    replace_file(&script_path, ask_script().as_bytes(), 0o700)
+    replace_file(&script_path, script.as_bytes(), 0o700)
 }
 
 fn create_private_dir(path: &Path) -> Result<(), String> {
@@ -2153,6 +2186,33 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn a_conversation_without_tools_loads_a_plugin_that_refuses_every_call() {
+        let root = tempfile::tempdir().unwrap();
+        let asking = root.path().join("GrokApprovalPlugin");
+        let refusing = refusal_plugin_dir(&asking);
+        assert_eq!(refusing, root.path().join("GrokApprovalPluginNoTools"));
+        assert_eq!(
+            agent_args(ApprovalPolicy::NoTools, &asking),
+            [OsString::from("agent"), "--plugin-dir".into(), refusing.clone().into_os_string(), "stdio".into()]
+        );
+        write_refusal_plugin(&refusing).unwrap();
+        // Whatever the tool, the hook answers with a refusal on one line.
+        for input in [r#"{"toolName":"Read"}"#, r#"{"toolName":"Bash"}"#, ""] {
+            let mut child = std::process::Command::new(refusing.join("hooks/ask.sh"))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            let line = String::from_utf8(output.stdout).unwrap();
+            assert!(line.ends_with('\n') && line.lines().count() == 1, "{line:?}");
+            let decision: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(decision["decision"], "deny");
+        }
     }
 
     #[test]

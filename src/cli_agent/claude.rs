@@ -121,6 +121,8 @@ async fn probe(executable: &Path, args: &[&str]) -> Option<Vec<u8>> {
     Some(output.stdout)
 }
 
+const NO_TOOLS_NOTE: &str = "This is a conversation without tools: no tool is available in this session. Answer from the conversation itself and say so when something would need a tool.";
+
 /// The arguments that start one stream-json turn. The prompt itself goes over
 /// stdin, so it never appears in the process list.
 fn build_args(request: &RunRequest) -> Vec<OsString> {
@@ -138,8 +140,15 @@ fn build_args(request: &RunRequest) -> Vec<OsString> {
     .into_iter()
     .map(OsString::from)
     .collect();
-    if request.approval == ApprovalPolicy::AskEveryTime {
-        args.extend(["--permission-mode", "manual"].map(OsString::from));
+    match request.approval {
+        ApprovalPolicy::AskEveryTime => args.extend(["--permission-mode", "manual"].map(OsString::from)),
+        ApprovalPolicy::FollowCli => {}
+        // No built-in tools and no MCP servers. Manual mode stays on so that
+        // anything that still asked would come to Taceta, which refuses it.
+        ApprovalPolicy::NoTools => args.extend(
+            ["--permission-mode", "manual", "--tools", "", "--strict-mcp-config", "--append-system-prompt", NO_TOOLS_NOTE]
+                .map(OsString::from),
+        ),
     }
     if let Some(model) = &request.model {
         args.extend([OsString::from("--model"), OsString::from(model)]);
@@ -1105,6 +1114,13 @@ mod tests {
         assert_eq!(ask, [&base[..], &["--permission-mode", "manual"]].concat());
         let follow = strings(build_args(&request(ApprovalPolicy::FollowCli)));
         assert_eq!(follow, base);
+        // A conversation without tools starts with no built-in tool and no MCP server.
+        let none = strings(build_args(&request(ApprovalPolicy::NoTools)));
+        assert_eq!(&none[..base.len()], base);
+        assert_eq!(
+            &none[base.len()..],
+            ["--permission-mode", "manual", "--tools", "", "--strict-mcp-config", "--append-system-prompt", NO_TOOLS_NOTE]
+        );
     }
 
     #[test]
