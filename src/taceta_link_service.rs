@@ -1,8 +1,6 @@
 //! App-owned client for the browser extension's Native Messaging bridge.
 //! The browser is an executor only: returned page text is untrusted context.
 
-#[cfg(test)]
-use crate::browser_harness::default_socket_path;
 use crate::browser_harness::{Envelope, LifecycleState, MutationState, Operation, ProtocolError};
 use crate::domain::{ChatMessage, Role, WebAuthorization, WebWorkflow};
 use serde::{Deserialize, Serialize};
@@ -905,15 +903,17 @@ mod tests {
     fn heartbeat_starts_disconnected_and_valid_request_marks_connected() {
         let service = TacetaLinkService::default();
         assert!(!service.is_extension_connected());
-        let path = default_socket_path().unwrap().with_file_name("health.sock");
-        let server = crate::browser_harness::SocketServer::bind(&path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let path = dir.join("health.sock");
+        let server = crate::browser_harness::SocketServer::bind(&dir, &path).unwrap();
         let service_for_server = service.clone();
         let session = Uuid::new_v4();
         let worker = std::thread::spawn(move || {
             let stream = server.accept().unwrap();
             service_for_server.serve_connection(stream).unwrap();
         });
-        let mut client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let mut client = ConnectionManager::connect(&dir, &path, "0.1.0", session).unwrap();
         let request = Envelope::new("0.1.0", session, Operation::Health, serde_json::json!({}));
         client.send(&request).unwrap();
         let _: Envelope<Value> = client.receive().unwrap();
@@ -924,17 +924,17 @@ mod tests {
     #[test]
     fn invalid_protocol_request_does_not_mark_connected() {
         let service = TacetaLinkService::default();
-        let path = default_socket_path()
-            .unwrap()
-            .with_file_name("invalid-health.sock");
-        let server = crate::browser_harness::SocketServer::bind(&path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let path = dir.join("invalid-health.sock");
+        let server = crate::browser_harness::SocketServer::bind(&dir, &path).unwrap();
         let service_for_server = service.clone();
         let session = Uuid::new_v4();
         let worker = std::thread::spawn(move || {
             let stream = server.accept().unwrap();
             assert!(service_for_server.serve_connection(stream).is_err());
         });
-        let mut client = ConnectionManager::connect(&path, "wrong-version", session).unwrap();
+        let mut client = ConnectionManager::connect(&dir, &path, "wrong-version", session).unwrap();
         let request = Envelope::new(
             "wrong-version",
             session,
@@ -1023,15 +1023,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unknown_job_result_is_not_acknowledged_as_accepted() {
-        let path = default_socket_path().unwrap().with_file_name("service-unknown-result.sock");
-        let server = crate::browser_harness::SocketServer::bind(&path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let path = dir.join("service-unknown-result.sock");
+        let server = crate::browser_harness::SocketServer::bind(&dir, &path).unwrap();
         let service = TacetaLinkService::default();
         let worker = std::thread::spawn(move || {
             let stream = server.accept().unwrap();
             service.serve_connection(stream).unwrap();
         });
         let session = Uuid::new_v4();
-        let mut client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let mut client = ConnectionManager::connect(&dir, &path, "0.1.0", session).unwrap();
         let request = Envelope::new(
             "0.1.0",
             session,
@@ -1050,15 +1052,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cancel_ack_reports_unsupported_instead_of_false_success() {
-        let path = default_socket_path().unwrap().with_file_name("service-cancel.sock");
-        let server = crate::browser_harness::SocketServer::bind(&path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let path = dir.join("service-cancel.sock");
+        let server = crate::browser_harness::SocketServer::bind(&dir, &path).unwrap();
         let service = TacetaLinkService::default();
         let worker = std::thread::spawn(move || {
             let stream = server.accept().unwrap();
             service.serve_connection(stream).unwrap();
         });
         let session = Uuid::new_v4();
-        let mut client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let mut client = ConnectionManager::connect(&dir, &path, "0.1.0", session).unwrap();
         let request = Envelope::new(
             "0.1.0", session, Operation::Cancel, serde_json::json!({"job_id": Uuid::new_v4()}),
         );
@@ -1108,10 +1112,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn socket_forwards_chatgpt_progress_before_final_result() {
-        let path = default_socket_path()
-            .unwrap()
-            .with_file_name("service-progress.sock");
-        let server = crate::browser_harness::SocketServer::bind(&path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let path = dir.join("service-progress.sock");
+        let server = crate::browser_harness::SocketServer::bind(&dir, &path).unwrap();
         let service = TacetaLinkService::default();
         let job_id = Uuid::new_v4();
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1126,7 +1130,7 @@ mod tests {
             service_for_worker.serve_connection(stream).unwrap();
         });
         let session = Uuid::new_v4();
-        let mut client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let mut client = ConnectionManager::connect(&dir, &path, "0.1.0", session).unwrap();
         let request = Envelope::new(
             "0.1.0",
             session,
@@ -1153,10 +1157,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn socket_poll_job_result_roundtrip() {
-        let path = default_socket_path()
-            .unwrap()
-            .with_file_name("service-roundtrip.sock");
-        let server = crate::browser_harness::SocketServer::bind(&path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let path = dir.join("service-roundtrip.sock");
+        let server = crate::browser_harness::SocketServer::bind(&dir, &path).unwrap();
         let session = Uuid::new_v4();
         let auth = WebAuthorization {
             request_id: Uuid::new_v4(),
@@ -1173,7 +1177,7 @@ mod tests {
                 service.serve_connection(stream).unwrap();
             }
         });
-        let mut client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let mut client = ConnectionManager::connect(&dir, &path, "0.1.0", session).unwrap();
         let poll = Envelope::new("0.1.0", session, Operation::PollJob, serde_json::json!({}));
         client.send(&poll).unwrap();
         let response: Envelope<Value> = client.receive().unwrap();
@@ -1192,7 +1196,7 @@ mod tests {
             response.payload["job"]["authorization"]["session_id"],
             job.authorization.session_id.to_string()
         );
-        let mut result_client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let mut result_client = ConnectionManager::connect(&dir, &path, "0.1.0", session).unwrap();
         let wrong_workflow = Envelope::new(
             "0.1.0", session, Operation::JobResult,
             serde_json::json!({"job_id":job.job_id,"workflow":"page_fetch","status":"completed","mutation_state":"performed"}),
@@ -1201,7 +1205,7 @@ mod tests {
         let wrong_ack: Envelope<Value> = result_client.receive().unwrap();
         assert_eq!(wrong_ack.payload["accepted"], false);
         let wrong_session = Uuid::new_v4();
-        let mut wrong_session_client = ConnectionManager::connect(&path, "0.1.0", wrong_session).unwrap();
+        let mut wrong_session_client = ConnectionManager::connect(&dir, &path, "0.1.0", wrong_session).unwrap();
         let wrong_session_request = Envelope::new(
             "0.1.0", wrong_session, Operation::JobResult,
             serde_json::json!({"job_id":job.job_id,"workflow":"google_search","status":"completed","mutation_state":"performed"}),
@@ -1209,7 +1213,7 @@ mod tests {
         wrong_session_client.send(&wrong_session_request).unwrap();
         let wrong_session_ack: Envelope<Value> = wrong_session_client.receive().unwrap();
         assert_eq!(wrong_session_ack.payload["accepted"], false);
-        let mut result_client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let mut result_client = ConnectionManager::connect(&dir, &path, "0.1.0", session).unwrap();
         let result_request = Envelope::new(
             "0.1.0",
             session,
@@ -1220,7 +1224,7 @@ mod tests {
         let ack: Envelope<Value> = result_client.receive().unwrap();
         assert_eq!(ack.operation, Operation::JobResult);
         assert_eq!(ack.payload["accepted"], true);
-        let mut duplicate_client = ConnectionManager::connect(&path, "0.1.0", session).unwrap();
+        let mut duplicate_client = ConnectionManager::connect(&dir, &path, "0.1.0", session).unwrap();
         duplicate_client.send(&result_request).unwrap();
         let duplicate_ack: Envelope<Value> = duplicate_client.receive().unwrap();
         assert_eq!(duplicate_ack.payload["accepted"], false);

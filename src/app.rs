@@ -205,8 +205,11 @@ impl TacetaApp {
         };
         #[cfg(unix)]
         {
-            if let Ok(path) = taceta::browser_harness::default_socket_path() {
-                if let Ok(server) = taceta::browser_harness::SocketServer::bind(&path) {
+            if let (Ok(root), Ok(path)) = (
+                taceta::browser_harness::default_socket_root(),
+                taceta::browser_harness::default_socket_path(),
+            ) {
+                if let Ok(server) = taceta::browser_harness::SocketServer::bind(&root, &path) {
                     let service = Arc::clone(&link_service);
                     std::thread::Builder::new()
                         .name("taceta-link-socket".into())

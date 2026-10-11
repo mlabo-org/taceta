@@ -1,6 +1,6 @@
 use std::io::{self, BufReader, BufWriter};
 use taceta::browser_harness::{
-    ConnectionManager, Envelope, MessageType, ProtocolError, default_socket_path, read_frame,
+    ConnectionManager, Envelope, MessageType, ProtocolError, default_socket_path, default_socket_root, read_frame,
     validate_envelope, write_frame,
 };
 
@@ -23,6 +23,7 @@ fn main() -> Result<(), ProtocolError> {
             return Err(ProtocolError::CorrelationMismatch);
         }
         let mut manager = ConnectionManager::connect(
+            &default_socket_root()?,
             &default_socket_path()?,
             env!("CARGO_PKG_VERSION"),
             request.session_id,
