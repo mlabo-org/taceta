@@ -41,6 +41,10 @@ pub struct GptConversation {
     /// when the user explicitly starts this new Codex thread.
     pub handoff_from_taceta: bool,
     pub pending_handoff: bool,
+    /// How many of the conversation's messages the Codex thread already
+    /// holds. Later ones came from another engine and are handed over with
+    /// the next request.
+    pub seen_messages: usize,
 }
 
 /// One coding CLI's own session for a conversation. The conversation's
@@ -76,6 +80,10 @@ pub struct Conversation {
     pub gpt_ownership_revision: u64,
     pub cli_sessions: HashMap<InferenceProvider, CliSession>,
     pub cli_usage: Option<GptUsage>,
+    /// How many of the messages Taceta's own task record holds. `None` until
+    /// the record has been written back once; messages after this count came
+    /// from another engine and are imported into the record on the next run.
+    pub task_seen_messages: Option<usize>,
 }
 
 impl Default for Conversation {
@@ -94,6 +102,7 @@ impl Default for Conversation {
             gpt_ownership_revision: 0,
             cli_sessions: HashMap::new(),
             cli_usage: None,
+            task_seen_messages: None,
         }
     }
 }
@@ -296,39 +305,40 @@ impl PersistedAppState {
         if self.active_conversation().provider.is_none() {
             self.active_conversation_mut().provider = Some(current_provider);
         }
+        // A task from Taceta's own runner carries richer state than its
+        // transcript, so it reaches GPT through the task handoff.
         let transfer_work = provider == InferenceProvider::Gpt
+            && current_provider == InferenceProvider::Ollama
             && !self.active_conversation().is_gpt()
             && self.active_conversation().agent_enabled
             && self.active_conversation().workspace.is_some()
-            && self.active_conversation().has_history();
-        if transfer_work {
-            self.remember_provider_model(provider);
-            let conversation = self.active_conversation_mut();
-            conversation.provider = Some(provider);
-            conversation.web_search_enabled = false;
-            conversation.gpt = Some(GptConversation { handoff_from_taceta: true, pending_handoff: true, ..Default::default() });
-            conversation.gpt_ownership_revision = conversation.gpt_ownership_revision.saturating_add(1);
-            self.pending_attachments.clear();
-            return;
-        }
-        let crosses_history_owner = self.active_conversation().is_gpt()
-            != (provider == InferenceProvider::Gpt);
-        let preserve_current = crosses_history_owner && self.active_conversation().has_history();
+            && self.active_conversation().has_history()
+            && self.active_conversation().gpt.is_none();
         self.remember_provider_model(provider);
-        if preserve_current {
-            self.start_new_conversation();
-        } else {
-            let conversation = self.active_conversation_mut();
-            if crosses_history_owner {
-                conversation.agent_enabled = provider == InferenceProvider::Gpt;
-                conversation.gpt = (provider == InferenceProvider::Gpt)
-                    .then(GptConversation::default);
-                conversation.workspace = None;
-                conversation.web_search_enabled = false;
-                self.pending_attachments.clear();
-            }
-            self.active_conversation_mut().provider = Some(provider);
+        let conversation = self.active_conversation_mut();
+        conversation.provider = Some(provider);
+        if provider != InferenceProvider::Ollama {
+            conversation.web_search_enabled = false;
         }
+        if transfer_work {
+            conversation.gpt = Some(GptConversation {
+                handoff_from_taceta: true,
+                pending_handoff: true,
+                seen_messages: conversation.messages.len(),
+                ..Default::default()
+            });
+            conversation.gpt_ownership_revision = conversation.gpt_ownership_revision.saturating_add(1);
+        } else if provider == InferenceProvider::Gpt {
+            // GPT starts in coding mode; a conversation that already has
+            // turns keeps the mode it was in.
+            if !conversation.has_history() {
+                conversation.agent_enabled = true;
+            }
+            // The conversation continues; its Codex thread, if it has one,
+            // is given the turns it missed with the next request.
+            conversation.gpt.get_or_insert_with(GptConversation::default);
+        }
+        self.pending_attachments.clear();
     }
 
     pub fn select_conversation(&mut self, id: Uuid) -> bool {
@@ -343,16 +353,23 @@ impl PersistedAppState {
         true
     }
 
-    /// A Codex thread's execution environment is fixed for its lifetime.
+    /// A Codex thread's execution environment is fixed for its lifetime, so
+    /// changing it retires the thread. The conversation continues: the next
+    /// request starts a new thread and hands it the conversation so far.
     pub fn configure_gpt_environment(&mut self, coding: bool, workspace: Option<std::path::PathBuf>) {
         let current = self.active_conversation();
         if !current.is_gpt() || (current.agent_enabled == coding && current.workspace == workspace) {
             return;
         }
-        if current.has_history() {
-            self.start_new_conversation();
-        }
         let conversation = self.active_conversation_mut();
+        if let Some(session) = conversation.gpt.as_mut() {
+            if let Some(thread_id) = session.thread_id.take() {
+                if !conversation.archived_gpt_thread_ids.contains(&thread_id) {
+                    conversation.archived_gpt_thread_ids.push(thread_id);
+                }
+            }
+            *session = GptConversation::default();
+        }
         conversation.agent_enabled = coding;
         conversation.workspace = workspace;
     }
@@ -664,53 +681,71 @@ mod tests {
     }
 
     #[test]
-    fn gpt_chat_provider_crossing_preserves_histories_and_restores_the_selected_owner() {
+    fn switching_providers_keeps_the_conversation_and_each_engines_own_session() {
         let mut state = PersistedAppState::default();
         state.active_conversation_mut().messages.push(ChatMessage::new_user("local conversation"));
-        let local_id = state.active_conversation_id;
-        state.switch_provider(InferenceProvider::Grok);
-        assert_eq!(state.active_conversation_id, local_id);
-        state.switch_provider(InferenceProvider::Gpt);
-        let gpt_id = state.active_conversation_id;
-        assert_ne!(gpt_id, local_id);
-        assert!(state.active_conversation().agent_enabled);
-        assert!(state.active_conversation().messages.is_empty());
-        state.active_conversation_mut().gpt.as_mut().unwrap().thread_id = Some("thread-1".into());
+        let id = state.active_conversation_id;
+        for provider in [InferenceProvider::Grok, InferenceProvider::Gpt] {
+            state.switch_provider(provider);
+            assert_eq!(state.active_conversation_id, id);
+            assert_eq!(state.inference_provider, provider);
+            assert_eq!(state.active_conversation().messages[0].content, "local conversation");
+        }
+        assert_eq!(state.conversations.len(), 1);
+        // A chat that moves to GPT stays a chat there.
+        assert!(!state.active_conversation().agent_enabled);
+        let session = state.active_conversation_mut().gpt.as_mut().unwrap();
+        session.thread_id = Some("thread-1".into());
+        session.seen_messages = 1;
+
+        // Leaving GPT and coming back finds the same thread.
         state.switch_provider(InferenceProvider::Ollama);
-        assert_ne!(state.active_conversation_id, gpt_id);
-        assert_eq!(state.conversations.len(), 3);
-        assert!(state.select_conversation(local_id));
-        assert_eq!(state.inference_provider, InferenceProvider::Grok);
-        assert_eq!(state.active_conversation().messages[0].content, "local conversation");
-        assert!(state.select_conversation(gpt_id));
-        assert_eq!(state.inference_provider, InferenceProvider::Gpt);
+        state.switch_provider(InferenceProvider::Claude);
+        state.switch_provider(InferenceProvider::Gpt);
+        assert_eq!(state.active_conversation_id, id);
+        let session = state.active_conversation().gpt.as_ref().unwrap();
+        assert_eq!((session.thread_id.as_deref(), session.seen_messages), (Some("thread-1"), 1));
+
+        // A different mode or workspace retires the thread, not the conversation.
         state.configure_gpt_environment(true, Some("/fixture/other".into()));
-        assert_ne!(state.active_conversation_id, gpt_id);
-        assert_eq!(state.conversations.iter().find(|chat| chat.id == gpt_id).unwrap().gpt.as_ref().unwrap().thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(state.active_conversation_id, id);
+        let conversation = state.active_conversation();
+        assert_eq!(conversation.archived_gpt_thread_ids, ["thread-1"]);
+        let session = conversation.gpt.as_ref().unwrap();
+        assert_eq!((session.thread_id.as_deref(), session.seen_messages), (None, 0));
+        assert_eq!(conversation.messages.len(), 1);
     }
 
     #[test]
-    fn gpt_work_handoff_keeps_identity_workspace_and_original_messages() {
+    fn a_local_task_reaches_gpt_through_the_task_handoff_and_other_engines_do_not() {
+        let task = |state: &mut PersistedAppState| {
+            let conversation = state.active_conversation_mut();
+            conversation.agent_enabled = true;
+            conversation.workspace = Some("/fixture/workspace".into());
+            conversation.messages = vec![ChatMessage::new_user("Implement the feature"), ChatMessage::new_assistant("Saved progress")];
+        };
         let mut state = PersistedAppState::default();
-        state.switch_provider(InferenceProvider::Grok);
         let original_id = state.active_conversation_id;
-        let conversation = state.active_conversation_mut();
-        conversation.agent_enabled = true;
-        conversation.workspace = Some("/fixture/workspace".into());
-        conversation.messages = vec![ChatMessage::new_user("Implement the feature"), ChatMessage::new_assistant("Saved progress")];
+        task(&mut state);
         state.switch_provider(InferenceProvider::Gpt);
         assert_eq!(state.active_conversation_id, original_id);
-        assert_eq!(state.conversations.len(), 1);
         assert_eq!(state.active_conversation().workspace.as_deref(), Some(std::path::Path::new("/fixture/workspace")));
-        assert_eq!(state.active_conversation().messages.len(), 2);
         let session = state.active_conversation().gpt.as_ref().unwrap();
         assert!(session.handoff_from_taceta && session.pending_handoff);
-        assert!(session.thread_id.is_none());
-        // Leaving GPT keeps the GPT conversation as it is and continues elsewhere.
+        // The handoff carries the task's turns, so they are not sent twice.
+        assert_eq!(session.seen_messages, 2);
         state.switch_provider(InferenceProvider::Grok);
-        assert_ne!(state.active_conversation_id, original_id);
-        assert_eq!(state.inference_provider, InferenceProvider::Grok);
-        assert_eq!(state.conversations.iter().find(|chat| chat.id == original_id).unwrap().messages.len(), 2);
+        assert_eq!(state.active_conversation_id, original_id);
+        assert_eq!(state.active_conversation().messages.len(), 2);
+
+        // A CLI's work has no local task record to hand off.
+        let mut state = PersistedAppState::default();
+        state.switch_provider(InferenceProvider::Grok);
+        task(&mut state);
+        state.switch_provider(InferenceProvider::Gpt);
+        let session = state.active_conversation().gpt.as_ref().unwrap();
+        assert!(!session.pending_handoff);
+        assert_eq!(session.seen_messages, 0);
     }
 
     #[test]

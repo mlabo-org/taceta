@@ -197,8 +197,8 @@ impl TacetaApp {
             if self.state.inference_provider != InferenceProvider::Gpt { return; }
             self.show_gpt_login_controls(ui, false);
             ui.label(RichText::new(text(language,
-                "GPTの会話はCodexの履歴を使います。モードや作業フォルダーを変えると新しい会話を作ります。",
-                "GPT conversations use Codex history. Changing mode or workspace starts a new conversation.")).small().weak());
+                "GPTはCodexのスレッドで動きます。モードや作業フォルダーを変えると新しいスレッドを始め、これまでの会話を次の送信で渡します。",
+                "GPT runs in a Codex thread. Changing mode or workspace starts a new thread, and the conversation so far is handed over with the next request.")).small().weak());
             if self.state.active_conversation().gpt.as_ref().is_some_and(|session| session.pending_handoff) {
                 ui.label(RichText::new(text(language,
                     "次の送信・続行で、保存した目的・指示・作業状態をGPTへ引き継ぎます。元の作業記録も残します。",
@@ -293,6 +293,18 @@ impl TacetaApp {
             GptAction::Send { text, attachments } => Some((text.clone(), attachments.clone())),
             _ => None,
         };
+        // Turns another engine answered are handed to the thread with this
+        // request. A pending task handoff already carries its own context.
+        let mut omitted_turns = 0;
+        if let (GptAction::Send { text, .. }, false) = (&mut request.action, pending_handoff) {
+            let seen = conversation.gpt.as_ref().map_or(0, |session| session.seen_messages);
+            let unseen = conversation.messages.get(seen.min(conversation.messages.len())..).unwrap_or_default();
+            let budget = model.context_length.map_or(400_000, |tokens| tokens as usize * 2);
+            if let Some(context) = taceta::prior_context::prior_context(unseen, budget) {
+                omitted_turns = context.omitted_messages;
+                *text = taceta::prior_context::with_prior_context(&context, text);
+            }
+        }
         let handoff_root = if pending_handoff {
             Some(self.agent_ui.data_root.clone())
         } else { None };
@@ -340,7 +352,13 @@ impl TacetaApp {
             pending_thread_save: None,
             binding_needs_save: false, save_error: None, submitted_prompt,
         });
-        self.notice = None;
+        self.notice = (omitted_turns > 0).then(|| Notice {
+            kind: NoticeKind::Warning,
+            text: match language {
+                AppShellLanguage::Japanese => format!("これまでの会話のうち、古い {omitted_turns} 件はこの接続先の文脈に収まらないため渡していません。"),
+                AppShellLanguage::English => format!("The {omitted_turns} oldest messages did not fit this engine's context and were not handed over."),
+            },
+        });
         self.scroll_to_bottom = true;
         true
     }
@@ -509,6 +527,8 @@ impl TacetaApp {
         if let Some(conversation) = self.state.conversations.iter_mut().find(|conversation| conversation.id == active.conversation_id) {
             let session = conversation.gpt.get_or_insert_with(Default::default);
             if let Some(thread_id) = thread_id.filter(|id| !id.is_empty()) { session.thread_id = Some(thread_id); }
+            // The thread holds this turn whether or not it finished.
+            if session.thread_id.is_some() { session.seen_messages = conversation.messages.len(); }
             session.status = status;
             session.error = error.clone();
             if session.pending_handoff && matches!(status, GptRunStatus::Failed | GptRunStatus::Interrupted)

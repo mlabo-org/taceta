@@ -18,6 +18,9 @@ pub(super) struct ActiveAgent {
     thinking: String,
     progress: String,
     submitted_prompt: Option<String>,
+    /// Messages from other engines that this run imports into the task
+    /// record. Once the run has a result they are part of that record.
+    imported_external: Vec<Uuid>,
 }
 
 /// An approval request with its details laid out for reading.
@@ -364,6 +367,16 @@ impl TacetaApp {
         let data_root = self.agent_ui.data_root.clone();
         let id = self.state.active_conversation_id;
         let prior = importable_messages(&self.state.active_conversation().messages);
+        // Turns another engine answered since the task record was last
+        // written back are imported into it before the run.
+        let (external, imported_external) = {
+            let conversation = self.state.active_conversation();
+            let unseen = conversation
+                .task_seen_messages
+                .and_then(|seen| conversation.messages.get(seen..))
+                .unwrap_or_default();
+            external_records(unseen)
+        };
         let prompt = if resume {
             None
         } else {
@@ -405,6 +418,13 @@ impl TacetaApp {
                     AgentSession::open_or_create(&data_root, id, &workspace)?;
                 if session.is_untouched() && !prior.is_empty() {
                     session.import_messages(prior)?;
+                } else if !external.is_empty() {
+                    session.import_external_handoff(&taceta::agent::ExternalWorkHandoff {
+                        source: "Taceta conversation".into(),
+                        source_session_id: id.to_string(),
+                        workspace: workspace.clone(),
+                        records: external,
+                    })?;
                 }
                 Ok::<_, String>(session)
             })
@@ -432,6 +452,7 @@ impl TacetaApp {
             thinking: String::new(),
             progress: text(language, "作業を開始しています…", "Starting task…").into(),
             submitted_prompt,
+            imported_external,
         });
         self.notice = None;
         self.scroll_to_bottom = true;
@@ -494,7 +515,7 @@ impl TacetaApp {
                 self.agent_ui.recovery = None;
                 for snapshot in snapshots {
                     match snapshot {
-                        Ok(snapshot) => self.remember_agent_snapshot(snapshot),
+                        Ok(snapshot) => self.remember_agent_snapshot(snapshot, &[]),
                         Err(error) => {
                             self.notice = Some(Notice {
                                 kind: NoticeKind::Error,
@@ -541,7 +562,12 @@ impl TacetaApp {
                     }
                 }
             }
-            self.agent_ui.active = None;
+            let imported_external = self
+                .agent_ui
+                .active
+                .take()
+                .map(|active| active.imported_external)
+                .unwrap_or_default();
             match result {
                 Ok(snapshot) => {
                     let status = status_label(self.language(), &snapshot.status).to_owned();
@@ -553,7 +579,7 @@ impl TacetaApp {
                         },
                         text: snapshot.error.clone().unwrap_or(status),
                     });
-                    self.remember_agent_snapshot(snapshot);
+                    self.remember_agent_snapshot(snapshot, &imported_external);
                 }
                 Err(error) => {
                     self.notice = Some(Notice {
@@ -602,13 +628,21 @@ impl TacetaApp {
                         active.thinking.clear();
                     }
                 }
-                self.remember_agent_snapshot(snapshot);
+                let imported = self
+                    .agent_ui
+                    .active
+                    .as_ref()
+                    .map(|active| active.imported_external.clone())
+                    .unwrap_or_default();
+                self.remember_agent_snapshot(snapshot, &imported);
             }
         }
         self.scroll_to_bottom = true;
     }
 
-    pub(super) fn remember_agent_snapshot(&mut self, snapshot: SessionSnapshot) {
+    /// Writes the task record back into the conversation. `imported` names
+    /// the messages a run has just imported into that record.
+    pub(super) fn remember_agent_snapshot(&mut self, snapshot: SessionSnapshot, imported: &[Uuid]) {
         let id = snapshot.id;
         if self.state.conversations.iter().any(|conversation| conversation.id == id && conversation.is_gpt()) {
             return;
@@ -630,9 +664,7 @@ impl TacetaApp {
                     title: conversation_title(&snapshot.goal, "Taceta"),
                     agent_enabled: true,
                     workspace: Some(snapshot.workspace.clone()),
-                    provider: Some(if snapshot.latest_model.as_deref().is_some_and(|model| model.starts_with("grok")) {
-                        InferenceProvider::Grok
-                    } else { InferenceProvider::Ollama }),
+                    provider: Some(InferenceProvider::Ollama),
                     ..Default::default()
                 },
             );
@@ -643,16 +675,27 @@ impl TacetaApp {
             .iter_mut()
             .find(|conversation| conversation.id == id)
         {
-            conversation.workspace = Some(snapshot.workspace.clone());
-            // In chat mode the conversation holds turns the task record never
-            // received; replacing them would lose them.
-            if conversation.agent_enabled {
+            // The conversation's messages are the record. The task record is
+            // written back only while Taceta's own runner is the engine in
+            // task mode, and turns it has not received are kept after it.
+            if conversation.agent_enabled && conversation.provider.unwrap_or_default() == InferenceProvider::Ollama {
+                conversation.workspace = Some(snapshot.workspace.clone());
+                let not_in_record: Vec<ChatMessage> = conversation
+                    .task_seen_messages
+                    .and_then(|seen| conversation.messages.get(seen..))
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|message| !imported.contains(&message.id))
+                    .cloned()
+                    .collect();
                 conversation.messages = snapshot
                     .messages
                     .iter()
                     .enumerate()
                     .filter_map(|(index, message)| transcript_message(id, index, message))
                     .collect();
+                conversation.task_seen_messages = Some(conversation.messages.len());
+                conversation.messages.extend(not_in_record);
             }
         }
         self.agent_ui.snapshots.insert(id, snapshot);
@@ -866,6 +909,32 @@ fn importable_messages(messages: &[ChatMessage]) -> Vec<AgentMessage> {
         .collect()
 }
 
+/// The messages of other engines as records the task runner can import, with
+/// the ids of the messages they came from. Interrupted output is left out.
+fn external_records(messages: &[ChatMessage]) -> (Vec<taceta::agent::ExternalWorkRecord>, Vec<Uuid>) {
+    use taceta::agent::{ExternalWorkRecord, ExternalWorkRole};
+    messages
+        .iter()
+        .filter(|message| !message.interrupted)
+        .filter_map(|message| {
+            let role = match message.role {
+                Role::User => ExternalWorkRole::User,
+                Role::Assistant => ExternalWorkRole::Assistant,
+                Role::System => return None,
+            };
+            let mut content = message.content.clone();
+            for action in &message.actions {
+                content.push_str(&format!(
+                    "\n\n[Action {}: {}]",
+                    if action.succeeded { "done" } else { "failed" },
+                    action.title
+                ));
+            }
+            Some((ExternalWorkRecord { id: message.id.to_string(), role, content }, message.id))
+        })
+        .unzip()
+}
+
 fn transcript_message(id: Uuid, index: usize, message: &AgentMessage) -> Option<ChatMessage> {
     let role = match message.role {
         AgentRole::User => Role::User,
@@ -930,7 +999,7 @@ mod tests {
                 role: AgentRole::Assistant, content: "Old result".into(), tool_calls: vec![],
                 tool_call_id: None, tool_name: None,
             }], error: None, event_count: 1, summary: None, latest_model: Some("grok-test".into()),
-        });
+        }, &[]);
         assert_eq!(app.state.active_conversation().messages[0].content, "Current GPT result");
         assert!(app.state.active_conversation().workspace.is_none());
         assert!(!app.agent_ui.snapshots.contains_key(&id));
@@ -953,13 +1022,55 @@ mod tests {
 
         app.state.active_conversation_mut().agent_enabled = false;
         app.state.active_conversation_mut().messages.push(ChatMessage::new(Role::User, "Chat-only turn"));
-        app.remember_agent_snapshot(snapshot());
+        app.remember_agent_snapshot(snapshot(), &[]);
         assert_eq!(contents(&app), ["Chat-only turn"]);
         assert!(app.agent_ui.snapshots.contains_key(&id));
 
         app.state.active_conversation_mut().agent_enabled = true;
-        app.remember_agent_snapshot(snapshot());
+        app.remember_agent_snapshot(snapshot(), &[]);
         assert_eq!(contents(&app), ["Task result"]);
+    }
+
+    #[test]
+    fn turns_from_other_engines_survive_the_task_record_and_join_it_once_imported() {
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        let id = app.state.active_conversation_id;
+        let record = |contents: &[&str]| SessionSnapshot {
+            id, workspace: PathBuf::from("/fixture/workspace"), status: SessionStatus::Completed,
+            goal: "Task".into(), user_instructions: vec![], work_state: Default::default(),
+            messages: contents.iter().map(|content| AgentMessage {
+                role: AgentRole::Assistant, content: (*content).into(), tool_calls: vec![],
+                tool_call_id: None, tool_name: None,
+            }).collect(),
+            error: None, event_count: 1, summary: None, latest_model: None,
+        };
+        let contents = |app: &TacetaApp| app.state.active_conversation().messages.iter()
+            .map(|message| message.content.clone()).collect::<Vec<_>>();
+        app.state.active_conversation_mut().agent_enabled = true;
+        app.remember_agent_snapshot(record(&["task answer"]), &[]);
+        assert_eq!(app.state.active_conversation().task_seen_messages, Some(1));
+
+        // Another engine answers two turns in the same conversation.
+        app.state.active_conversation_mut().provider = Some(InferenceProvider::Claude);
+        let elsewhere = [ChatMessage::new_user("asked elsewhere"), ChatMessage::new_assistant("answered elsewhere")];
+        let ids: Vec<Uuid> = elsewhere.iter().map(|message| message.id).collect();
+        app.state.active_conversation_mut().messages.extend(elsewhere);
+        // While that engine is selected, the task record is not written back at all.
+        app.remember_agent_snapshot(record(&["task answer"]), &[]);
+        assert_eq!(contents(&app), ["task answer", "asked elsewhere", "answered elsewhere"]);
+
+        // Back on the local runner, a restart keeps the turns it has not received.
+        app.state.active_conversation_mut().provider = Some(InferenceProvider::Ollama);
+        app.remember_agent_snapshot(record(&["task answer"]), &[]);
+        assert_eq!(contents(&app), ["task answer", "asked elsewhere", "answered elsewhere"]);
+
+        // A run imports them; the record then holds them and they are not kept twice.
+        let (records, imported) = external_records(&app.state.active_conversation().messages[1..]);
+        assert_eq!(imported, ids);
+        assert_eq!(records.iter().map(|record| record.content.as_str()).collect::<Vec<_>>(), ["asked elsewhere", "answered elsewhere"]);
+        app.remember_agent_snapshot(record(&["task answer", "asked elsewhere", "answered elsewhere", "next task answer"]), &imported);
+        assert_eq!(contents(&app), ["task answer", "asked elsewhere", "answered elsewhere", "next task answer"]);
+        assert_eq!(app.state.active_conversation().task_seen_messages, Some(4));
     }
 
     #[test]
@@ -1015,6 +1126,7 @@ mod tests {
             thinking: String::new(),
             progress: String::new(),
             submitted_prompt: None,
+            imported_external: Vec::new(),
         });
         let request_id = Uuid::new_v4();
         app.apply_agent_event(AgentEvent::ApprovalRequired(ApprovalRequest {
@@ -1082,7 +1194,7 @@ mod tests {
             event_count: 7,
             summary: None,
             latest_model: Some("grok-test".into()),
-        });
+        }, &[]);
         assert_eq!(app.state.active_conversation_id, original_id);
         assert!(
             app.state
