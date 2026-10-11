@@ -22,6 +22,44 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 const MAX_TOOL_CALLS_PER_ROUND: usize = 5;
+const MAX_PAGE_FETCHES: usize = 5;
+
+/// How much fetched page text one answer may still take in. Pages are
+/// source material, not conversation: text beyond the allowance is cut and
+/// the model is told so, rather than letting the server silently drop the
+/// start of the request when the context overflows.
+struct FetchBudget {
+    fetched: usize,
+    tokens_left: usize,
+}
+
+impl FetchBudget {
+    /// Half of the context is kept for the conversation and the answer.
+    fn for_context(context_tokens: u32) -> Self {
+        Self { fetched: 0, tokens_left: context_tokens as usize / 2 }
+    }
+
+    /// Cuts `text` to this page's share: what is left, divided among the
+    /// fetches still allowed. Returns the kept text and how many characters
+    /// were left out.
+    fn take(&mut self, text: &str) -> (String, usize) {
+        let remaining_fetches = (MAX_PAGE_FETCHES + 1).saturating_sub(self.fetched).max(1);
+        let allowance = self.tokens_left / remaining_fetches;
+        // ASCII runs at roughly four characters per token; other scripts at
+        // roughly one. Counted in quarter tokens to stay in integers.
+        let mut quarters = 0usize;
+        let mut end = text.len();
+        for (index, character) in text.char_indices() {
+            quarters += if character.is_ascii() { 1 } else { 4 };
+            if quarters > allowance * 4 {
+                end = index;
+                break;
+            }
+        }
+        self.tokens_left = self.tokens_left.saturating_sub(quarters.min(allowance * 4) / 4);
+        (text[..end].to_owned(), text[end..].chars().count())
+    }
+}
 
 pub struct OllamaClient {
     http: reqwest::Client,
@@ -332,7 +370,7 @@ impl InferenceBackend for OllamaClient {
                 });
             }
             let mut seen = HashSet::new();
-            let mut fetch_count = 0usize;
+            let mut fetch_count = FetchBudget::for_context(request.context_length);
             let mut chatgpt_web_budget =
                 ChatGptWebRequestBudget::new(request.chatgpt_web_request_limit);
             let initial_search = initial_web_search_call(&request, &route)?;
@@ -679,7 +717,7 @@ async fn perform_forced_web_search(
     call: ToolCall,
     events: &UnboundedSender<GenerationEvent>,
     chatgpt_web_budget: &mut ChatGptWebRequestBudget,
-    fetch_count: &mut usize,
+    fetch_count: &mut FetchBudget,
     seen: &mut HashSet<String>,
     messages: &mut Vec<WireMessage>,
     trigger: ForcedSearchTrigger,
@@ -896,7 +934,7 @@ async fn execute_tool(
     chatgpt_prompt_source: ChatGptPromptSource,
     call: &ToolCall,
     events: &UnboundedSender<GenerationEvent>,
-    fetch_count: &mut usize,
+    fetch_count: &mut FetchBudget,
     max_results: u8,
     fetch_pages: bool,
 ) -> Result<(String, Vec<String>), BackendError> {
@@ -1000,7 +1038,7 @@ async fn execute_tool(
                     "web_fetch is disabled by the current Web Search settings".into(),
                 ));
             }
-            if *fetch_count >= 5 {
+            if fetch_count.fetched >= MAX_PAGE_FETCHES {
                 let _ = events.send(GenerationEvent::SearchProgress(
                     "本文取得の上限に達しました".into(),
                 ));
@@ -1016,7 +1054,7 @@ async fn execute_tool(
                     "web_fetch requires a public HTTPS URL".into(),
                 ));
             }
-            *fetch_count += 1;
+            fetch_count.fetched += 1;
             let url = url.to_string();
             let _ = events.send(GenerationEvent::SearchProgress(format!("取得中: {url}")));
             if let Some(workflow) = link_workflow {
@@ -1071,7 +1109,14 @@ async fn execute_tool(
             match provider.fetch(&url).await {
                 Ok(page) => {
                     let citation = page.url.clone();
-                    Ok((serde_json::to_string(&serde_json::json!({"url":page.url,"content_type":page.content_type,"text":page.text})).unwrap(), vec![citation]))
+                    let (text, omitted) = fetch_count.take(&page.text);
+                    let mut payload = serde_json::json!({"url":page.url,"content_type":page.content_type,"text":text});
+                    if omitted > 0 {
+                        payload["truncated"] = true.into();
+                        payload["omitted_characters"] = omitted.into();
+                        payload["note"] = "Only the beginning of this page fits the model's context. The rest was not read.".into();
+                    }
+                    Ok((serde_json::to_string(&payload).unwrap(), vec![citation]))
                 }
                 Err(error) => {
                     let retryable = matches!(
@@ -1553,7 +1598,7 @@ mod tests {
             arguments: serde_json::json!({"query":question.content}),
         };
         let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let mut fetch_count = 0;
+        let mut fetch_count = FetchBudget::for_context(8_192);
         let search = execute_tool(
             None,
             Some(&service),
@@ -2129,6 +2174,35 @@ mod tests {
         assert_eq!(wired.len(), 2);
         assert_eq!(wired[0].content, "first question");
         assert_eq!(wired[1].content, "current question");
+    }
+
+    #[test]
+    fn fetched_pages_share_half_the_context_and_say_when_they_were_cut() {
+        // 4,000 tokens of context leave 2,000 for pages, 400 for the first of five.
+        let mut budget = FetchBudget::for_context(4_000);
+        budget.fetched = 1;
+        let english = "a".repeat(10_000);
+        let (kept, omitted) = budget.take(&english);
+        assert_eq!(kept.len(), 1_600);
+        assert_eq!(omitted, 10_000 - 1_600);
+        // Japanese text costs about a token per character.
+        budget.fetched = 2;
+        let japanese = "あ".repeat(10_000);
+        let (kept, omitted) = budget.take(&japanese);
+        assert_eq!(kept.chars().count(), 400);
+        assert_eq!(kept.chars().count() + omitted, 10_000);
+        // A short page is passed whole, and what it did not use stays for later pages.
+        budget.fetched = 3;
+        let before = budget.tokens_left;
+        let (kept, omitted) = budget.take("short page");
+        assert_eq!((kept.as_str(), omitted), ("short page", 0));
+        assert!(before - budget.tokens_left <= 3);
+        // The last allowed fetch may use everything that is left.
+        budget.fetched = 5;
+        let left = budget.tokens_left;
+        let (kept, _) = budget.take(&english);
+        assert_eq!(kept.len(), left * 4);
+        assert_eq!(budget.tokens_left, 0);
     }
 
     #[test]
