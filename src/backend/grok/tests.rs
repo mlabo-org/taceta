@@ -21,7 +21,7 @@ async fn start(router: Router) -> (Url, tokio::task::JoinHandle<()>) {
 fn chat_request(model: &str, messages: Vec<ChatMessage>) -> ChatRequest {
     ChatRequest {
         model: model.into(), messages, thinking: ThinkingMode::Default, context_length: 32_768,
-        tools: None, web_search_provider: None, max_search_results: 5,
+        web_search_provider: None, max_search_results: 5,
         chatgpt_web_request_limit: 1, fetch_search_pages: false, web_authorization: None,
     }
 }

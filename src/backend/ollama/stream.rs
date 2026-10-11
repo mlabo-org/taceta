@@ -84,7 +84,6 @@ where
                     }
                 }
                 for call in message.tool_calls {
-                    let _ = events.send(GenerationEvent::ToolCall(call.clone()));
                     result.tool_calls.push(call);
                 }
             }
@@ -114,7 +113,6 @@ where
                 }
             }
             for call in message.tool_calls {
-                let _ = events.send(GenerationEvent::ToolCall(call.clone()));
                 result.tool_calls.push(call);
             }
         }
