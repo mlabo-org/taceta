@@ -25,39 +25,154 @@ const MAX_TOOL_CALLS_PER_ROUND: usize = 5;
 const MAX_PAGE_FETCHES: usize = 5;
 
 /// How much fetched page text one answer may still take in. Pages are
-/// source material, not conversation: text beyond the allowance is cut and
-/// the model is told so, rather than letting the server silently drop the
-/// start of the request when the context overflows.
+/// source material, not conversation. A page that is larger than its share
+/// is never cut and never sent whole: it is summarized for the question
+/// first, because text beyond the context makes the server silently drop
+/// the start of the request, which is the conversation itself.
 struct FetchBudget {
     fetched: usize,
     tokens_left: usize,
+    summarizer: Option<PageSummarizer>,
+}
+
+/// Where a page that does not fit is summarized: the model that is answering.
+struct PageSummarizer {
+    http: reqwest::Client,
+    chat_url: String,
+    model: String,
+    context_tokens: usize,
+}
+
+/// A page as it is handed to the model.
+struct PageText {
+    text: String,
+    summarized: bool,
+}
+
+/// ASCII runs at roughly four characters per token; other scripts at roughly
+/// one. Counted in quarter tokens to stay in integers.
+fn quarter_tokens(text: &str) -> usize {
+    text.chars().map(|character| if character.is_ascii() { 1 } else { 4 }).sum()
+}
+
+/// Splits `text` into consecutive pieces of at most `max_tokens` each. Every
+/// character of the page is in exactly one piece.
+fn split_by_tokens(text: &str, max_tokens: usize) -> Vec<&str> {
+    let limit = max_tokens.max(1) * 4;
+    let mut pieces = Vec::new();
+    let (mut start, mut quarters) = (0, 0);
+    for (index, character) in text.char_indices() {
+        let cost = if character.is_ascii() { 1 } else { 4 };
+        if quarters + cost > limit && index > start {
+            pieces.push(&text[start..index]);
+            start = index;
+            quarters = 0;
+        }
+        quarters += cost;
+    }
+    if start < text.len() {
+        pieces.push(&text[start..]);
+    }
+    pieces
 }
 
 impl FetchBudget {
     /// Half of the context is kept for the conversation and the answer.
-    fn for_context(context_tokens: u32) -> Self {
-        Self { fetched: 0, tokens_left: context_tokens as usize / 2 }
+    fn for_context(context_tokens: u32, summarizer: Option<PageSummarizer>) -> Self {
+        Self { fetched: 0, tokens_left: context_tokens as usize / 2, summarizer }
     }
 
-    /// Cuts `text` to this page's share: what is left, divided among the
-    /// fetches still allowed. Returns the kept text and how many characters
-    /// were left out.
-    fn take(&mut self, text: &str) -> (String, usize) {
-        let remaining_fetches = (MAX_PAGE_FETCHES + 1).saturating_sub(self.fetched).max(1);
-        let allowance = self.tokens_left / remaining_fetches;
-        // ASCII runs at roughly four characters per token; other scripts at
-        // roughly one. Counted in quarter tokens to stay in integers.
-        let mut quarters = 0usize;
-        let mut end = text.len();
-        for (index, character) in text.char_indices() {
-            quarters += if character.is_ascii() { 1 } else { 4 };
-            if quarters > allowance * 4 {
-                end = index;
-                break;
-            }
+    /// This page's share: what is left, divided among the fetches still allowed.
+    fn allowance(&self) -> usize {
+        self.tokens_left / (MAX_PAGE_FETCHES + 1).saturating_sub(self.fetched).max(1)
+    }
+
+    /// Returns the page whole when it fits its share, and otherwise its
+    /// summary for `question`. A page that can be neither is an error: it
+    /// is not passed on in part.
+    async fn admit(
+        &mut self,
+        page: &str,
+        question: &str,
+        url: &str,
+        events: &UnboundedSender<GenerationEvent>,
+    ) -> Result<PageText, String> {
+        let allowance = self.allowance();
+        let whole = quarter_tokens(page).div_ceil(4);
+        if whole <= allowance {
+            self.tokens_left -= whole;
+            return Ok(PageText { text: page.to_owned(), summarized: false });
         }
-        self.tokens_left = self.tokens_left.saturating_sub(quarters.min(allowance * 4) / 4);
-        (text[..end].to_owned(), text[end..].chars().count())
+        let summarizer = self.summarizer.as_ref().ok_or("the page does not fit the model's context")?;
+        let summary = summarizer.summarize(page, question, allowance, url, events).await?;
+        self.tokens_left = self.tokens_left.saturating_sub(quarter_tokens(&summary).div_ceil(4));
+        Ok(PageText { text: summary, summarized: true })
+    }
+}
+
+impl PageSummarizer {
+    /// Reads the whole page in order, piece by piece, carrying forward one
+    /// summary of what matters for the question.
+    async fn summarize(
+        &self,
+        page: &str,
+        question: &str,
+        allowance: usize,
+        url: &str,
+        events: &UnboundedSender<GenerationEvent>,
+    ) -> Result<String, String> {
+        const INSTRUCTION_TOKENS: usize = 400;
+        // Each request holds the instructions, the summary so far and one
+        // piece of the page, and must leave room for the new summary.
+        let piece_tokens = (self.context_tokens / 2)
+            .checked_sub(allowance + INSTRUCTION_TOKENS)
+            .filter(|tokens| *tokens >= 256)
+            .ok_or("the model's context is too small to summarize this page")?;
+        let pieces = split_by_tokens(page, piece_tokens);
+        let mut summary = String::new();
+        for (index, piece) in pieces.iter().enumerate() {
+            let _ = events.send(GenerationEvent::SearchProgress(format!(
+                "ページを要約中 {}/{}: {url}",
+                index + 1,
+                pieces.len()
+            )));
+            let mut prompt = format!(
+                "You are reading a web page in consecutive parts to help answer a question. \
+Write one summary, in the page's own language, of everything in the page so far that bears on the question: \
+facts, names, numbers, dates, and what the page says about them. Keep exact figures and wording that matter. \
+Add nothing that the page does not say, and do not answer the question. \
+Write at most about {} characters. Reply with the summary only.\n\nQuestion:\n{question}",
+                allowance * 2
+            );
+            if !summary.is_empty() {
+                prompt.push_str("\n\nSummary of the earlier parts (keep what still matters):\n");
+                prompt.push_str(&summary);
+            }
+            prompt.push_str(&format!("\n\nPart {} of {}:\n{piece}", index + 1, pieces.len()));
+            let body = serde_json::json!({
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": false,
+                "options": {"num_ctx": self.context_tokens, "num_predict": allowance + 64},
+            });
+            let response = self.http.post(&self.chat_url).json(&body).send().await.map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("the model answered {} while summarizing", response.status()));
+            }
+            let value: serde_json::Value = response.json().await.map_err(|error| error.to_string())?;
+            if value["done_reason"] == "length" {
+                return Err("the model reached its output limit while summarizing".into());
+            }
+            let next = value["message"]["content"].as_str().unwrap_or_default().trim();
+            if next.is_empty() {
+                return Err("the model returned an empty summary".into());
+            }
+            summary = next.to_owned();
+        }
+        if quarter_tokens(&summary).div_ceil(4) > allowance {
+            return Err("the summary still does not fit the model's context".into());
+        }
+        Ok(summary)
     }
 }
 
@@ -370,7 +485,15 @@ impl InferenceBackend for OllamaClient {
                 });
             }
             let mut seen = HashSet::new();
-            let mut fetch_count = FetchBudget::for_context(request.context_length);
+            let mut fetch_count = FetchBudget::for_context(
+                request.context_length,
+                Some(PageSummarizer {
+                    http: client.http.clone(),
+                    chat_url: client.url("/api/chat"),
+                    model: request.model.clone(),
+                    context_tokens: request.context_length as usize,
+                }),
+            );
             let mut chatgpt_web_budget =
                 ChatGptWebRequestBudget::new(request.chatgpt_web_request_limit);
             let initial_search = initial_web_search_call(&request, &route)?;
@@ -1109,14 +1232,27 @@ async fn execute_tool(
             match provider.fetch(&url).await {
                 Ok(page) => {
                     let citation = page.url.clone();
-                    let (text, omitted) = fetch_count.take(&page.text);
-                    let mut payload = serde_json::json!({"url":page.url,"content_type":page.content_type,"text":text});
-                    if omitted > 0 {
-                        payload["truncated"] = true.into();
-                        payload["omitted_characters"] = omitted.into();
-                        payload["note"] = "Only the beginning of this page fits the model's context. The rest was not read.".into();
+                    let question = current_input.map(|message| message.content.as_str()).unwrap_or_default();
+                    match fetch_count.admit(&page.text, question, &page.url, events).await {
+                        Ok(admitted) => {
+                            let mut payload = serde_json::json!({"url":page.url,"content_type":page.content_type,"text":admitted.text});
+                            if admitted.summarized {
+                                payload["summarized"] = true.into();
+                                payload["note"] = "The page was too long for the model's context. This is a summary of the whole page written for the question, not its exact text.".into();
+                            }
+                            Ok((serde_json::to_string(&payload).unwrap(), vec![citation]))
+                        }
+                        Err(reason) => {
+                            let _ = events.send(GenerationEvent::SearchProgress(format!("取得失敗: {url}")));
+                            let payload = serde_json::json!({
+                                "error": "ページが長すぎて、要約もできませんでした。本文は渡していません",
+                                "url": page.url,
+                                "retryable": false,
+                                "detail": reason,
+                            });
+                            Ok((serde_json::to_string(&payload).unwrap(), Vec::new()))
+                        }
                     }
-                    Ok((serde_json::to_string(&payload).unwrap(), vec![citation]))
                 }
                 Err(error) => {
                     let retryable = matches!(
@@ -1598,7 +1734,7 @@ mod tests {
             arguments: serde_json::json!({"query":question.content}),
         };
         let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let mut fetch_count = FetchBudget::for_context(8_192);
+        let mut fetch_count = FetchBudget::for_context(8_192, None);
         let search = execute_tool(
             None,
             Some(&service),
@@ -2177,32 +2313,30 @@ mod tests {
     }
 
     #[test]
-    fn fetched_pages_share_half_the_context_and_say_when_they_were_cut() {
+    fn a_page_is_split_for_summarizing_without_losing_a_character() {
+        let page = format!("{}{}", "a".repeat(1_000), "あ".repeat(300));
+        // 100 tokens hold 400 ASCII characters or 100 Japanese ones.
+        let pieces = split_by_tokens(&page, 100);
+        assert_eq!(pieces.concat(), page);
+        assert!(pieces.iter().all(|piece| quarter_tokens(piece) <= 400));
+        assert_eq!(pieces[0].len(), 400);
+        // The piece where the scripts meet holds both, still within the limit.
+        assert_eq!(pieces[2], format!("{}{}", "a".repeat(200), "あ".repeat(50)));
+    }
+
+    #[tokio::test]
+    async fn a_page_that_fits_goes_whole_and_one_that_does_not_is_never_passed_in_part() {
+        let (events, _received) = tokio::sync::mpsc::unbounded_channel();
         // 4,000 tokens of context leave 2,000 for pages, 400 for the first of five.
-        let mut budget = FetchBudget::for_context(4_000);
+        let mut budget = FetchBudget::for_context(4_000, None);
         budget.fetched = 1;
-        let english = "a".repeat(10_000);
-        let (kept, omitted) = budget.take(&english);
-        assert_eq!(kept.len(), 1_600);
-        assert_eq!(omitted, 10_000 - 1_600);
-        // Japanese text costs about a token per character.
-        budget.fetched = 2;
-        let japanese = "あ".repeat(10_000);
-        let (kept, omitted) = budget.take(&japanese);
-        assert_eq!(kept.chars().count(), 400);
-        assert_eq!(kept.chars().count() + omitted, 10_000);
-        // A short page is passed whole, and what it did not use stays for later pages.
-        budget.fetched = 3;
-        let before = budget.tokens_left;
-        let (kept, omitted) = budget.take("short page");
-        assert_eq!((kept.as_str(), omitted), ("short page", 0));
-        assert!(before - budget.tokens_left <= 3);
-        // The last allowed fetch may use everything that is left.
-        budget.fetched = 5;
-        let left = budget.tokens_left;
-        let (kept, _) = budget.take(&english);
-        assert_eq!(kept.len(), left * 4);
-        assert_eq!(budget.tokens_left, 0);
+        let short = budget.admit("short page", "q", "https://example.com/a", &events).await.unwrap();
+        assert_eq!((short.text.as_str(), short.summarized), ("short page", false));
+        assert_eq!(budget.tokens_left, 2_000 - 3);
+        // With nothing to summarize it, a page over its share is refused whole.
+        let long = "a".repeat(10_000);
+        assert!(budget.admit(&long, "q", "https://example.com/b", &events).await.is_err());
+        assert_eq!(budget.tokens_left, 2_000 - 3);
     }
 
     #[test]
