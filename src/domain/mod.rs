@@ -54,6 +54,20 @@ pub struct ChatMessage {
     /// Per-answer inference metadata, kept out of future model input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_identity: Option<ModelIdentity>,
+    /// What a coding CLI did while producing this answer. Part of the
+    /// conversation's record, so another engine can continue from it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionRecord>,
+}
+
+/// One finished action from a coding CLI: a command it ran or a file it changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionRecord {
+    pub title: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    pub succeeded: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +87,7 @@ impl ChatMessage {
             citations: Vec::new(),
             interrupted: false,
             model_identity: None,
+            actions: Vec::new(),
         }
     }
     pub fn new_user(content: impl Into<String>) -> Self {
