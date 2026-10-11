@@ -168,6 +168,9 @@ pub struct TacetaApp {
     /// Set when the newest message must come into view whatever the scroll
     /// position: a conversation was opened or a request was sent.
     jump_to_latest: bool,
+    /// While an answer arrives the view keeps its end in sight, until the
+    /// reader scrolls away. Sending or opening a conversation turns it on.
+    follow_latest: bool,
     /// Why this launch could not serve the browser link, when it could not.
     link_socket_error: Option<String>,
     web_key_draft: String,
@@ -350,6 +353,7 @@ impl TacetaApp {
             conversation_bulk_delete_confirmation: None,
             scroll_to_bottom: true,
             jump_to_latest: true,
+            follow_latest: true,
             link_socket_error: None,
             web_key_draft: String::new(),
             web_key_status: None,
@@ -3102,6 +3106,13 @@ impl TacetaApp {
     ) {
         let stick_to_bottom = self.scroll_to_bottom || self.is_generating();
         let jump_to_latest = std::mem::take(&mut self.jump_to_latest);
+        if jump_to_latest {
+            self.follow_latest = true;
+        } else if root_ui.input(|input| input.smooth_scroll_delta().y != 0.0) {
+            // The reader took over the scroll position.
+            self.follow_latest = false;
+        }
+        let follow_latest = self.follow_latest && self.is_generating();
         CentralPanel::default().show_inside(root_ui, |ui| {
             let available = ui.available_width();
             let column = (available - 2.0 * READING_COLUMN_MARGIN).clamp(1.0, READING_COLUMN_WIDTH);
@@ -3128,7 +3139,7 @@ impl TacetaApp {
                             ui.add_space(20.0);
                             body(self, ui);
                             ui.add_space(16.0);
-                            if jump_to_latest {
+                            if jump_to_latest || follow_latest {
                                 ui.scroll_to_cursor(Some(Align::BOTTOM));
                             }
                         });
@@ -3937,12 +3948,18 @@ fn composer_editor_content_height(ui: &Ui, draft: &str, wrap_width: f32) -> f32 
 
 impl eframe::App for TacetaApp {
     fn logic(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        let busy = |app: &Self| {
+            app.is_generating() || app.gpt_ui.auth_busy() || app.agent_ui.is_recovering()
+                || app.model_refresh_pending || app.model_pull.is_some()
+                || app.model_unload_result.is_some()
+        };
+        let was_busy = busy(self);
         self.drain_background_work();
         self.persist_gpt_thread(frame.storage_mut());
 
-        if self.is_generating() || self.gpt_ui.auth_busy() || self.agent_ui.is_recovering()
-            || self.model_refresh_pending || self.model_pull.is_some()
-            || self.model_unload_result.is_some() {
+        // Work that ended in this pass still needs one more frame: without
+        // it the window keeps showing the running state until the next input.
+        if was_busy || busy(self) {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
