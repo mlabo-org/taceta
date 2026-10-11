@@ -57,7 +57,7 @@ pub(super) async fn classify(
         .map_err(routing_request_error)?;
     let response: ChatChunk = response.json().await.map_err(routing_request_error)?;
     if let Some(error) = response.error {
-        return Err(BackendError::Protocol(format!(
+        return Err(BackendError::Web(format!(
             "web routing failed: {error}"
         )));
     }
@@ -65,12 +65,12 @@ pub(super) async fn classify(
         .message
         .map(|message| message.content)
         .filter(|content| !content.trim().is_empty())
-        .ok_or_else(|| BackendError::Protocol("web routing returned no decision".into()))?;
+        .ok_or_else(|| BackendError::Web("web routing returned no decision".into()))?;
     parse_decision(&content, current_input)
 }
 
 fn routing_request_error(error: reqwest::Error) -> BackendError {
-    BackendError::Protocol(format!("web routing request failed: {error}"))
+    BackendError::Web(format!("web routing request failed: {error}"))
 }
 
 fn routing_body(model: &str, current_input: &str, context_length: u32) -> ChatBody {
@@ -117,7 +117,7 @@ fn route_schema() -> serde_json::Value {
 
 fn parse_decision(content: &str, current_input: &str) -> Result<WebRouteDecision, BackendError> {
     let payload: RoutePayload = serde_json::from_str(content.trim()).map_err(|_| {
-        BackendError::Protocol(
+        BackendError::Web(
             "web routing returned invalid JSON; nothing was sent to the browser".into(),
         )
     })?;
@@ -136,7 +136,7 @@ fn parse_decision(content: &str, current_input: &str) -> Result<WebRouteDecision
 fn valid_query(query: String) -> Result<String, BackendError> {
     let query = query.trim();
     if !(4..=512).contains(&query.chars().count()) {
-        return Err(BackendError::Protocol(
+        return Err(BackendError::Web(
             "web routing returned an invalid search query; nothing was sent to the browser".into(),
         ));
     }

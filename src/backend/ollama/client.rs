@@ -256,7 +256,7 @@ impl InferenceBackend for OllamaClient {
                     .json()
                     .await?;
                 if !capability::has_tools(&show.capabilities) {
-                    return Err(BackendError::Protocol(
+                    return Err(BackendError::Web(
                         "selected Ollama model does not advertise tool support".into(),
                     ));
                 }
@@ -274,10 +274,10 @@ impl InferenceBackend for OllamaClient {
                     .as_ref()
                     .map(|_| WebSearchProvider::from_kind(provider_kind.unwrap_or_default()))
                     .transpose()
-                    .map_err(|e| BackendError::Protocol(e.to_string()))?
+                    .map_err(|e| BackendError::Web(e.to_string()))?
             };
             if link_workflow.is_some() && client.link_service.is_none() {
-                return Err(BackendError::Protocol("Taceta Link is unavailable".into()));
+                return Err(BackendError::Web("Taceta Link is unavailable".into()));
             }
             let current_input = request
                 .messages
@@ -285,7 +285,7 @@ impl InferenceBackend for OllamaClient {
                 .rev()
                 .find(|message| message.role == Role::User)
                 .ok_or_else(|| {
-                    BackendError::Protocol("Web routing requires a current user input".into())
+                    BackendError::Web("Web routing requires a current user input".into())
                 })?;
             let route = if tools.is_some() {
                 determine_web_route(&client, &request, current_input, &events).await?
@@ -376,12 +376,12 @@ impl InferenceBackend for OllamaClient {
                     return Ok(());
                 }
                 if local_route {
-                    return Err(BackendError::Protocol(
+                    return Err(BackendError::Web(
                         "local web routing produced an undeclared tool call".into(),
                     ));
                 }
                 if provider.is_none() && link_workflow.is_none() {
-                    return Err(BackendError::Protocol(
+                    return Err(BackendError::Web(
                         "model returned tool calls while web search is disabled".into(),
                     ));
                 }
@@ -396,7 +396,7 @@ impl InferenceBackend for OllamaClient {
                 let mut chatgpt_web_budget_exhausted = false;
                 for (index, raw) in streamed.tool_calls.into_iter().enumerate() {
                     let call = web_search::parse_tool_call(&raw)
-                        .map_err(|e| BackendError::Protocol(e.to_string()))?;
+                        .map_err(|e| BackendError::Web(e.to_string()))?;
                     let (content, urls) = if index >= MAX_TOOL_CALLS_PER_ROUND {
                         let _ = events.send(GenerationEvent::SearchProgress(
                             "このラウンドの検索上限に達しました".into(),
@@ -485,7 +485,7 @@ impl InferenceBackend for OllamaClient {
                 .error_for_status()?;
             let summary = stream::consume_research(response.bytes_stream(), events.clone()).await?;
             if !summary.tool_calls.is_empty() {
-                return Err(BackendError::Protocol(
+                return Err(BackendError::Web(
                     "Web summary returned a tool call; summary cannot perform research".into(),
                 ));
             }
@@ -580,7 +580,7 @@ fn validate_tools(
 ) -> Result<Option<serde_json::Value>, BackendError> {
     let Some(value) = tools else { return Ok(None) };
     let Some(items) = value.as_array() else {
-        return Err(BackendError::Protocol(
+        return Err(BackendError::Web(
             "web tools must be a JSON array".into(),
         ));
     };
@@ -592,7 +592,7 @@ fn validate_tools(
             )
         })
     {
-        return Err(BackendError::Protocol(
+        return Err(BackendError::Web(
             "unsupported web tool configuration".into(),
         ));
     }
@@ -632,7 +632,7 @@ fn initial_web_search_call(
     }
     let (query, trigger) = match route {
         router::WebRouteDecision::Local => {
-            return Err(BackendError::Protocol(
+            return Err(BackendError::Web(
                 "Web is ON: answering without external research is not allowed".into(),
             ));
         }
@@ -703,7 +703,7 @@ async fn perform_forced_web_search(
         } => (Some(ordinal), exhausted_after),
         ChatGptWebAdmission::Passthrough => (None, false),
         ChatGptWebAdmission::Exhausted => {
-            return Err(BackendError::Protocol(
+            return Err(BackendError::Web(
                 "Taceta-triggered Web Search exhausted its request budget before execution".into(),
             ));
         }
@@ -873,7 +873,7 @@ fn parse_provider(value: &str) -> Result<ProviderKind, BackendError> {
         "Ollama" | "ollama" => Ok(ProviderKind::Ollama),
         "Google Search" | "google_search" => Ok(ProviderKind::GoogleSearch),
         "ChatGPT Web" | "chatgpt_web" => Ok(ProviderKind::ChatGptWeb),
-        _ => Err(BackendError::Protocol(
+        _ => Err(BackendError::Web(
             "unsupported web search provider".into(),
         )),
     }
@@ -907,7 +907,7 @@ async fn execute_tool(
                 .as_str()
                 .filter(|q| !q.trim().is_empty())
                 .ok_or_else(|| {
-                    BackendError::Protocol("web_search requires a non-empty query".into())
+                    BackendError::Web("web_search requires a non-empty query".into())
                 })?;
             let limit = call.arguments["limit"]
                 .as_u64()
@@ -915,9 +915,9 @@ async fn execute_tool(
                 .clamp(1, max_results.clamp(1, 5) as u64) as usize;
             if let Some(workflow) = link_workflow {
                 let service = link_service
-                    .ok_or_else(|| BackendError::Protocol("Taceta Link is unavailable".into()))?;
+                    .ok_or_else(|| BackendError::Web("Taceta Link is unavailable".into()))?;
                 let auth = authorization.ok_or_else(|| {
-                    BackendError::Protocol("Taceta Link authorization is missing".into())
+                    BackendError::Web("Taceta Link authorization is missing".into())
                 })?;
                 let ordinal = chatgpt_request_ordinal.unwrap_or(1);
                 let progress = if matches!(workflow, WebWorkflow::ChatGptWeb) {
@@ -940,9 +940,9 @@ async fn execute_tool(
                     chatgpt_prompt_source,
                     auth,
                 )
-                .map_err(|e| BackendError::Protocol(e.to_string()))?;
+                .map_err(|e| BackendError::Web(e.to_string()))?;
                 taceta_link_service::check_browser_running()
-                    .map_err(|error| BackendError::Protocol(error.to_string()))?;
+                    .map_err(|error| BackendError::Web(error.to_string()))?;
                 let wait_ms = link_wait_duration(job.timeout_ms);
                 let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
                 let wait = service.enqueue_and_wait_with_progress(job, progress_tx);
@@ -968,23 +968,23 @@ async fn execute_tool(
                 let result = match outcome {
                     Ok(result) => result,
                     Err(taceta_link_service::LinkError::Timeout) => {
-                        return Err(BackendError::Protocol(format!(
+                        return Err(BackendError::Web(format!(
                             "Taceta Link {} request timed out",
                             workflow_wire_name(workflow),
                         )));
                     }
-                    Err(error) => return Err(BackendError::Protocol(error.to_string())),
+                    Err(error) => return Err(BackendError::Web(error.to_string())),
                 };
                 let urls = result.citation_urls();
                 return Ok((result.untrusted_context(), urls));
             }
             let _ = events.send(GenerationEvent::SearchProgress(format!("検索中: {query}")));
             let provider = provider
-                .ok_or_else(|| BackendError::Protocol("web provider is unavailable".into()))?;
+                .ok_or_else(|| BackendError::Web("web provider is unavailable".into()))?;
             let results = provider
                 .search(query, limit)
                 .await
-                .map_err(|e| BackendError::Protocol(format!("stage=search kind=provider: {e}")))?;
+                .map_err(|e| BackendError::Web(format!("stage=search kind=provider: {e}")))?;
             let urls = results.iter().map(|r| r.url.clone()).collect();
             let content = serde_json::to_string(
                 &results
@@ -997,7 +997,7 @@ async fn execute_tool(
         }
         "web_fetch" => {
             if !fetch_pages {
-                return Err(BackendError::Protocol(
+                return Err(BackendError::Web(
                     "web_fetch is disabled by the current Web Search settings".into(),
                 ));
             }
@@ -1009,11 +1009,11 @@ async fn execute_tool(
             }
             let requested_url = call.arguments["url"]
                 .as_str()
-                .ok_or_else(|| BackendError::Protocol("web_fetch requires a URL".into()))?;
+                .ok_or_else(|| BackendError::Web("web_fetch requires a URL".into()))?;
             let url = web_search::validate_public_url(requested_url)
-                .map_err(|error| BackendError::Protocol(error.to_string()))?;
+                .map_err(|error| BackendError::Web(error.to_string()))?;
             if url.scheme() != "https" {
-                return Err(BackendError::Protocol(
+                return Err(BackendError::Web(
                     "web_fetch requires a public HTTPS URL".into(),
                 ));
             }
@@ -1025,19 +1025,19 @@ async fn execute_tool(
                     workflow,
                     crate::domain::WebWorkflow::GoogleSearch
                 ) {
-                    return Err(BackendError::Protocol(
+                    return Err(BackendError::Web(
                         "the selected browser workflow cannot read external pages".into(),
                     ));
                 }
                 let service = link_service
-                    .ok_or_else(|| BackendError::Protocol("Taceta Link is unavailable".into()))?;
+                    .ok_or_else(|| BackendError::Web("Taceta Link is unavailable".into()))?;
                 let auth = authorization.ok_or_else(|| {
-                    BackendError::Protocol("Taceta Link authorization is missing".into())
+                    BackendError::Web("Taceta Link authorization is missing".into())
                 })?;
                 let job = taceta_link_service::page_fetch_job(url.clone(), auth)
-                    .map_err(|error| BackendError::Protocol(error.to_string()))?;
+                    .map_err(|error| BackendError::Web(error.to_string()))?;
                 taceta_link_service::check_browser_running()
-                    .map_err(|error| BackendError::Protocol(error.to_string()))?;
+                    .map_err(|error| BackendError::Web(error.to_string()))?;
                 let wait_ms = link_wait_duration(job.timeout_ms);
                 return match tokio::time::timeout(wait_ms, service.enqueue_and_wait(job)).await {
                     Ok(Ok(result)) => {
@@ -1068,7 +1068,7 @@ async fn execute_tool(
                 };
             }
             let provider = provider
-                .ok_or_else(|| BackendError::Protocol("web provider is unavailable".into()))?;
+                .ok_or_else(|| BackendError::Web("web provider is unavailable".into()))?;
             match provider.fetch(&url).await {
                 Ok(page) => {
                     let citation = page.url.clone();
@@ -1091,7 +1091,7 @@ async fn execute_tool(
                 }
             }
         }
-        _ => Err(BackendError::Protocol("unsupported web tool".into())),
+        _ => Err(BackendError::Web("unsupported web tool".into())),
     }
 }
 
@@ -1625,7 +1625,7 @@ mod tests {
             assert_eq!(failure.payload["accepted"], true);
         };
         let (result, ()) = tokio::join!(search, browser);
-        assert!(matches!(result, Err(BackendError::Protocol(message)) if message.contains("progress stalled")));
+        assert!(matches!(result, Err(BackendError::Web(message)) if message.contains("progress stalled")));
         let mut saw_partial = false;
         while let Ok(event) = received.try_recv() {
             if let GenerationEvent::ExternalContentDelta { delta, .. } = event {
