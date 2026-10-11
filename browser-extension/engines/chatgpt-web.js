@@ -115,6 +115,22 @@ export function chatGPTWebProgressChunk(previousText, nextText, sequence) {
   return delta ? { sequence, delta, replace } : null;
 }
 
+/** Runs inside the ChatGPT page; must not use anything from this module. */
+export function fillComposer(value) {
+  const node = document.querySelector('#prompt-textarea[contenteditable="true"][role="textbox"]');
+  if (!node) return { __error: "composer_missing" };
+  node.focus();
+  node.replaceChildren(document.createTextNode(value));
+  node.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+  return null;
+}
+
+/** Runs inside the ChatGPT page; must not use anything from this module. */
+export function clickSend() {
+  document.querySelector('button[data-testid="send-button"]')?.click();
+  return null;
+}
+
 export async function runChatGPTWeb({ page, prompt, url = "https://chatgpt.com/", timeoutMs = DEFAULT_HARD_TIMEOUT_MS, idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS, pollMs = 250, stabilityMs = 500, onProgress = () => {} }) {
   if (!page || typeof page.evaluate !== "function") throw typedError("page_required");
   if (typeof prompt !== "string" || !prompt.trim()) throw typedError("prompt_required");
@@ -135,14 +151,8 @@ export async function runChatGPTWeb({ page, prompt, url = "https://chatgpt.com/"
   }
   if (!state.composer) throw typedError("composer_timeout");
   const before = new Set(state.assistants.map((item) => item.id).filter(Boolean));
-  await page.evaluate((value) => {
-    const node = document.querySelector('#prompt-textarea[contenteditable="true"][role="textbox"]');
-    if (!node) throw new Error("composer_missing");
-    node.focus();
-    node.replaceChildren(document.createTextNode(value));
-    node.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
-  }, prompt);
-  await page.evaluate(() => document.querySelector('button[data-testid="send-button"]')?.click());
+  await page.evaluate(fillComposer, prompt);
+  await page.evaluate(clickSend);
 
   let candidate = null;
   let completed = false;
