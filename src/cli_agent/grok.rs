@@ -244,10 +244,14 @@ fn write_hook_plugin(dir: &Path, script: &str) -> Result<(), String> {
     let script_text = script_path
         .to_str()
         .ok_or("The approval plugin path is not valid UTF-8.")?;
+    // The CLI runs the command through a shell, so the path is quoted: the
+    // usual location is under "Application Support". An unquoted path fails
+    // to start, and a hook that fails does not stop the tool call.
+    let command = format!("'{}'", script_text.replace('\'', r"'\''"));
     let hooks = json!({
         "hooks": {
             "PreToolUse": [{
-                "hooks": [{"type": "command", "command": script_text, "timeout": 10}]
+                "hooks": [{"type": "command", "command": command, "timeout": 10}]
             }]
         }
     });
@@ -637,6 +641,7 @@ async fn drive(
         tools: HashMap::new(),
         pending: Vec::new(),
         stop: None,
+        refused: false,
     };
     let prompt_id = 100;
     let prompt = json!({
@@ -811,6 +816,9 @@ struct Turn {
     pending: Vec<PendingApproval>,
     /// Set when this run decided to end the turn early.
     stop: Option<Stop>,
+    /// The user refused an action in this turn. The CLI may then end the
+    /// turn as cancelled, which is the turn's ordinary end, not a failure.
+    refused: bool,
 }
 
 /// How the wait for the prompt's response ended.
@@ -929,6 +937,11 @@ impl Turn {
         }
         match stop_reason.as_deref() {
             Some("end_turn") => RunOutcome {
+                session_id,
+                status: RunStatus::Completed,
+                error: None,
+            },
+            Some("cancelled") if self.refused => RunOutcome {
                 session_id,
                 status: RunStatus::Completed,
                 error: None,
@@ -1145,6 +1158,7 @@ impl Turn {
             return Ok(());
         };
         let approval = self.pending.remove(position);
+        self.refused |= !approved;
         let wanted = if approved {
             "allow_once"
         } else {
@@ -1786,10 +1800,11 @@ mod tests {
             answer["result"],
             json!({"outcome": {"outcome": "selected", "optionId": "reject-once"}})
         );
-        fixture.finish_turn(&prompt, "end_turn").await;
+        // The CLI ends a turn in which an action was refused as cancelled.
+        fixture.finish_turn(&prompt, "cancelled").await;
         let (outcome, events) = fixture.outcome().await;
         assert_eq!(events[0], Event::ApprovalResolved { id: approval_id });
-        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!((outcome.status, outcome.error), (RunStatus::Completed, None));
     }
 
     #[tokio::test]
@@ -2208,7 +2223,8 @@ mod tests {
     fn the_approval_plugin_is_written_privately_and_asks_for_everything_but_reads() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("grok-approval");
+        // The real location has a space in it, and a path may hold a quote.
+        let dir = root.path().join("Application Support").join("grok's approval");
         std::fs::create_dir_all(dir.join("hooks")).unwrap();
         std::fs::write(dir.join("hooks/ask.sh"), "stale").unwrap();
         std::fs::write(dir.join("hooks/hooks.json"), "stale").unwrap();
@@ -2224,11 +2240,26 @@ mod tests {
         let hooks: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("hooks/hooks.json")).unwrap())
                 .unwrap();
+        let command = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap().to_owned();
         assert_eq!(
             hooks,
             json!({"hooks": {"PreToolUse": [{"hooks": [
-                {"type": "command", "command": script.to_str().unwrap(), "timeout": 10}
+                {"type": "command", "command": command, "timeout": 10}
             ]}]}})
+        );
+        // The CLI hands the command to a shell. It must start the script as written.
+        let mut through_shell = std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(through_shell.stdin.as_mut().unwrap(), br#"{"toolName":"write"}"#).unwrap();
+        let output = through_shell.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            r#"{"decision":"ask","reason":"Taceta asks before every action"}"#
         );
 
         let ask = r#"{"decision":"ask","reason":"Taceta asks before every action"}"#;
