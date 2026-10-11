@@ -550,7 +550,8 @@ impl TacetaApp {
                 if let Err(save_error) = saved { error = Some(save_error); }
             }
         }
-        self.notice = Some(Notice {
+        // A turn that simply finished needs no announcement; the answer is there.
+        self.notice = (status != GptRunStatus::Completed || error.is_some()).then(|| Notice {
             kind: if status == GptRunStatus::Failed { NoticeKind::Error } else { NoticeKind::Info },
             text: error.unwrap_or_else(|| gpt_status_label(self.language(), status).into()),
         });
