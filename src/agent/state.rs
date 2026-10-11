@@ -277,11 +277,6 @@ impl State {
             }
         }
         self.snapshot.event_count = record.seq;
-        if self.snapshot.messages.len() > 200 {
-            self.snapshot
-                .messages
-                .drain(..self.snapshot.messages.len() - 200);
-        }
         Ok(())
     }
 
