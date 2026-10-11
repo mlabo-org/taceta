@@ -8,6 +8,7 @@ use std::{
 };
 
 mod agent_ui;
+mod cli_ui;
 mod gpt_ui;
 mod provider_ui;
 
@@ -134,6 +135,7 @@ pub struct TacetaApp {
     provider_ui: provider_ui::ProviderUiState,
     agent_ui: agent_ui::AgentUiState,
     gpt_ui: gpt_ui::GptUiState,
+    cli_ui: cli_ui::CliUiState,
     model_refresh_pending: bool,
     models: Vec<ModelDescriptor>,
     connection: ConnectionState,
@@ -321,6 +323,7 @@ impl TacetaApp {
             provider_ui: provider_ui::ProviderUiState::default(),
             agent_ui: agent_ui::AgentUiState::new(data_roots.agent_sessions),
             gpt_ui: gpt_ui::GptUiState::new(data_roots.gpt_bindings),
+            cli_ui: cli_ui::CliUiState::new(),
             model_refresh_pending: false,
             models: Vec::new(),
             connection: ConnectionState::Connecting,
@@ -466,6 +469,10 @@ impl TacetaApp {
                 let result = client.list_models().await;
                 let _ = result_tx.send((epoch, result));
             });
+            return;
+        }
+        if let Some(agent) = self.cli_ui.agent(self.state.inference_provider) {
+            self.refresh_cli_models(agent, epoch);
             return;
         }
         let Some(backend) = self.backend.clone() else {
@@ -675,6 +682,7 @@ impl TacetaApp {
         self.drain_provider_work();
         self.drain_agent_work();
         self.drain_gpt_work();
+        self.drain_cli_work();
         if let Some(receiver) = &self.model_unload_result {
             let result = match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -1204,6 +1212,10 @@ impl TacetaApp {
             self.start_gpt_send();
             return;
         }
+        if self.is_cli_provider() {
+            self.start_cli_send();
+            return;
+        }
         if self.state.active_conversation().agent_enabled {
             self.start_agent_run(false);
             return;
@@ -1342,6 +1354,10 @@ impl TacetaApp {
         }
         if self.gpt_ui.active.is_some() {
             self.stop_gpt_run();
+            return;
+        }
+        if self.cli_ui.active.is_some() {
+            self.stop_cli_run();
             return;
         }
         if self.agent_ui.active.is_some() {
@@ -1980,6 +1996,7 @@ impl TacetaApp {
                                 match self.state.inference_provider {
                                     InferenceProvider::Grok => "Grok",
                                     InferenceProvider::Gpt => "GPT",
+                                    InferenceProvider::Claude => "Claude",
                                     InferenceProvider::Ollama => text(language, "ローカル接続", "Local ready"),
                                 },
                                 None,
@@ -3021,6 +3038,10 @@ impl TacetaApp {
             self.show_gpt_chat(root_ui);
             return;
         }
+        if self.is_cli_provider() {
+            self.show_cli_chat(root_ui);
+            return;
+        }
         if self.state.active_conversation().agent_enabled {
             self.show_agent_chat(root_ui);
             return;
@@ -3278,7 +3299,7 @@ impl TacetaApp {
                                         egui::Stroke::NONE;
                                     let file_clicked = ui
                                         .add_enabled(
-                                            !self.is_generating() && (!self.state.active_conversation().agent_enabled || self.state.inference_provider == InferenceProvider::Gpt),
+                                            !self.is_generating() && !self.is_cli_provider() && (!self.state.active_conversation().agent_enabled || self.state.inference_provider == InferenceProvider::Gpt),
                                             Button::new("＋")
                                                 .min_size(Vec2::splat(control.row_height))
                                                 .corner_radius(control.row_height / 2.0),
@@ -3335,7 +3356,7 @@ impl TacetaApp {
                                     } else {
                                         text(language, "Web: OFF", "Web: OFF")
                                     };
-                                    if self.state.inference_provider != InferenceProvider::Gpt && ui
+                                    if matches!(self.state.inference_provider, InferenceProvider::Ollama | InferenceProvider::Grok) && ui
                                         .add_enabled(
                                             web_available && !self.is_generating(),
                                             Button::new(web_label)
@@ -3796,6 +3817,7 @@ impl eframe::App for TacetaApp {
         self.show_unreadable_state_dialog(ui.ctx());
         self.show_agent_approval(ui.ctx());
         self.show_gpt_requests(ui.ctx());
+        self.show_cli_approval(ui.ctx());
         self.show_gpt_transfer(ui.ctx());
     }
 
@@ -3813,6 +3835,7 @@ impl Drop for TacetaApp {
     fn drop(&mut self) {
         self.abort_agent_on_exit();
         self.abort_gpt_on_exit();
+        self.abort_cli_on_exit();
         if let Some(login) = self.provider_ui.login.take() {
             login.task.abort();
         }

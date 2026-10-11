@@ -43,6 +43,17 @@ pub struct GptConversation {
     pub pending_handoff: bool,
 }
 
+/// One coding CLI's own session for a conversation. The conversation's
+/// messages are the record; the session is that CLI's working context.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CliSession {
+    pub session_id: String,
+    /// How many of the conversation's messages this session already holds.
+    /// Later messages came from another engine and are handed over on the
+    /// next turn.
+    pub seen_messages: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Conversation {
@@ -63,6 +74,8 @@ pub struct Conversation {
     /// Historical Codex references never own the current execution route.
     pub archived_gpt_thread_ids: Vec<String>,
     pub gpt_ownership_revision: u64,
+    pub cli_sessions: HashMap<InferenceProvider, CliSession>,
+    pub cli_usage: Option<GptUsage>,
 }
 
 impl Default for Conversation {
@@ -79,6 +92,8 @@ impl Default for Conversation {
             gpt: None,
             archived_gpt_thread_ids: Vec::new(),
             gpt_ownership_revision: 0,
+            cli_sessions: HashMap::new(),
+            cli_usage: None,
         }
     }
 }
@@ -178,6 +193,14 @@ pub struct PersistedAppState {
     /// the guide for existing users.
     #[serde(default = "default_link_setup_acknowledged")]
     pub taceta_link_setup_acknowledged: bool,
+    /// Whether coding CLIs ask Taceta before each action. When off, each
+    /// CLI's own permission settings decide.
+    #[serde(default = "default_cli_ask_every_time")]
+    pub cli_ask_every_time: bool,
+}
+
+fn default_cli_ask_every_time() -> bool {
+    true
 }
 
 impl Default for PersistedAppState {
@@ -198,6 +221,7 @@ impl Default for PersistedAppState {
             draft: String::new(),
             pending_attachments: Vec::new(),
             web_search_provider: ProviderKind::Brave,
+            cli_ask_every_time: true,
             max_search_results: 5,
             chatgpt_web_request_limit: DEFAULT_CHATGPT_WEB_REQUEST_LIMIT,
             fetch_search_pages: true,
