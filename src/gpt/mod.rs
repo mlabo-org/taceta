@@ -230,8 +230,11 @@ fn validate_effective_permissions(response:&Value,mode:GptMode,cwd:&str)->Result
         || response.get("approvalsReviewer").and_then(Value::as_str)!=Some("user") {
         return Err("Codex did not accept Taceta's sandbox and user-approval policy. No work was started.".into());
     }
-    if response.pointer("/sandbox/networkAccess").and_then(Value::as_bool)==Some(true) {
-        return Err("Codex enabled tool network access unexpectedly. No work was started.".into());
+    // A workspace-write sandbox must state that network access is off; an
+    // absent or re-typed field is not treated as off.
+    let network=response.pointer("/sandbox/networkAccess").and_then(Value::as_bool);
+    if network==Some(true) || (mode==GptMode::Coding && network!=Some(false)) {
+        return Err("Codex did not confirm that tool network access is off. No work was started.".into());
     }
     if mode==GptMode::Coding {
         let policy=response.get("sandbox").ok_or("Codex did not return its effective sandbox.")?;
@@ -476,6 +479,12 @@ mod tests {
         let mut response=json!({"approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite","writableRoots":["/workspace"],"networkAccess":false,"excludeSlashTmp":true,"excludeTmpdirEnvVar":true}});
         assert!(validate_effective_permissions(&response,GptMode::Coding,"/workspace").is_ok());
         response["sandbox"]["networkAccess"]=json!(true);
+        assert!(validate_effective_permissions(&response,GptMode::Coding,"/workspace").is_err());
+        for unconfirmed in [json!("false"),Value::Null] {
+            response["sandbox"]["networkAccess"]=unconfirmed;
+            assert!(validate_effective_permissions(&response,GptMode::Coding,"/workspace").is_err());
+        }
+        response["sandbox"].as_object_mut().unwrap().remove("networkAccess");
         assert!(validate_effective_permissions(&response,GptMode::Coding,"/workspace").is_err());
         response["sandbox"]["networkAccess"]=json!(false);response["approvalsReviewer"]=json!("auto_review");
         assert!(validate_effective_permissions(&response,GptMode::Coding,"/workspace").is_err());
