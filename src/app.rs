@@ -142,6 +142,9 @@ pub struct TacetaApp {
     ollama_custom_endpoint_draft: String,
     model_storage_path: PathBuf,
     home: PathBuf,
+    /// Set once this session has asked the local engine to load a model, so
+    /// quitting releases that memory.
+    ollama_used: bool,
     generation: Option<ActiveGeneration>,
     external_preview_ids: HashSet<Uuid>,
     notice: Option<Notice>,
@@ -326,6 +329,7 @@ impl TacetaApp {
             ollama_custom_endpoint_draft,
             model_storage_path: data_roots.model_storage,
             home: data_roots.home,
+            ollama_used: false,
             generation: None,
             external_preview_ids: HashSet::new(),
             notice: None,
@@ -1323,6 +1327,7 @@ impl TacetaApp {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        self.ollama_used |= self.state.inference_provider == InferenceProvider::Ollama;
         let task = self.runtime.spawn(async move {
             let result = backend.stream_chat(request, event_tx).await;
             let _ = result_tx.send(result);
@@ -3826,6 +3831,21 @@ impl Drop for TacetaApp {
         if let Some(pull) = self.model_pull.take() {
             pull.task.abort();
         }
+        self.release_local_models_on_exit();
+    }
+}
+
+impl TacetaApp {
+    /// Quitting must not leave models in memory with no app using them. The
+    /// wait is bounded so a stuck engine cannot keep the app from closing.
+    fn release_local_models_on_exit(&mut self) {
+        if !self.ollama_used {
+            return;
+        }
+        let manager = Arc::clone(&self.model_manager);
+        let _ = self.runtime.block_on(async move {
+            tokio::time::timeout(Duration::from_secs(20), manager.unload_all()).await
+        });
     }
 }
 

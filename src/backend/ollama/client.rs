@@ -2,7 +2,7 @@ use super::{
     api::{ChatBody, ChatOptions, PullBody, PullChunk, ShowResponse, TagsResponse, WireMessage},
     capability,
     endpoint::OllamaEndpoint,
-    lifecycle, router, stream,
+    lifecycle, memory, router, stream,
 };
 use crate::{
     backend::{BackendError, BackendFuture, InferenceBackend, ModelManager},
@@ -57,6 +57,8 @@ impl crate::agent::AgentModel for OllamaClient {
                 return Err("Select a Thinking setting advertised by this Ollama model.".into());
             }
             lifecycle::ensure_ready(&client.http, &client.endpoint)
+                .await.map_err(|error| error.to_string())?;
+            memory::release_all_but(&client.http, &client.endpoint, &request.model)
                 .await.map_err(|error| error.to_string())?;
             let body = agent_chat_body(request);
             let response = client.http.post(client.url("/api/chat"))
@@ -148,7 +150,7 @@ mod agent_adapter_tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut captured = None;
-            for round in 0..2 {
+            for round in 0..5 {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut bytes = Vec::new();
@@ -172,6 +174,20 @@ mod agent_adapter_tests {
                 let response = if round == 0 {
                     assert!(bytes.starts_with(b"GET /api/version "));
                     "{}".to_owned()
+                } else if round == 1 {
+                    // Another model is loaded: it is released before this one is used.
+                    assert!(bytes.starts_with(b"GET /api/ps "));
+                    r#"{"models":[{"name":"other-model"},{"name":"fixture-model"}]}"#.to_owned()
+                } else if round == 2 {
+                    assert!(bytes.starts_with(b"POST /api/generate "));
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&bytes[header_end..header_end + length]).unwrap(),
+                        serde_json::json!({"model":"other-model","keep_alive":0,"stream":false})
+                    );
+                    r#"{"done":true}"#.to_owned()
+                } else if round == 3 {
+                    assert!(bytes.starts_with(b"GET /api/ps "));
+                    r#"{"models":[{"name":"fixture-model"}]}"#.to_owned()
                 } else {
                     assert!(bytes.starts_with(b"POST /api/chat "));
                     captured = Some(serde_json::from_slice::<serde_json::Value>(&bytes[header_end..header_end + length]).unwrap());
@@ -244,6 +260,7 @@ impl InferenceBackend for OllamaClient {
                 ));
             }
             lifecycle::ensure_ready(&client.http, &client.endpoint).await?;
+            memory::release_all_but(&client.http, &client.endpoint, &request.model).await?;
             let tools = validate_tools(request.tools.as_ref())?;
             let mut routing_thinking = crate::domain::ThinkingCapability::Unverified;
             if tools.is_some() {
@@ -1279,56 +1296,17 @@ impl ModelManager for OllamaModelManager {
     fn unload_all(&self) -> BackendFuture<usize> {
         let manager = self.clone_for_task();
         Box::pin(async move {
-            async fn loaded_models(manager: &OllamaModelManager) -> Result<Vec<String>, BackendError> {
-                #[derive(serde::Deserialize)]
-                struct RunningModels { models: Vec<RunningModel> }
-                #[derive(serde::Deserialize)]
-                struct RunningModel { name: String }
-                let running: RunningModels = manager.http.get(manager.url("/api/ps"))
-                    .timeout(Duration::from_secs(5)).send().await?
-                    .error_for_status()?.json().await?;
-                let mut seen = HashSet::new();
-                Ok(running.models.into_iter().map(|m| m.name)
-                    .filter(|name| seen.insert(name.clone())).collect())
-            }
             // Snapshot only currently loaded models. Never start an idle server
             // or chase new workloads started by another client during unloading.
-            tokio::time::timeout(Duration::from_secs(30), async {
-                let models = loaded_models(&manager).await?;
-                if models.is_empty() { return Ok(0); }
-                let mut errors = Vec::new();
-                for model in &models {
-                    let result: Result<(), BackendError> = async {
-                        let response = manager.http.post(manager.url("/api/generate"))
-                            .timeout(Duration::from_secs(5))
-                            .json(&serde_json::json!({"model": model, "keep_alive": 0, "stream": false}))
-                            .send().await?;
-                        let status = response.status();
-                        let body: serde_json::Value = response.json().await?;
-                        if !status.is_success() {
-                            return Err(BackendError::Protocol(format!("{status}: {}",
-                                body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error"))));
-                        }
-                        if body.get("done").and_then(|v| v.as_bool()) != Some(true) {
-                            return Err(BackendError::Protocol("model unload was not acknowledged".into()));
-                        }
-                        Ok(())
-                    }.await;
-                    if let Err(error) = result { errors.push(format!("{model}: {error}")); }
-                }
-                if !errors.is_empty() {
-                    return Err(BackendError::Protocol(format!("Some models could not be unloaded: {}", errors.join("; "))));
-                }
-                loop {
-                    let running = loaded_models(&manager).await?;
-                    if running.is_empty() { return Ok(models.len()); }
-                    if running.iter().all(|name| !models.contains(name)) {
-                        return Err(BackendError::Protocol(format!(
-                            "New models were loaded during memory release: {}", running.join(", "))));
-                    }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-            }).await.map_err(|_| BackendError::Protocol("model unload timed out after 30 seconds".into()))?
+            let models = memory::loaded(&manager.http, &manager.endpoint).await?;
+            let running = memory::release(&manager.http, &manager.endpoint, &models).await?;
+            if !running.is_empty() {
+                return Err(BackendError::Protocol(format!(
+                    "New models were loaded during memory release: {}",
+                    running.join(", ")
+                )));
+            }
+            Ok(models.len())
         })
     }
 

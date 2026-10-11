@@ -245,7 +245,10 @@ impl TacetaApp {
         };
         let submitted_prompt = config.prompt.clone();
         let backend: Arc<dyn AgentModel> = match self.state.inference_provider {
-            InferenceProvider::Ollama => Arc::new(OllamaClient::new(self.ollama_endpoint.clone())),
+            InferenceProvider::Ollama => {
+                self.ollama_used = true;
+                Arc::new(OllamaClient::new(self.ollama_endpoint.clone()))
+            }
             InferenceProvider::Grok => Arc::clone(&self.provider_ui.grok) as Arc<dyn AgentModel>,
             InferenceProvider::Gpt => return,
         };
