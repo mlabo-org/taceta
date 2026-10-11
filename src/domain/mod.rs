@@ -261,6 +261,9 @@ pub struct GenerationStats {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_duration_ns: Option<u64>,
+    /// The model stopped because it reached its output limit, not because
+    /// it had finished.
+    pub reached_output_limit: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

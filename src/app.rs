@@ -868,6 +868,11 @@ impl TacetaApp {
         }
 
         if let Some((conversation_id, assistant_id)) = target {
+            // The notice about an answer cut off at the output limit outlives
+            // the successful end of the request that follows it.
+            let cut_off = events
+                .iter()
+                .any(|event| matches!(event, GenerationEvent::Completed(stats) if stats.reached_output_limit));
             for event in events {
                 self.apply_generation_event(conversation_id, assistant_id, event);
             }
@@ -876,7 +881,9 @@ impl TacetaApp {
                 match generation_result {
                     Ok(()) => {
                         self.connection = ConnectionState::Ready;
-                        self.notice = None;
+                        if !cut_off {
+                            self.notice = None;
+                        }
                     }
                     Err(error) => {
                         let web_failure = matches!(error, BackendError::Web(_));
@@ -983,7 +990,19 @@ impl TacetaApp {
                     }
                 });
             }
-            GenerationEvent::Completed(_) => {}
+            GenerationEvent::Completed(stats) => {
+                if stats.reached_output_limit {
+                    self.notice = Some(Notice {
+                        kind: NoticeKind::Warning,
+                        text: text(
+                            self.language(),
+                            "モデルの出力上限に達したため、この回答は途中で終わっています。続きを頼むか、コンテキスト長を大きくしてください。",
+                            "This answer stops early: the model reached its output limit. Ask it to continue, or raise the context length.",
+                        )
+                        .to_owned(),
+                    });
+                }
+            }
         }
         self.scroll_to_bottom = true;
     }

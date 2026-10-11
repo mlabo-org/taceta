@@ -55,6 +55,10 @@ impl Summarizer {
                     match event {
                         GenerationEvent::ContentDelta(delta) => text.push_str(&delta),
                         GenerationEvent::ReplaceContent(content) => text = content,
+                        // A summary that was cut off must not stand in for the conversation.
+                        GenerationEvent::Completed(stats) if stats.reached_output_limit => {
+                            return Err("The model reached its output limit before finishing the summary.".into());
+                        }
                         _ => {}
                     }
                 }
