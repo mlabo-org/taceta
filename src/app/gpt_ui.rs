@@ -636,7 +636,7 @@ impl TacetaApp {
             return;
         }
         if let Some(storage) = storage {
-            save_app_state(storage, &self.state);
+            save_app_state(storage, &self.state, &mut self.unreadable_state);
             storage.flush();
         }
         if let Some(thread_id) = thread_id.filter(|_| !*active.cancel.borrow()) {

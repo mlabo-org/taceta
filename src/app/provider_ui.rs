@@ -296,9 +296,43 @@ mod tests {
     }
 
     #[test]
+    fn undecodable_saved_state_is_kept_verbatim_when_a_new_state_replaces_it() {
+        use eframe::Storage;
+        const KEY: &str = "taceta.application-state.v1";
+        let mut storage = MemoryStorage::default();
+        assert!(load_app_state(Some(&storage)).unreadable.is_none());
+
+        let mut state = load_app_state(Some(&storage)).state;
+        state.ollama_custom_endpoint = "http://127.0.0.1:23456".into();
+        save_app_state(&mut storage, &state, &mut None);
+        let readable = storage.get_string(KEY).unwrap();
+        assert!(load_app_state(Some(&storage)).unreadable.is_none());
+        assert_eq!(storage.0.len(), 1);
+
+        let from_newer_build = readable.replace("Ollama", "ProviderFromANewerBuild");
+        assert_ne!(from_newer_build, readable);
+        storage.set_string(KEY, from_newer_build.clone());
+        let loaded = load_app_state(Some(&storage));
+        assert_eq!(loaded.unreadable.as_deref(), Some(from_newer_build.as_str()));
+        assert_eq!(loaded.state.ollama_custom_endpoint, PersistedAppState::default().ollama_custom_endpoint);
+
+        let mut unreadable = loaded.unreadable;
+        save_app_state(&mut storage, &loaded.state, &mut unreadable);
+        assert!(unreadable.is_none());
+        let kept: Vec<_> = storage
+            .0
+            .iter()
+            .filter(|(key, _)| key.starts_with(crate::persistence::UNREADABLE_APP_STATE_KEY_PREFIX))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, &from_newer_build);
+        assert!(load_app_state(Some(&storage)).unreadable.is_none());
+    }
+
+    #[test]
     fn provider_and_workspace_survive_storage_without_changing_old_defaults() {
         let mut storage = MemoryStorage::default();
-        let mut state = load_app_state(Some(&storage));
+        let mut state = load_app_state(Some(&storage)).state;
         assert_eq!(state.inference_provider, InferenceProvider::Ollama);
         assert!(!state.active_conversation().agent_enabled);
         state.switch_provider(InferenceProvider::Grok);
@@ -315,8 +349,8 @@ mod tests {
         state.agent_max_steps = 120;
         state.agent_max_duration_secs = 7_200;
         state.show_thinking_trace = true;
-        save_app_state(&mut storage, &state);
-        let restored = load_app_state(Some(&storage));
+        save_app_state(&mut storage, &state, &mut None);
+        let restored = load_app_state(Some(&storage)).state;
         assert_eq!(restored.inference_provider, InferenceProvider::Grok);
         assert_eq!(
             restored.provider_models[&InferenceProvider::Ollama],
