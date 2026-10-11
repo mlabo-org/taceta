@@ -100,7 +100,7 @@ GrokとClaudeは、各社の公式CLIを無改変のまま子プロセスとし�
 
 CLIは利用者の通常のログインと設定（`~/.grok`、`~/.claude`）をそのまま使います。そのCLIに設定済みのMCPサーバー、フック、スキルも働きます。
 
-GrokとClaudeは作業専用です。作業フォルダーが必要で、ツールを使わない通常チャット、添付、Taceta LinkによるWeb検索は提供しません。
+GrokとClaudeには「作業」と「チャット」があります。新しい会話は「作業」で始まり、作業フォルダーが必要です。「チャット」は会話だけを行い、作業フォルダーを使わず、ファイルの読み書きもコマンドの実行もしません。Claudeは組み込みの道具もMCPサーバーもなしで起動し、Grokには道具を止める起動オプションがないため、Tacetaが読み込ませる小さなプラグインのフックがすべての道具の呼び出しを拒否します（`~/Library/Application Support/Taceta/GrokApprovalPluginNoTools`）。Grokのフックは、時間切れや異常終了のときは呼び出しを止めない作りなので、その場合はGrok自身の権限設定が判断します。CLIはTaceta専用の空のフォルダー（`~/Library/Application Support/Taceta/CliChatWorkspace`）で動きます。モードを切り替えると、その会話のCLIセッションは作り直し、それまでの会話は次の送信で渡します。どちらのモードでも、添付とTaceta LinkによるWeb検索は提供しません。
 
 「毎回確認」では、ファイルの変更とコマンドの実行を、実行前に1件ずつTacetaで確認します。Claudeは手動の権限モード（`--permission-mode manual`）で起動します。Grokでは、ツール実行前のフックで確認を求める小さなプラグインをTacetaが読み込ませます。このプラグインは `~/Library/Application Support/Taceta/GrokApprovalPlugin` に置き、読み取り専用のツールについては確認しません。「自動承認」ではCLI自身の権限設定に従います。設定によっては、確認なしでファイルの変更とコマンドの実行が行われます。
 
@@ -329,7 +329,7 @@ Grok and Claude are used by running each vendor's official, unmodified CLI as a 
 
 Each CLI uses your normal login and settings (`~/.grok`, `~/.claude`) as they are, including that CLI's own MCP servers, hooks and skills.
 
-Grok and Claude are task-only. They need a workspace; there is no plain tool-less chat mode, no attachments, and no Taceta Link Web Search for them.
+Grok and Claude have Task and Chat. A new conversation starts in Task, which needs a workspace. Chat is conversation only: it uses no workspace, reads and changes no file, and runs no command. Claude is started with no built-in tools and no MCP servers. Grok has no option that starts it without tools, so a small plugin loaded by Taceta refuses every tool call through its pre-tool hook (`~/Library/Application Support/Taceta/GrokApprovalPluginNoTools`). A Grok hook that times out or crashes does not stop the call; Grok's own permission settings then decide. The CLI runs in an empty folder of Taceta's own (`~/Library/Application Support/Taceta/CliChatWorkspace`). Switching the mode starts new CLI sessions for that conversation, and the conversation so far is handed over with the next request. Neither mode has attachments or Taceta Link Web Search.
 
 With Ask every time, each file change and command is confirmed in Taceta before it runs. Claude is started with manual permission mode (`--permission-mode manual`). For Grok, Taceta loads a small plugin whose pre-tool hook asks; it is kept under `~/Library/Application Support/Taceta/GrokApprovalPlugin`, and read-only tools are not asked about. With Automatic, the CLI's own permission settings decide. Depending on them, files may change and commands may run without confirmation.
 

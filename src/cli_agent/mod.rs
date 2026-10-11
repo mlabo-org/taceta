@@ -23,6 +23,9 @@ pub enum ApprovalPolicy {
     /// The CLI's own permission settings decide; Taceta is asked only when
     /// those settings ask.
     FollowCli,
+    /// Nothing may run: the turn is conversation only. The CLI is started
+    /// without tools where it can be, and every tool call is refused.
+    NoTools,
 }
 
 #[derive(Clone, Debug)]

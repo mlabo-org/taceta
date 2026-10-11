@@ -32,6 +32,8 @@ pub(super) struct ActiveCli {
     tools: Vec<ToolItem>,
     approvals: VecDeque<(ApprovalRequest, std::time::Instant)>,
     session_id: Option<String>,
+    /// The turn is conversation only; anything that asks is refused.
+    no_tools: bool,
 }
 
 pub(super) struct CliUiState {
@@ -40,6 +42,9 @@ pub(super) struct CliUiState {
     pub(super) active: Option<ActiveCli>,
     readiness: HashMap<InferenceProvider, Result<Readiness, String>>,
     readiness_result: Option<(InferenceProvider, std_mpsc::Receiver<Result<Readiness, String>>)>,
+    /// Where the CLIs run for a conversation without tools: an empty folder
+    /// of Taceta's own, so no project is opened.
+    chat_workspace: PathBuf,
 }
 
 impl CliUiState {
@@ -48,6 +53,7 @@ impl CliUiState {
     pub(super) fn new(grok_approval_plugin: PathBuf) -> Self {
         Self {
             claude: Arc::new(ClaudeCode),
+            chat_workspace: grok_approval_plugin.with_file_name("CliChatWorkspace"),
             grok: Arc::new(GrokCli::new(grok_approval_plugin)),
             active: None,
             readiness: HashMap::new(),
@@ -119,6 +125,21 @@ impl TacetaApp {
                 if self.state.inference_provider != provider {
                     return;
                 }
+                let chat = self.state.active_conversation().cli_chat;
+                let mut selected = chat;
+                ui.add_enabled_ui(!self.is_generating(), |ui| {
+                    ui.selectable_value(&mut selected, true, text(language, "チャット", "Chat"));
+                    ui.selectable_value(&mut selected, false, text(language, "作業", "Task"));
+                });
+                if selected != chat {
+                    let conversation = self.state.active_conversation_mut();
+                    conversation.cli_chat = selected;
+                    // A CLI session belongs to the folder and tools it was started with.
+                    conversation.cli_sessions.clear();
+                }
+                if selected {
+                    return;
+                }
                 let workspace = self.state.active_conversation().workspace.clone();
                 let label = workspace
                     .as_ref()
@@ -158,7 +179,13 @@ impl TacetaApp {
                 return;
             }
             ui.label(
-                RichText::new(if self.state.cli_ask_every_time {
+                RichText::new(if self.state.active_conversation().cli_chat {
+                    text(
+                        language,
+                        "会話だけを行います。ファイルの読み書きもコマンドの実行もしません。作業フォルダーは使いません。",
+                        "Conversation only. No file is read or changed and no command runs. No workspace is used.",
+                    )
+                } else if self.state.cli_ask_every_time {
                     text(
                         language,
                         "ファイルの変更とコマンドの実行は、1件ずつこの画面で確認します。",
@@ -172,7 +199,7 @@ impl TacetaApp {
                     )
                 })
                 .small()
-                .color(if self.state.cli_ask_every_time {
+                .color(if self.state.cli_ask_every_time || self.state.active_conversation().cli_chat {
                     ui.visuals().weak_text_color()
                 } else {
                     theme::palette(ui).warning
@@ -236,10 +263,23 @@ impl TacetaApp {
         if self.state.draft.trim().is_empty() {
             return;
         }
-        let Some(workspace) = self.state.active_conversation().workspace.clone() else {
+        let chat = self.state.active_conversation().cli_chat;
+        let workspace = if chat {
+            let folder = self.cli_ui.chat_workspace.clone();
+            if let Err(error) = std::fs::create_dir_all(&folder) {
+                self.notice = Some(Notice {
+                    kind: NoticeKind::Error,
+                    text: format!("{}: {error}", folder.display()),
+                });
+                return;
+            }
+            folder
+        } else if let Some(workspace) = self.state.active_conversation().workspace.clone() {
+            workspace
+        } else {
             self.notice = Some(Notice {
                 kind: NoticeKind::Warning,
-                text: text(language, "作業フォルダーを選んでください。", "Choose a workspace first.").to_owned(),
+                text: text(language, "作業フォルダーを選ぶか、「チャット」に切り替えてください。", "Choose a workspace, or switch to Chat.").to_owned(),
             });
             return;
         };
@@ -283,7 +323,9 @@ impl TacetaApp {
             model: model.map(|model| model.name),
             effort,
             prompt: session_prompt,
-            approval: if self.state.cli_ask_every_time {
+            approval: if chat {
+                ApprovalPolicy::NoTools
+            } else if self.state.cli_ask_every_time {
                 ApprovalPolicy::AskEveryTime
             } else {
                 ApprovalPolicy::FollowCli
@@ -311,6 +353,7 @@ impl TacetaApp {
             tools: Vec::new(),
             approvals: VecDeque::new(),
             session_id,
+            no_tools: chat,
         });
         self.scroll_to_bottom = true;
     }
@@ -387,6 +430,9 @@ impl TacetaApp {
                 Some(existing) => *existing = item,
                 None => active.tools.push(item),
             },
+            Event::Approval(request) if active.no_tools => {
+                let _ = active.controls.send(Control::Approval { id: request.id, approved: false });
+            }
             Event::Approval(request) => {
                 active.approvals.push_back((request, std::time::Instant::now()));
             }
@@ -672,6 +718,7 @@ mod tests {
             tools: Vec::new(),
             approvals: VecDeque::new(),
             session_id: None,
+            no_tools: false,
         });
         (event_tx, control_rx, result_tx)
     }

@@ -89,6 +89,8 @@ pub struct Conversation {
     pub summary: Option<taceta::prior_context::Summary>,
     /// What was typed here and not sent, kept while another conversation is open.
     pub draft: String,
+    /// With Grok or Claude: talk only, with no tools and no workspace.
+    pub cli_chat: bool,
 }
 
 impl Default for Conversation {
@@ -110,6 +112,7 @@ impl Default for Conversation {
             task_seen_messages: None,
             summary: None,
             draft: String::new(),
+            cli_chat: false,
         }
     }
 }

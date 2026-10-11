@@ -71,7 +71,8 @@ impl Summarizer {
                         model: model.clone(),
                         effort: None,
                         prompt: request,
-                        approval: ApprovalPolicy::AskEveryTime,
+                        // Writing a summary needs no tools at all.
+                        approval: ApprovalPolicy::NoTools,
                         max_duration_secs: SUMMARY_TIME_LIMIT_SECS,
                     },
                     events,
