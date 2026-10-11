@@ -567,19 +567,7 @@ fn generation_messages(messages: &[ChatMessage], web_enabled: bool) -> Vec<WireM
 }
 
 fn message_is_model_context(message: &ChatMessage) -> bool {
-    if message.interrupted {
-        return false;
-    }
-    if message.role != Role::Assistant {
-        return true;
-    }
-    !matches!(
-        message.content.trim(),
-        "生成を停止しました"
-            | "生成を停止しました。"
-            | "Generation stopped"
-            | "Generation stopped."
-    )
+    !message.interrupted
 }
 
 fn validate_tools(
@@ -2223,7 +2211,6 @@ mod tests {
         let messages = vec![
             ChatMessage::new_user("first question"),
             interrupted,
-            ChatMessage::new_assistant("生成を停止しました"),
             ChatMessage::new_user("current question"),
         ];
         let wired = wire_conversation_messages(&messages);

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use taceta::backend::OllamaEndpointMode;
 use taceta::domain::{
-    Attachment, ChatMessage, DEFAULT_CHATGPT_WEB_REQUEST_LIMIT, InferenceProvider, ThinkingMode,
+    Attachment, ChatMessage, DEFAULT_CHATGPT_WEB_REQUEST_LIMIT, InferenceProvider, Role, ThinkingMode,
     normalize_chatgpt_web_request_limit,
 };
 use taceta::web_search::ProviderKind;
@@ -233,6 +233,17 @@ impl PersistedAppState {
             self.inference_provider
         };
         for conversation in &mut self.conversations {
+            // Stop placeholders saved before the interrupted flag existed.
+            for message in &mut conversation.messages {
+                if message.role == Role::Assistant
+                    && matches!(
+                        message.content.trim(),
+                        "生成を停止しました" | "生成を停止しました。" | "Generation stopped" | "Generation stopped."
+                    )
+                {
+                    message.interrupted = true;
+                }
+            }
             if conversation.is_gpt() {
                 conversation.provider = Some(InferenceProvider::Gpt);
                 let gpt = conversation.gpt.get_or_insert_with(Default::default);
@@ -663,6 +674,18 @@ pub fn save_app_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_placeholders_saved_without_the_flag_are_marked_interrupted() {
+        let mut state = PersistedAppState::default();
+        let messages = &mut state.conversations[0].messages;
+        messages.push(ChatMessage::new_assistant("生成を停止しました。"));
+        messages.push(ChatMessage::new_assistant("An answer that mentions Generation stopped."));
+        let state = state.normalized();
+        let messages = &state.conversations[0].messages;
+        assert!(messages[0].interrupted);
+        assert!(!messages[1].interrupted);
+    }
 
     #[test]
     fn gpt_saved_owner_thread_and_controls_round_trip_without_changing_old_defaults() {
