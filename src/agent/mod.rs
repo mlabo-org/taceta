@@ -737,6 +737,7 @@ impl AgentSession {
     fn search_history(&self, arguments: HistorySearch) -> Result<String, String> {
         let mut matches = Vec::new();
         let mut next_seq = None;
+        let needle = as_written_in_json(&arguments.query)?;
         for record in self
             .journal
             .records
@@ -744,7 +745,7 @@ impl AgentSession {
             .filter(|record| record.seq >= arguments.start_seq)
         {
             let raw = serde_json::to_string(record).map_err(|e| e.to_string())?;
-            if let Some(position) = raw.find(&arguments.query) {
+            if let Some(position) = raw.find(&needle) {
                 if matches.len() == arguments.limit {
                     next_seq = Some(record.seq);
                     break;
@@ -753,7 +754,7 @@ impl AgentSession {
                 while !raw.is_char_boundary(start) {
                     start -= 1;
                 }
-                let mut end = (position + arguments.query.len() + 240).min(raw.len());
+                let mut end = (position + needle.len() + 240).min(raw.len());
                 while !raw.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -1007,3 +1008,28 @@ async fn wait_approval(
 
 #[cfg(test)]
 mod tests;
+
+/// Events are searched in their stored JSON form, where a line break, a
+/// quotation mark or a backslash in the original text is written escaped.
+/// The query is put in the same form so that such text is still found.
+fn as_written_in_json(query: &str) -> Result<String, String> {
+    let quoted = serde_json::to_string(query).map_err(|e| e.to_string())?;
+    Ok(quoted[1..quoted.len() - 1].to_owned())
+}
+
+#[cfg(test)]
+mod history_search_tests {
+    use super::as_written_in_json;
+
+    #[test]
+    fn text_with_quotes_and_line_breaks_is_found_in_a_stored_event() {
+        let original = "She said \"run it\"\nthen path C:\\temp と日本語";
+        let stored = serde_json::json!({"seq": 7, "content": original}).to_string();
+        for query in ["said \"run it\"", "it\"\nthen", "C:\\temp", "と日本語", "plain"] {
+            let found = stored.contains(&as_written_in_json(query).unwrap());
+            assert_eq!(found, original.contains(query), "{query:?}");
+        }
+        // The raw text itself would have missed the escaped forms.
+        assert!(!stored.contains("it\"\nthen"));
+    }
+}
