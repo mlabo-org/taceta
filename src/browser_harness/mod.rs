@@ -145,6 +145,9 @@ pub enum ProtocolError {
     Oversize(usize),
     #[error("truncated frame: expected {expected} bytes, received {received}")]
     Truncated { expected: usize, received: usize },
+    /// The peer closed the stream between frames.
+    #[error("connection closed")]
+    Closed,
     #[error("invalid JSON frame: {0}")]
     InvalidJson(#[from] serde_json::Error),
     #[error("unsupported schema version {0}")]
@@ -185,16 +188,16 @@ pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Result<
 
 pub fn read_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T, ProtocolError> {
     let mut header = [0u8; 4];
-    reader.read_exact(&mut header).map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            ProtocolError::Truncated {
-                expected: 4,
-                received: 0,
-            }
-        } else {
-            e.into()
+    let mut received = 0;
+    while received < header.len() {
+        match reader.read(&mut header[received..]) {
+            Ok(0) if received == 0 => return Err(ProtocolError::Closed),
+            Ok(0) => return Err(ProtocolError::Truncated { expected: header.len(), received }),
+            Ok(count) => received += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
         }
-    })?;
+    }
     let length = u32::from_le_bytes(header) as usize;
     if length > MAX_FRAME_BYTES {
         return Err(ProtocolError::Oversize(length));
@@ -462,6 +465,14 @@ mod tests {
         assert!(matches!(
             read_frame::<_, serde_json::Value>(&mut b.as_slice()),
             Err(ProtocolError::Truncated { .. })
+        ));
+        assert!(matches!(
+            read_frame::<_, serde_json::Value>(&mut [].as_slice()),
+            Err(ProtocolError::Closed)
+        ));
+        assert!(matches!(
+            read_frame::<_, serde_json::Value>(&mut [3u8, 0].as_slice()),
+            Err(ProtocolError::Truncated { expected: 4, received: 2 })
         ));
     }
     #[test]
