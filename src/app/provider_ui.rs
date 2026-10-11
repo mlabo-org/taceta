@@ -1,46 +1,20 @@
 use super::*;
-use taceta::backend::{GrokClient, GrokLoginEvent};
-
-pub(super) struct LoginTask {
-    pub task: JoinHandle<()>,
-    events: mpsc::UnboundedReceiver<GrokLoginEvent>,
-    result: std_mpsc::Receiver<Result<(), String>>,
-}
-
-pub(super) struct ProviderUiState {
-    pub grok: Arc<GrokClient>,
-    pub login: Option<LoginTask>,
-}
-
-impl Default for ProviderUiState {
-    fn default() -> Self {
-        Self {
-            grok: Arc::new(GrokClient::new()),
-            login: None,
-        }
-    }
-}
 
 impl TacetaApp {
     pub(super) fn is_generating(&self) -> bool {
         self.generation.is_some() || self.agent_ui.active.is_some() || self.gpt_ui.active.is_some()
-            || self.cli_ui.active.is_some() || self.gpt_ui.is_transferring()
+            || self.cli_ui.active.is_some()
     }
 
     fn can_change_provider(&self) -> bool {
         !self.is_generating()
             && self.model_pull.is_none()
             && self.model_unload_result.is_none()
-            && self.provider_ui.login.is_none()
             && !self.gpt_ui.auth_busy()
     }
 
     pub(super) fn select_provider(&mut self, provider: InferenceProvider) {
         if provider == self.state.inference_provider || !self.can_change_provider() {
-            return;
-        }
-        if provider == InferenceProvider::Grok && self.state.active_conversation().requires_gpt_reverse_transfer() {
-            self.start_gpt_reverse_transfer();
             return;
         }
         self.state.switch_provider(provider);
@@ -53,10 +27,7 @@ impl TacetaApp {
                 OllamaClient::new(self.ollama_endpoint.clone())
                     .with_link_service(Arc::clone(&self.link_service)),
             ) as Arc<dyn InferenceBackend>),
-            InferenceProvider::Grok => {
-                Some(Arc::clone(&self.provider_ui.grok) as Arc<dyn InferenceBackend>)
-            }
-            InferenceProvider::Gpt | InferenceProvider::Claude => None,
+            InferenceProvider::Grok | InferenceProvider::Gpt | InferenceProvider::Claude => None,
         };
         self.invalidate_model_list();
         self.notice = None;
@@ -93,183 +64,13 @@ impl TacetaApp {
         ui.heading(text(language, "推論の接続先", "Inference provider"));
         self.show_provider_selector(ui);
         ui.label(text(language,
-            "Ollamaは設定したサーバーを使います。GrokはxAI、GPTはOpenAIへ会話と作業に必要な内容を送ります。GPTはCodexの会話履歴を使います。",
-            "Ollama uses your configured server. Grok sends task context to xAI; GPT sends it to OpenAI. GPT conversations use Codex history."));
+            "Ollamaは設定したサーバーを使います。GPTはOpenAI、GrokはxAI、ClaudeはAnthropicへ、会話と作業に必要な内容を送ります。GrokとClaudeは、このMacに入っている各社の公式CLIを、あなた自身のログインと設定のまま使います。サインインは各CLIで行ってください。",
+            "Ollama uses your configured server. GPT sends task context to OpenAI, Grok to xAI and Claude to Anthropic. Grok and Claude run each vendor's official CLI installed on this Mac with your own login and settings. Sign in with each CLI itself."));
         ui.add_space(8.0);
         if self.state.inference_provider == InferenceProvider::Gpt {
             self.show_gpt_settings(ui);
-            ui.add_space(20.0);
-            return;
         }
-        if self.state.inference_provider == InferenceProvider::Ollama {
-            ui.add_space(20.0);
-            return;
-        }
-        ui.horizontal(|ui| {
-            if self.provider_ui.login.is_some() {
-                ui.spinner();
-                ui.label(text(
-                    language,
-                    "ブラウザーでGrokのログインを完了してください。",
-                    "Complete Grok sign-in in your browser.",
-                ));
-                if ui.button(text(language, "中止", "Cancel")).clicked() {
-                    if let Some(login) = self.provider_ui.login.take() {
-                        login.task.abort();
-                    }
-                    self.notice = Some(Notice {
-                        kind: NoticeKind::Info,
-                        text: text(
-                            language,
-                            "Grok接続を中止しました。",
-                            "Grok sign-in cancelled.",
-                        )
-                        .into(),
-                    });
-                }
-            } else {
-                if ui
-                    .add_enabled(
-                        !self.is_generating(),
-                        Button::new(text(
-                            language,
-                            "Grokに接続（OAuth）",
-                            "Connect Grok (OAuth)",
-                        )),
-                    )
-                    .clicked()
-                {
-                    self.start_grok_login();
-                }
-                if ui
-                    .add_enabled(
-                        !self.is_generating(),
-                        Button::new(text(language, "Grok接続を解除", "Disconnect Grok")),
-                    )
-                    .clicked()
-                {
-                    match self.provider_ui.grok.sign_out() {
-                        Ok(()) => {
-                            if self.state.inference_provider == InferenceProvider::Grok {
-                                self.invalidate_model_list();
-                                self.state.selected_model = None;
-                                self.connection = ConnectionState::Unavailable(
-                                    text(
-                                        language,
-                                        "Grokへの再接続が必要です。",
-                                        "Reconnect Grok to continue.",
-                                    )
-                                    .into(),
-                                );
-                            }
-                            self.notice = Some(Notice {
-                                kind: NoticeKind::Info,
-                                text: text(
-                                    language,
-                                    "このTacetaのGrok認証を削除しました。",
-                                    "Removed this Taceta's Grok credentials.",
-                                )
-                                .into(),
-                            });
-                        }
-                        Err(error) => {
-                            self.notice = Some(Notice {
-                                kind: NoticeKind::Error,
-                                text: error,
-                            })
-                        }
-                    }
-                }
-            }
-        });
-        ui.label(RichText::new(text(language,
-            "認証には公式Grok CLIを使います。認証情報はこのMacのTaceta専用フォルダーに保存します。",
-            "Authentication uses the official Grok CLI. Credentials are stored in Taceta's own folder on this Mac.")).small().weak());
         ui.add_space(20.0);
-    }
-
-    fn start_grok_login(&mut self) {
-        if self.provider_ui.login.is_some() || self.is_generating() {
-            return;
-        }
-        let grok = Arc::clone(&self.provider_ui.grok);
-        let (tx, events) = mpsc::unbounded_channel();
-        let (result_tx, result) = std_mpsc::channel();
-        let task = self.runtime.spawn(async move {
-            let outcome = grok.sign_in(tx).await;
-            let _ = result_tx.send(outcome);
-        });
-        self.provider_ui.login = Some(LoginTask {
-            task,
-            events,
-            result,
-        });
-        self.notice = None;
-    }
-
-    pub(super) fn drain_provider_work(&mut self) {
-        let mut events = Vec::new();
-        let mut outcome = None;
-        if let Some(login) = self.provider_ui.login.as_mut() {
-            while let Ok(event) = login.events.try_recv() {
-                events.push(event);
-            }
-            outcome = match login.result.try_recv() {
-                Ok(result) => Some(result),
-                Err(std_mpsc::TryRecvError::Disconnected) => {
-                    Some(Err("Grok sign-in stopped before completion".into()))
-                }
-                Err(std_mpsc::TryRecvError::Empty) => None,
-            };
-        }
-        for event in events {
-            match event {
-                GrokLoginEvent::OpenBrowser(url) => {
-                    if let Err(error) = Command::new("/usr/bin/open").arg(url).spawn() {
-                        if let Some(login) = self.provider_ui.login.take() {
-                            login.task.abort();
-                        }
-                        outcome = Some(Err(format!(
-                            "Could not open the Grok sign-in page: {error}"
-                        )));
-                    }
-                }
-                GrokLoginEvent::Progress(progress) => {
-                    self.notice = Some(Notice {
-                        kind: NoticeKind::Info,
-                        text: progress,
-                    });
-                }
-            }
-        }
-        if let Some(outcome) = outcome {
-            self.provider_ui.login = None;
-            match outcome {
-                Ok(()) => {
-                    if self.state.inference_provider == InferenceProvider::Grok {
-                        self.invalidate_model_list();
-                        self.refresh_models();
-                    } else {
-                        self.select_provider(InferenceProvider::Grok);
-                    }
-                    self.notice = Some(Notice {
-                        kind: NoticeKind::Info,
-                        text: text(
-                            self.language(),
-                            "Grok認証を保存しました。利用可能なモデルを取得しています。",
-                            "Grok credentials saved. Loading available models.",
-                        )
-                        .into(),
-                    });
-                }
-                Err(error) => {
-                    self.notice = Some(Notice {
-                        kind: NoticeKind::Error,
-                        text: error,
-                    })
-                }
-            }
-        }
     }
 }
 

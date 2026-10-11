@@ -1,4 +1,3 @@
-mod grok;
 mod ollama;
 
 use crate::domain::{
@@ -10,8 +9,6 @@ use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
-    #[error("Grok: {0}")]
-    Grok(String),
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("invalid Ollama response: {0}")]
@@ -31,8 +28,6 @@ pub enum BackendError {
     #[error("Ollama did not become ready within 10 seconds")]
     OllamaReadinessTimeout,
 }
-
-pub use grok::{GrokClient, GrokLoginEvent};
 
 pub type BackendFuture<T> = Pin<Box<dyn Future<Output = Result<T, BackendError>> + Send>>;
 
