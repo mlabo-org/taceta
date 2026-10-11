@@ -245,7 +245,51 @@ enum InlineChange {
     Link(String),
 }
 
-fn parse(markdown: &str) -> Node {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StyleSource {
+    Markdown,
+    Html,
+}
+
+/// Nested inline styles. Styles opened by an HTML tag are tracked apart from
+/// Markdown spans, so a stray closing tag cannot end the span around it and an
+/// unclosed tag cannot outlive its block.
+#[derive(Default)]
+struct StyleStack {
+    open: Vec<(InlineStyle, StyleSource)>,
+}
+
+impl StyleStack {
+    fn current(&self) -> InlineStyle {
+        self.open.last().map(|(style, _)| style.clone()).unwrap_or_default()
+    }
+
+    fn open(&mut self, change: InlineChange, source: StyleSource) {
+        let mut next = self.current();
+        apply_inline_change(&mut next, change);
+        self.open.push((next, source));
+    }
+
+    fn close_markdown(&mut self) {
+        while let Some((_, source)) = self.open.pop() {
+            if source == StyleSource::Markdown {
+                break;
+            }
+        }
+    }
+
+    fn close_html(&mut self) {
+        if self.open.last().is_some_and(|(_, source)| *source == StyleSource::Html) {
+            self.open.pop();
+        }
+    }
+
+    fn end_block(&mut self) {
+        self.open.retain(|(_, source)| *source == StyleSource::Markdown);
+    }
+}
+
+fn parser_options() -> Options {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_GFM);
     options.insert(Options::ENABLE_TABLES);
@@ -254,14 +298,19 @@ fn parse(markdown: &str) -> Node {
     options.insert(Options::ENABLE_FOOTNOTES);
     options.insert(Options::ENABLE_MATH);
     options.insert(Options::ENABLE_DEFINITION_LIST);
+    options
+}
+
+fn parse(markdown: &str) -> Node {
+    let options = parser_options();
 
     let mut nodes = vec![Node::Root {
         children: Vec::new(),
     }];
     let mut open_elements = Vec::new();
-    let mut styles = vec![InlineStyle::default()];
+    let mut styles = StyleStack::default();
 
-    let normalized = normalize_math_delimiters(markdown);
+    let normalized = normalize_math_delimiters(markdown, options);
     for event in Parser::new_ext(&normalized, options) {
         match event {
             Event::Start(tag) => {
@@ -275,9 +324,7 @@ fn parse(markdown: &str) -> Node {
                         alt: String::new(),
                     });
                 } else if let Some(change) = inline_change(&tag) {
-                    let mut next = styles.last().cloned().unwrap_or_default();
-                    apply_inline_change(&mut next, change);
-                    styles.push(next);
+                    styles.open(change, StyleSource::Markdown);
                     open_elements.push(OpenElement::Inline);
                 } else if let Some(node) = block_for_tag(&tag) {
                     nodes.push(node);
@@ -287,12 +334,11 @@ fn parse(markdown: &str) -> Node {
                 }
             }
             Event::End(_) => match open_elements.pop() {
-                Some(OpenElement::Block) => close_block(&mut nodes),
-                Some(OpenElement::Inline) => {
-                    if styles.len() > 1 {
-                        styles.pop();
-                    }
+                Some(OpenElement::Block) => {
+                    styles.end_block();
+                    close_block(&mut nodes);
                 }
+                Some(OpenElement::Inline) => styles.close_markdown(),
                 Some(OpenElement::Image {
                     destination,
                     title,
@@ -304,7 +350,7 @@ fn parse(markdown: &str) -> Node {
                         title,
                         alt,
                     },
-                    styles.last().cloned().unwrap_or_default(),
+                    styles.current(),
                 ),
                 Some(OpenElement::Ignored) | None => {}
             },
@@ -313,7 +359,7 @@ fn parse(markdown: &str) -> Node {
                     append_inline(
                         &mut nodes,
                         InlineKind::Text(value.to_string()),
-                        styles.last().cloned().unwrap_or_default(),
+                        styles.current(),
                     );
                 }
             }
@@ -325,7 +371,7 @@ fn parse(markdown: &str) -> Node {
                     append_inline(
                         &mut nodes,
                         InlineKind::Code(value.to_string()),
-                        styles.last().cloned().unwrap_or_default(),
+                        styles.current(),
                     );
                 }
             }
@@ -333,27 +379,27 @@ fn parse(markdown: &str) -> Node {
                 append_inline(
                     &mut nodes,
                     InlineKind::InlineMath(value.to_string()),
-                    styles.last().cloned().unwrap_or_default(),
+                    styles.current(),
                 );
             }
             Event::DisplayMath(value) => {
                 append_inline(
                     &mut nodes,
                     InlineKind::DisplayMath(value.to_string()),
-                    styles.last().cloned().unwrap_or_default(),
+                    styles.current(),
                 );
             }
             Event::SoftBreak => {
                 append_inline(
                     &mut nodes,
                     InlineKind::Text(" ".to_owned()),
-                    styles.last().cloned().unwrap_or_default(),
+                    styles.current(),
                 );
             }
             Event::HardBreak => append_inline(
                 &mut nodes,
                 InlineKind::HardBreak,
-                styles.last().cloned().unwrap_or_default(),
+                styles.current(),
             ),
             Event::TaskListMarker(checked) => {
                 mark_task_item(&mut nodes, checked);
@@ -362,7 +408,7 @@ fn parse(markdown: &str) -> Node {
                 append_inline(
                     &mut nodes,
                     InlineKind::FootnoteReference(label.to_string()),
-                    styles.last().cloned().unwrap_or_default(),
+                    styles.current(),
                 );
             }
             Event::Rule => {
@@ -502,93 +548,83 @@ fn mark_task_item(nodes: &mut [Node], checked: bool) {
     }
 }
 
-fn normalize_math_delimiters(markdown: &str) -> String {
+/// Rewrites TeX-style `\(…\)` and `\[…\]` to the `$` delimiters the parser
+/// understands. Code blocks and inline code are copied through unchanged.
+fn normalize_math_delimiters(markdown: &str, options: Options) -> String {
+    let mut code: Vec<std::ops::Range<usize>> = Parser::new_ext(markdown, options)
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(event, Event::Code(_) | Event::Start(Tag::CodeBlock(_))).then_some(range)
+        })
+        .collect();
+    code.sort_by_key(|range| range.start);
+
     let mut normalized = String::with_capacity(markdown.len());
-    let mut fence: Option<(u8, usize)> = None;
-
-    for line in markdown.split_inclusive('\n') {
-        let trimmed = line.trim_start_matches(' ');
-        let indent = line.len() - trimmed.len();
-        let marker = trimmed.as_bytes().first().copied();
-        let marker_len = marker
-            .filter(|marker| matches!(marker, b'`' | b'~'))
-            .map(|marker| trimmed.bytes().take_while(|byte| *byte == marker).count())
-            .unwrap_or(0);
-
-        if indent <= 3 && marker_len >= 3 {
-            match fence {
-                None => fence = Some((marker.unwrap_or_default(), marker_len)),
-                Some((open_marker, open_len))
-                    if marker == Some(open_marker) && marker_len >= open_len =>
-                {
-                    fence = None;
-                }
-                _ => {}
-            }
-            normalized.push_str(line);
-        } else if fence.is_some() {
-            normalized.push_str(line);
-        } else {
-            normalized.push_str(&normalize_math_delimiters_in_line(line));
-        }
-    }
-
-    normalized
-}
-
-fn normalize_math_delimiters_in_line(line: &str) -> String {
-    let mut normalized = String::with_capacity(line.len());
+    let mut code = code.into_iter().peekable();
+    let mut display_open = false;
     let mut index = 0;
-    let mut inline_code_run: Option<usize> = None;
-
-    while index < line.len() {
-        let remaining = &line[index..];
-        if remaining.starts_with('`') {
-            let run = remaining.bytes().take_while(|byte| *byte == b'`').count();
-            match inline_code_run {
-                None => inline_code_run = Some(run),
-                Some(open) if open == run => inline_code_run = None,
-                _ => {}
-            }
-            normalized.push_str(&remaining[..run]);
-            index += run;
-        } else if inline_code_run.is_none() && remaining.starts_with("\\(") {
-            if let Some(close) = remaining[2..].find("\\)") {
+    while index < markdown.len() {
+        while code.peek().is_some_and(|range| range.end <= index) {
+            code.next();
+        }
+        let next_code = code.peek().cloned();
+        if let Some(range) = next_code.as_ref().filter(|range| range.start <= index) {
+            normalized.push_str(&markdown[index..range.end]);
+            index = range.end;
+            continue;
+        }
+        let prose_end = next_code.map_or(markdown.len(), |range| range.start);
+        let remaining = &markdown[index..prose_end];
+        if let Some(body) = remaining.strip_prefix("\\(") {
+            let line = body.split('\n').next().unwrap_or_default();
+            if let Some(close) = line.find("\\)") {
                 normalized.push('$');
-                normalized.push_str(remaining[2..2 + close].trim());
+                normalized.push_str(line[..close].trim());
                 normalized.push('$');
                 index += 2 + close + 2;
-            } else {
-                normalized.push_str("\\(");
-                index += 2;
+                continue;
             }
-        } else if inline_code_run.is_none() && remaining.starts_with("\\)") {
-            normalized.push('$');
-            index += 2;
-        } else if inline_code_run.is_none() && remaining.starts_with("\\[") {
+        } else if remaining.starts_with("\\[") && !display_open && opens_display_math(markdown, index) {
             normalized.push_str("$$");
+            display_open = true;
             index += 2;
-        } else if inline_code_run.is_none() && remaining.starts_with("\\]") {
+            continue;
+        } else if remaining.starts_with("\\]") && display_open {
             normalized.push_str("$$");
+            display_open = false;
             index += 2;
-        } else {
-            let character = remaining.chars().next().unwrap_or_default();
-            normalized.push(character);
-            index += character.len_utf8();
+            continue;
         }
+        let character = remaining.chars().next().unwrap_or_default();
+        normalized.push(character);
+        index += character.len_utf8();
     }
-
     normalized
 }
 
-fn append_safe_html(nodes: &mut [Node], styles: &mut Vec<InlineStyle>, fragment: &str) {
+/// `\[` opens display math when it starts its line or stands apart from the
+/// surrounding words. Inside a word, as in `a\[0\]`, it is an escaped bracket.
+fn opens_display_math(markdown: &str, index: usize) -> bool {
+    let before = markdown[..index].chars().next_back();
+    let after = markdown[index + 2..].chars().next();
+    let line_start = markdown[..index]
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .all(|character| character.is_whitespace() || character == '>');
+    line_start
+        || (before.is_none_or(char::is_whitespace) && after.is_none_or(char::is_whitespace))
+}
+
+fn append_safe_html(nodes: &mut [Node], styles: &mut StyleStack, fragment: &str) {
     let mut remaining = fragment;
     while let Some(open) = remaining.find('<') {
         if open > 0 {
             append_inline(
                 nodes,
                 InlineKind::Text(remaining[..open].to_owned()),
-                styles.last().cloned().unwrap_or_default(),
+                styles.current(),
             );
         }
 
@@ -596,7 +632,7 @@ fn append_safe_html(nodes: &mut [Node], styles: &mut Vec<InlineStyle>, fragment:
             append_inline(
                 nodes,
                 InlineKind::Text(remaining[open..].to_owned()),
-                styles.last().cloned().unwrap_or_default(),
+                styles.current(),
             );
             return;
         };
@@ -623,23 +659,19 @@ fn append_safe_html(nodes: &mut [Node], styles: &mut Vec<InlineStyle>, fragment:
             append_inline(
                 nodes,
                 InlineKind::HardBreak,
-                styles.last().cloned().unwrap_or_default(),
+                styles.current(),
             );
         } else if let Some(change) = change {
             if closing {
-                if styles.len() > 1 {
-                    styles.pop();
-                }
+                styles.close_html();
             } else {
-                let mut next = styles.last().cloned().unwrap_or_default();
-                apply_inline_change(&mut next, change);
-                styles.push(next);
+                styles.open(change, StyleSource::Html);
             }
         } else {
             append_inline(
                 nodes,
                 InlineKind::Text(literal.to_owned()),
-                styles.last().cloned().unwrap_or_default(),
+                styles.current(),
             );
         }
 
@@ -650,7 +682,7 @@ fn append_safe_html(nodes: &mut [Node], styles: &mut Vec<InlineStyle>, fragment:
         append_inline(
             nodes,
             InlineKind::Text(remaining.to_owned()),
-            styles.last().cloned().unwrap_or_default(),
+            styles.current(),
         );
     }
 }
@@ -2100,10 +2132,42 @@ HTML
     #[test]
     fn math_delimiter_normalization_leaves_fenced_and_inline_code_unchanged() {
         let markdown = "\\(x^2\\)\n\n`\\(code\\)`\n\n~~~text\n\\[code\\]\n~~~\n";
-        let normalized = normalize_math_delimiters(markdown);
+        let normalized = normalize_math_delimiters(markdown, parser_options());
         assert!(normalized.starts_with("$x^2$"));
         assert!(normalized.contains("`\\(code\\)`"));
         assert!(normalized.contains("~~~text\n\\[code\\]\n~~~"));
+    }
+
+    #[test]
+    fn math_delimiter_normalization_never_rewrites_code_or_escaped_brackets() {
+        let normalize = |markdown: &str| normalize_math_delimiters(markdown, parser_options());
+        let sed = "sed 's/\\(a\\)/\\1/'";
+        for markdown in [
+            format!("- item\n\n    ```bash\n    {sed}\n    ```\n"),
+            format!("> ~~~bash\n> {sed}\n> ~~~\n"),
+            format!("text\n\n    {sed}\n"),
+        ] {
+            assert_eq!(normalize(&markdown), markdown);
+            assert!(format!("{:?}", parse(&markdown)).contains("\\\\(a\\\\)"), "{markdown}");
+        }
+        assert_eq!(normalize("a\\[0\\] = 1\n"), "a\\[0\\] = 1\n");
+        assert_eq!(normalize("1\\) item\n"), "1\\) item\n");
+        assert_eq!(normalize("\\[\nx = 1\n\\]\n"), "$$\nx = 1\n$$\n");
+        assert_eq!(normalize("so \\[ x = 1 \\] holds\n"), "so $$ x = 1 $$ holds\n");
+        assert_eq!(normalize("\\(x\\) and `\\(y\\)`\n"), "$x$ and `\\(y\\)`\n");
+    }
+
+    #[test]
+    fn html_tag_styles_end_with_their_block_and_leave_markdown_spans_alone() {
+        let debug = |markdown: &str| format!("{:?}", parse(markdown));
+        let unclosed = debug("The BOS token is <s> here.\n\nNext paragraph\n");
+        let next = unclosed.split("Next paragraph").nth(1).unwrap();
+        assert!(unclosed.split("Next paragraph").next().unwrap().contains("strikethrough: true"));
+        assert!(next.split("strikethrough: ").nth(1).unwrap().starts_with("false"));
+
+        let stray = debug("[press </b>here](https://example.com)\n");
+        assert_eq!(stray.matches("Text(").count(), stray.matches("https://example.com").count(), "{stray}");
+        assert!(stray.contains("here"), "{stray}");
     }
 
     #[test]
