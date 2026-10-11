@@ -393,7 +393,7 @@ impl WebSearchProvider {
     /// Fetches one page with manual redirect validation so every hop receives
     /// the same SSRF checks. Only http(s), public IPs and text-like content are allowed.
     pub async fn fetch(&self, url: &str) -> Result<FetchedPage, WebError> {
-        let (validated, validated_address) = validated_public_target(url)?;
+        let (validated, validated_address) = validated_fetch_target(url)?;
         if matches!(
             self.kind,
             ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb
@@ -436,7 +436,7 @@ impl WebSearchProvider {
                 let redirected = current
                     .join(location)
                     .map_err(|_| WebError::UnsafeUrl(location.into()))?;
-                (current, current_address) = validated_public_target(redirected.as_str())?;
+                (current, current_address) = validated_fetch_target(redirected.as_str())?;
                 continue;
             }
             let response = response
@@ -609,21 +609,38 @@ fn status_or_transport(stage: &'static str, error: &reqwest::Error) -> WebError 
 
 fn is_private_or_local(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v) => {
-            v.is_private()
-                || v.is_loopback()
-                || v.is_link_local()
-                || v.is_broadcast()
-                || v.is_unspecified()
-                || v.octets()[0] == 169 && v.octets()[1] == 254
-        }
+        IpAddr::V4(v) => is_private_or_local_v4(v),
         IpAddr::V6(v) => {
+            // `::ffff:a.b.c.d` and `::a.b.c.d` reach the embedded IPv4 host.
+            if let Some(embedded) = v.to_ipv4_mapped().or_else(|| v.to_ipv4()) {
+                return is_private_or_local_v4(embedded);
+            }
             v.is_loopback()
                 || v.is_unspecified()
                 || (v.segments()[0] & 0xfe00) == 0xfc00
                 || (v.segments()[0] & 0xffc0) == 0xfe80
         }
     }
+}
+
+fn is_private_or_local_v4(v: std::net::Ipv4Addr) -> bool {
+    let [first, second, ..] = v.octets();
+    v.is_private()
+        || v.is_loopback()
+        || v.is_link_local()
+        || v.is_broadcast()
+        || v.is_unspecified()
+        || first == 0
+        || first == 100 && (second & 0xc0) == 64
+}
+
+/// A page fetch and every redirect it follows must stay on public HTTPS.
+fn validated_fetch_target(raw: &str) -> Result<(Url, SocketAddr), WebError> {
+    let (url, address) = validated_public_target(raw)?;
+    if url.scheme() != "https" {
+        return Err(WebError::UnsafeUrl(raw.into()));
+    }
+    Ok((url, address))
 }
 
 fn keychain_secret(account: &'static str) -> Option<String> {
@@ -699,6 +716,33 @@ mod tests {
         assert!(validate_public_url("http://localhost/").is_err());
         assert!(validate_public_url("file:///tmp/a").is_err());
         assert!(validate_public_url("http://user:pass@example.com/").is_err());
+    }
+
+    #[test]
+    fn embedded_ipv4_and_shared_ranges_count_as_local_addresses() {
+        for address in [
+            "::ffff:127.0.0.1",
+            "::ffff:7f00:1",
+            "::ffff:192.168.0.10",
+            "::ffff:169.254.169.254",
+            "::127.0.0.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "0.1.2.3",
+        ] {
+            assert!(is_private_or_local(address.parse().unwrap()), "{address}");
+        }
+        for address in ["2001:db8::1", "::ffff:198.51.100.7", "100.128.0.1", "198.51.100.7"] {
+            assert!(!is_private_or_local(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn page_fetch_and_redirect_targets_require_public_https() {
+        assert!(validated_fetch_target("https://198.51.100.7/article").is_ok());
+        for url in ["http://198.51.100.7/article", "https://127.0.0.1/"] {
+            assert!(matches!(validated_fetch_target(url), Err(WebError::UnsafeUrl(_))), "{url}");
+        }
     }
 
     #[test]
