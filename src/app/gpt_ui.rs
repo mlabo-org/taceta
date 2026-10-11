@@ -435,7 +435,21 @@ impl TacetaApp {
     }
 
     fn apply_gpt_event(&mut self, event: GptEvent) {
+        let language = self.language();
         let Some(active) = self.gpt_ui.active.as_mut() else { return; };
+        // The line beside the spinner follows what the turn is doing now.
+        match &event {
+            GptEvent::ThreadReady { .. } => active.progress = text(language, "応答を待っています…", "Waiting for a response…").into(),
+            GptEvent::ThinkingDelta(_) => active.progress = text(language, "考えています…", "Thinking…").into(),
+            GptEvent::MessageStarted { .. } | GptEvent::ContentDelta { .. } => {
+                active.progress = text(language, "回答を書いています…", "Writing the answer…").into();
+            }
+            GptEvent::Tool(item) if !item.completed => {
+                active.progress = format!("{}: {}", text(language, "実行中", "Running"), item.title);
+            }
+            GptEvent::Tool(_) => active.progress = text(language, "次の手順を考えています…", "Deciding the next step…").into(),
+            _ => {}
+        }
         let Some(conversation) = self.state.conversations.iter_mut()
             .find(|conversation| conversation.id == active.conversation_id && conversation.is_gpt()) else { return; };
         let session = conversation.gpt.get_or_insert_with(Default::default);
@@ -575,7 +589,7 @@ impl TacetaApp {
                     "作業フォルダーとモデルを選び、実行したいことを入力してください。普通の会話には「チャット」を選べます。",
                     "Choose a workspace and model, then describe the work. Select Chat for an ordinary conversation."));
             }
-            for message in &conversation.messages { app.show_message(ui, message, app.is_generating()); }
+            for message in &conversation.messages { app.show_message(ui, message, false); }
             if let Some(session) = &conversation.gpt {
                 if app.state.show_thinking_trace && !session.thinking.is_empty() {
                     egui::CollapsingHeader::new(text(language, "思考過程", "Thinking trace"))
