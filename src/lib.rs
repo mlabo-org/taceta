@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod backend;
 pub mod browser_harness;
+pub mod cli_agent;
 pub mod domain;
 pub mod gpt;
 pub mod taceta_link_installer;
