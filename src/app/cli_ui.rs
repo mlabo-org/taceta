@@ -356,6 +356,7 @@ impl TacetaApp {
             no_tools: chat,
         });
         self.scroll_to_bottom = true;
+        self.jump_to_latest = true;
     }
 
     pub(super) fn drain_cli_work(&mut self) {
@@ -607,6 +608,7 @@ impl TacetaApp {
             .collapsible(false)
             .resizable(true)
             .default_width(680.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.strong(&request.title);
                 if waiting > 0 {

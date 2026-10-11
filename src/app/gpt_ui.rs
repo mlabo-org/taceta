@@ -353,6 +353,7 @@ impl TacetaApp {
         });
         self.notice = None;
         self.scroll_to_bottom = true;
+        self.jump_to_latest = true;
         true
     }
 
@@ -627,7 +628,7 @@ impl TacetaApp {
         let Some(active) = self.gpt_ui.active.as_mut() else { return; };
         if let Some(request) = active.approvals.front() {
             egui::Window::new(text(language, "GPTの実行内容を確認", "Approve GPT action"))
-                .id(egui::Id::new("gpt-approval")).collapsible(false).default_width(680.0).show(ctx, |ui| {
+                .id(egui::Id::new("gpt-approval")).collapsible(false).default_width(680.0).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                 ui.label(&request.description);
                 ScrollArea::both().max_height(440.0).show(ui, |ui| { ui.monospace(&request.details); });
                 ui.horizontal(|ui| {
@@ -638,7 +639,7 @@ impl TacetaApp {
             });
         } else if let Some(request) = active.questions.front_mut() {
             egui::Window::new(text(language, "GPTからの質問", "Question from GPT"))
-                .id(egui::Id::new("gpt-questions")).collapsible(false).default_width(680.0).show(ctx, |ui| {
+                .id(egui::Id::new("gpt-questions")).collapsible(false).default_width(680.0).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                 ScrollArea::vertical().max_height(500.0).show(ui, |ui| {
                     for (index, question) in request.questions.iter().enumerate() {
                         ui.push_id(&question.id, |ui| {
