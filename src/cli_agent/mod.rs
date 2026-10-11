@@ -5,6 +5,7 @@
 //! the run. A driver translates one CLI's stdio protocol into the types here;
 //! nothing outside a driver sees that protocol.
 
+pub mod claude;
 pub mod process;
 
 use std::{future::Future, path::PathBuf, pin::Pin};
