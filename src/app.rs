@@ -144,6 +144,9 @@ pub struct TacetaApp {
     generation: Option<ActiveGeneration>,
     external_preview_ids: HashSet<Uuid>,
     notice: Option<Notice>,
+    /// Stored state this build could not decode; kept verbatim on the next save.
+    unreadable_state: Option<String>,
+    unreadable_state_dialog: bool,
     conversation_title_editor: Option<ConversationTitleEditor>,
     conversation_delete_confirmation: Option<ConversationDeleteConfirmation>,
     conversation_bulk_delete_mode: bool,
@@ -189,7 +192,9 @@ impl TacetaApp {
         apply_app_shell_preferences(&creation_context.egui_ctx, shell_preferences);
 
         let link_service = Arc::new(TacetaLinkService::default());
-        let mut state = load_app_state(creation_context.storage);
+        let loaded = load_app_state(creation_context.storage);
+        let unreadable_state = loaded.unreadable;
+        let mut state = loaded.state;
         let gpt_recovery = crate::persistence::gpt_bindings_root()
             .and_then(|root| crate::persistence::recover_gpt_bindings(&mut state, &root));
         let endpoint_result =
@@ -296,6 +301,8 @@ impl TacetaApp {
         if let Err(error) = gpt_recovery {
             app.notice = Some(Notice { kind: NoticeKind::Error, text: error });
         }
+        app.unreadable_state_dialog = unreadable_state.is_some();
+        app.unreadable_state = unreadable_state;
         app
     }
 
@@ -344,6 +351,8 @@ impl TacetaApp {
             generation: None,
             external_preview_ids: HashSet::new(),
             notice: None,
+            unreadable_state: None,
+            unreadable_state_dialog: false,
             conversation_title_editor: None,
             conversation_delete_confirmation: None,
             conversation_bulk_delete_mode: false,
@@ -1687,6 +1696,37 @@ impl TacetaApp {
                             }
                         }
                     });
+            });
+    }
+
+    fn show_unreadable_state_dialog(&mut self, ctx: &Context) {
+        if !self.unreadable_state_dialog {
+            return;
+        }
+        let language = self.language();
+        egui::Window::new(text(language, "保存データを読み込めませんでした", "Saved data could not be read"))
+            .id(egui::Id::new("unreadable-application-state"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(text(
+                    language,
+                    "保存されていた会話と設定を、この版のTacetaでは読み込めませんでした。新しい版で保存されたデータの可能性があります。",
+                    "This version of Taceta could not read the saved chats and settings. They may have been saved by a newer version.",
+                ));
+                ui.add_space(6.0);
+                ui.label(text(
+                    language,
+                    "空の状態で起動しています。元のデータは消さず、保存ファイル内に次の名前で始まる控えとして残します。",
+                    "Taceta started empty. The original data is not deleted; it is kept in the settings file under a key starting with:",
+                ));
+                ui.monospace(crate::persistence::UNREADABLE_APP_STATE_KEY_PREFIX);
+                ui.add_space(8.0);
+                if ui.button(text(language, "閉じる", "Close")).clicked() {
+                    self.unreadable_state_dialog = false;
+                }
             });
     }
 
@@ -3731,6 +3771,7 @@ impl eframe::App for TacetaApp {
             Screen::Models => self.show_model_manager(ui),
         }
         self.show_conversation_history_dialogs(ui.ctx());
+        self.show_unreadable_state_dialog(ui.ctx());
         self.show_agent_approval(ui.ctx());
         self.show_gpt_requests(ui.ctx());
         self.show_gpt_transfer(ui.ctx());
@@ -3738,7 +3779,7 @@ impl eframe::App for TacetaApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         save_app_shell_preferences(storage, APP_SHELL_STORAGE_KEY, &self.shell_preferences);
-        save_app_state(storage, &self.state);
+        save_app_state(storage, &self.state, &mut self.unreadable_state);
     }
 
     fn auto_save_interval(&self) -> Duration {

@@ -11,6 +11,7 @@ use taceta::gpt::{GptRunStatus, GptToolItem};
 use uuid::Uuid;
 
 const APP_STATE_STORAGE_KEY: &str = "taceta.application-state.v1";
+pub const UNREADABLE_APP_STATE_KEY_PREFIX: &str = "taceta.application-state.unreadable.";
 
 pub const CONTEXT_LENGTH_OPTIONS: [u32; 7] =
     [4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144];
@@ -630,14 +631,32 @@ pub fn normalize_context_length(value: u32) -> u32 {
         .unwrap_or(DEFAULT_CONTEXT_LENGTH)
 }
 
-pub fn load_app_state(storage: Option<&dyn eframe::Storage>) -> PersistedAppState {
-    storage
-        .and_then(|storage| eframe::get_value::<PersistedAppState>(storage, APP_STATE_STORAGE_KEY))
-        .unwrap_or_default()
-        .normalized()
+/// The application state for this launch. `unreadable` holds the exact stored
+/// text when a saved state exists but this build cannot decode it.
+pub struct LoadedAppState {
+    pub state: PersistedAppState,
+    pub unreadable: Option<String>,
 }
 
-pub fn save_app_state(storage: &mut dyn eframe::Storage, state: &PersistedAppState) {
+pub fn load_app_state(storage: Option<&dyn eframe::Storage>) -> LoadedAppState {
+    let stored = storage.and_then(|storage| storage.get_string(APP_STATE_STORAGE_KEY));
+    let decoded = storage
+        .and_then(|storage| eframe::get_value::<PersistedAppState>(storage, APP_STATE_STORAGE_KEY));
+    let unreadable = if decoded.is_none() { stored } else { None };
+    LoadedAppState { state: decoded.unwrap_or_default().normalized(), unreadable }
+}
+
+/// Saves the state. An undecodable previous state is first kept verbatim under
+/// its own key, so replacing it never destroys the only copy.
+pub fn save_app_state(
+    storage: &mut dyn eframe::Storage,
+    state: &PersistedAppState,
+    unreadable: &mut Option<String>,
+) {
+    if let Some(raw) = unreadable.take() {
+        let key = format!("{UNREADABLE_APP_STATE_KEY_PREFIX}{}", chrono::Utc::now().timestamp());
+        storage.set_string(&key, raw);
+    }
     eframe::set_value(storage, APP_STATE_STORAGE_KEY, &state.clone().normalized());
 }
 
