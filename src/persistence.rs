@@ -476,12 +476,6 @@ struct GptBinding {
 
 fn default_gpt_binding_owner() -> InferenceProvider { InferenceProvider::Gpt }
 
-pub fn gpt_bindings_root() -> Result<std::path::PathBuf, String> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
-        .map(|home| home.join("Library/Application Support/Taceta/GptBindings"))
-        .ok_or_else(|| "The current user's home directory is unavailable".into())
-}
-
 /// Unlike eframe's asynchronous flush, this checkpoint reaches disk before the
 /// service receives ThreadSaved and is allowed to begin a mutating turn.
 pub fn save_gpt_binding(root: &std::path::Path, conversation: &Conversation) -> Result<(), String> {
