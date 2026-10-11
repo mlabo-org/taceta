@@ -13,11 +13,151 @@ pub(super) struct ActiveAgent {
     result: std_mpsc::Receiver<Result<SessionSnapshot, String>>,
     cancel: watch::Sender<bool>,
     approvals: mpsc::UnboundedSender<ApprovalDecision>,
-    approval: Option<ApprovalRequest>,
+    approval: Option<PendingApproval>,
     content: String,
     thinking: String,
     progress: String,
     submitted_prompt: Option<String>,
+}
+
+/// An approval request with its details laid out for reading.
+struct PendingApproval {
+    request: ApprovalRequest,
+    view: ApprovalView,
+    /// Decisions are ignored briefly after a request appears, so a click
+    /// meant for the previous request cannot answer this one.
+    shown_at: std::time::Instant,
+}
+
+const APPROVAL_SETTLE: Duration = Duration::from_millis(600);
+
+#[derive(Debug, PartialEq, Eq)]
+enum ApprovalView {
+    Edit { path: String, created: bool, lines: Vec<DiffLine> },
+    Fields(Vec<(String, String)>),
+    Text(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiffLine {
+    Same(String),
+    Removed(String),
+    Added(String),
+    /// Unchanged lines left out between two changed regions.
+    Skipped(usize),
+}
+
+impl ApprovalView {
+    /// Proposal details arrive as JSON written by the workspace tools. Edits
+    /// become a line diff, anything else its fields, and unknown shapes are
+    /// shown exactly as received.
+    fn from_details(details: &str) -> Self {
+        let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(details) else {
+            return Self::Text(details.to_owned());
+        };
+        if let (Some(path), Some(after)) = (
+            fields.get("path").and_then(|value| value.as_str()),
+            fields.get("after").and_then(|value| value.as_str()),
+        ) {
+            let before = fields.get("before").and_then(|value| value.as_str());
+            return Self::Edit {
+                path: path.to_owned(),
+                created: before.is_none(),
+                lines: line_diff(before.unwrap_or_default(), after),
+            };
+        }
+        Self::Fields(
+            fields
+                .into_iter()
+                .map(|(name, value)| {
+                    let value = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
+                    (name, value)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Lines kept around each change so its place in the file is recognisable.
+const DIFF_CONTEXT: usize = 3;
+/// Above this many differing lines per side the middle is shown as one
+/// removed block and one added block instead of being aligned line by line.
+const DIFF_ALIGN_LIMIT: usize = 2_000;
+
+fn line_diff(before: &str, after: &str) -> Vec<DiffLine> {
+    let old: Vec<&str> = before.lines().collect();
+    let new: Vec<&str> = after.lines().collect();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (old_mid, new_mid) = (&old[prefix..old.len() - suffix], &new[prefix..new.len() - suffix]);
+
+    let mut all: Vec<DiffLine> = old[..prefix].iter().map(|line| DiffLine::Same((*line).to_owned())).collect();
+    if old_mid.len() > DIFF_ALIGN_LIMIT || new_mid.len() > DIFF_ALIGN_LIMIT {
+        all.extend(old_mid.iter().map(|line| DiffLine::Removed((*line).to_owned())));
+        all.extend(new_mid.iter().map(|line| DiffLine::Added((*line).to_owned())));
+    } else {
+        // Longest common subsequence over the differing middle.
+        let (rows, columns) = (old_mid.len(), new_mid.len());
+        let mut common = vec![0u32; (rows + 1) * (columns + 1)];
+        for row in (0..rows).rev() {
+            for column in (0..columns).rev() {
+                common[row * (columns + 1) + column] = if old_mid[row] == new_mid[column] {
+                    common[(row + 1) * (columns + 1) + column + 1] + 1
+                } else {
+                    common[(row + 1) * (columns + 1) + column].max(common[row * (columns + 1) + column + 1])
+                };
+            }
+        }
+        let (mut row, mut column) = (0, 0);
+        while row < rows && column < columns {
+            if old_mid[row] == new_mid[column] {
+                all.push(DiffLine::Same(old_mid[row].to_owned()));
+                row += 1;
+                column += 1;
+            } else if common[(row + 1) * (columns + 1) + column] >= common[row * (columns + 1) + column + 1] {
+                all.push(DiffLine::Removed(old_mid[row].to_owned()));
+                row += 1;
+            } else {
+                all.push(DiffLine::Added(new_mid[column].to_owned()));
+                column += 1;
+            }
+        }
+        all.extend(old_mid[row..].iter().map(|line| DiffLine::Removed((*line).to_owned())));
+        all.extend(new_mid[column..].iter().map(|line| DiffLine::Added((*line).to_owned())));
+    }
+    all.extend(old[old.len() - suffix..].iter().map(|line| DiffLine::Same((*line).to_owned())));
+
+    // Keep changed lines and their surroundings; fold the rest.
+    let changed: Vec<bool> = all.iter().map(|line| !matches!(line, DiffLine::Same(_))).collect();
+    let keep: Vec<bool> = (0..all.len())
+        .map(|index| {
+            let from = index.saturating_sub(DIFF_CONTEXT);
+            let to = (index + DIFF_CONTEXT + 1).min(all.len());
+            changed[from..to].iter().any(|changed| *changed)
+        })
+        .collect();
+    let mut shown = Vec::new();
+    let mut skipped = 0;
+    for (line, keep) in all.into_iter().zip(keep) {
+        if keep {
+            if skipped > 0 {
+                shown.push(DiffLine::Skipped(skipped));
+                skipped = 0;
+            }
+            shown.push(line);
+        } else {
+            skipped += 1;
+        }
+    }
+    if skipped > 0 {
+        shown.push(DiffLine::Skipped(skipped));
+    }
+    shown
 }
 
 pub(super) struct AgentUiState {
@@ -439,7 +579,11 @@ impl TacetaApp {
             }
             AgentEvent::ApprovalRequired(request) => {
                 if let Some(active) = self.agent_ui.active.as_mut() {
-                    active.approval = Some(request);
+                    active.approval = Some(PendingApproval {
+                        view: ApprovalView::from_details(&request.details),
+                        request,
+                        shown_at: std::time::Instant::now(),
+                    });
                 }
             }
             AgentEvent::Snapshot(snapshot) => {
@@ -574,8 +718,17 @@ impl TacetaApp {
         let Some(active) = self.agent_ui.active.as_ref() else {
             return;
         };
-        let Some(request) = active.approval.as_ref() else {
+        let Some(pending) = active.approval.as_ref() else {
             return;
+        };
+        let request = &pending.request;
+        let settled = pending.shown_at.elapsed() >= APPROVAL_SETTLE;
+        if !settled {
+            ctx.request_repaint_after(APPROVAL_SETTLE);
+        }
+        let palette_colors = |ui: &Ui| {
+            let palette = theme::palette(ui);
+            (palette.success, palette.error, palette.placeholder_text)
         };
         let mut decision = None;
         egui::Window::new(text(language, "実行内容の確認", "Approve this action"))
@@ -596,19 +749,53 @@ impl TacetaApp {
                         ui.monospace(workspace.display().to_string());
                     }
                 }
-                ScrollArea::both().max_height(440.0).show(ui, |ui| {
-                    ui.monospace(&request.details);
+                ScrollArea::both().max_height(440.0).show(ui, |ui| match &pending.view {
+                    ApprovalView::Edit { path, created, lines } => {
+                        let (added, removed, quiet) = palette_colors(ui);
+                        ui.monospace(path);
+                        if *created {
+                            ui.label(RichText::new(text(language, "新しいファイル", "New file")).small().weak());
+                        }
+                        if lines.is_empty() {
+                            ui.label(text(language, "内容の変更はありません。", "The content does not change."));
+                        }
+                        for line in lines {
+                            match line {
+                                DiffLine::Same(line) => ui.monospace(format!("  {line}")),
+                                DiffLine::Removed(line) => ui.label(RichText::new(format!("- {line}")).monospace().color(removed)),
+                                DiffLine::Added(line) => ui.label(RichText::new(format!("+ {line}")).monospace().color(added)),
+                                DiffLine::Skipped(count) => ui.label(RichText::new(match language {
+                                    AppShellLanguage::Japanese => format!("… 変更のない {count} 行"),
+                                    AppShellLanguage::English => format!("… {count} unchanged lines"),
+                                }).small().color(quiet)),
+                            };
+                        }
+                    }
+                    ApprovalView::Fields(fields) => {
+                        egui::Grid::new("taceta-agent-approval-fields").num_columns(2).show(ui, |ui| {
+                            for (name, value) in fields {
+                                ui.label(RichText::new(name).weak());
+                                ui.monospace(value);
+                                ui.end_row();
+                            }
+                        });
+                    }
+                    ApprovalView::Text(details) => {
+                        ui.monospace(details);
+                    }
                 });
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(text(language, "この1回を許可", "Approve once"))
-                        .clicked()
-                    {
-                        decision = Some(true);
-                    }
-                    if ui.button(text(language, "拒否", "Deny")).clicked() {
-                        decision = Some(false);
-                    }
+                ui.add_enabled_ui(settled, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(text(language, "この1回を許可", "Approve once"))
+                            .clicked()
+                        {
+                            decision = Some(true);
+                        }
+                        if ui.button(text(language, "拒否", "Deny")).clicked() {
+                            decision = Some(false);
+                        }
+                    });
                 });
             });
         if let Some(approved) = decision {
@@ -618,9 +805,9 @@ impl TacetaApp {
 
     fn decide_agent_approval(&mut self, approved: bool) {
         if let Some(active) = self.agent_ui.active.as_mut() {
-            if let Some(request) = active.approval.take() {
+            if let Some(pending) = active.approval.take() {
                 let _ = active.approvals.send(ApprovalDecision {
-                    id: request.id,
+                    id: pending.request.id,
                     approved,
                 });
             }
@@ -770,6 +957,39 @@ mod tests {
         app.state.active_conversation_mut().agent_enabled = true;
         app.remember_agent_snapshot(snapshot());
         assert_eq!(contents(&app), ["Task result"]);
+    }
+
+    #[test]
+    fn an_edit_proposal_is_shown_as_the_lines_that_change() {
+        let before = (1..=20).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let after = before.replace("line 10", "line ten").replace("line 20", "line 20\nline 21");
+        let details = serde_json::json!({"workspace":"/w","path":"src/a.rs","before":before,"after":after}).to_string();
+        let ApprovalView::Edit { path, created, lines } = ApprovalView::from_details(&details) else {
+            panic!("an edit view was expected");
+        };
+        assert_eq!(path, "src/a.rs");
+        assert!(!created);
+        let changed: Vec<&DiffLine> = lines.iter().filter(|line| matches!(line, DiffLine::Removed(_) | DiffLine::Added(_))).collect();
+        assert_eq!(changed, [
+            &DiffLine::Removed("line 10".into()),
+            &DiffLine::Added("line ten".into()),
+            &DiffLine::Added("line 21".into()),
+        ]);
+        assert_eq!(lines.first(), Some(&DiffLine::Skipped(6)));
+        assert!(lines.contains(&DiffLine::Same("line 9".into())));
+        assert!(!lines.contains(&DiffLine::Same("line 1".into())));
+
+        let created = serde_json::json!({"workspace":"/w","path":"new.txt","before":null,"after":"hi\n"}).to_string();
+        assert_eq!(
+            ApprovalView::from_details(&created),
+            ApprovalView::Edit { path: "new.txt".into(), created: true, lines: vec![DiffLine::Added("hi".into())] }
+        );
+        let command = serde_json::json!({"command":"cargo test","network":"denied"}).to_string();
+        assert_eq!(
+            ApprovalView::from_details(&command),
+            ApprovalView::Fields(vec![("command".into(), "cargo test".into()), ("network".into(), "denied".into())])
+        );
+        assert_eq!(ApprovalView::from_details("old: a"), ApprovalView::Text("old: a".into()));
     }
 
     #[test]
