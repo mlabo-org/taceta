@@ -44,12 +44,16 @@ struct Timing {
     startup: Duration,
     /// How long a cancelled turn may take to answer before the CLI is ended.
     cancel_grace: Duration,
+    /// How long to wait after `initialize` for the CLI's refreshed model
+    /// list before settling for the one `initialize` carried.
+    model_refresh: Duration,
 }
 
 impl Timing {
     const DEFAULT: Self = Self {
         startup: Duration::from_secs(60),
         cancel_grace: Duration::from_secs(3),
+        model_refresh: Duration::from_secs(10),
     };
 }
 
@@ -508,8 +512,24 @@ async fn fetch_models(
         Stop::Failed(message) => message,
         Stop::Interrupted | Stop::LimitReached => "Listing Grok's models was stopped.".to_owned(),
     })?;
-    let state = result
-        .pointer("/_meta/modelState")
+    // `initialize` answers from a cached list that can lack the newest
+    // models. The CLI then fetches the current list and announces it; that
+    // announcement is the one to use when it arrives in time.
+    let refreshed = tokio::time::timeout(timing.model_refresh, async {
+        while let Some(Ok(message)) = process.next().await {
+            if message.get("method").and_then(Value::as_str) == Some("_x.ai/models/update") {
+                return message.get("params").cloned();
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    let state = refreshed
+        .as_ref()
+        .filter(|state| state.get("availableModels").is_some())
+        .or_else(|| result.pointer("/_meta/modelState"))
         .ok_or("Grok's initialize answer lists no models.")?;
     parse_model_options(state)
 }
@@ -1297,6 +1317,7 @@ mod tests {
     const TEST_TIMING: Timing = Timing {
         startup: Duration::from_millis(400),
         cancel_grace: Duration::from_millis(300),
+        model_refresh: Duration::from_millis(200),
     };
 
     /// The test plays the CLI: it reads what the driver wrote and writes
@@ -2067,6 +2088,27 @@ mod tests {
         let options = task.await.unwrap().unwrap();
         assert_eq!(options[0].id, "grok-4.7");
         assert_eq!(options[0].efforts.first().map(String::as_str), Some("low"));
+    }
+
+    #[tokio::test]
+    async fn the_refreshed_model_list_announced_after_initialize_replaces_the_cached_one() {
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let (our_read, our_write) = tokio::io::split(ours);
+        let (their_read, their_write) = tokio::io::split(theirs);
+        let mut process = CliProcess::from_io(our_read, our_write);
+        let mut peer = Peer {
+            reader: BufReader::new(their_read),
+            writer: their_write,
+        };
+        let task = tokio::spawn(async move { fetch_models(&mut process, TEST_TIMING).await });
+        let initialize = peer.read().await;
+        let cached = json!({"availableModels": [{"modelId": "older-model", "name": "Older"}]});
+        peer.respond(&initialize, json!({"_meta": {"modelState": cached}})).await;
+        peer.write(json!({"jsonrpc": "2.0", "method": "_x.ai/settings/update", "params": {}})).await;
+        peer.write(json!({"jsonrpc": "2.0", "method": "_x.ai/models/update", "params": model_state()})).await;
+        let ids: Vec<String> = task.await.unwrap().unwrap().into_iter().map(|option| option.id).collect();
+        assert!(ids.contains(&"grok-4.7".to_owned()), "{ids:?}");
+        assert!(!ids.contains(&"older-model".to_owned()), "{ids:?}");
     }
 
     #[test]
