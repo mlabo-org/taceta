@@ -544,7 +544,42 @@ pub fn recover_gpt_bindings(state: &mut PersistedAppState, root: &std::path::Pat
             && !(binding.handoff_from_taceta && binding.pending_handoff) {
             return Err("A saved GPT conversation binding has no thread ID".into());
         }
-        let conversation = if let Some(index) = state.conversations.iter().position(|conversation| conversation.id == binding.id) {
+        let known = state.conversations.iter().position(|conversation| conversation.id == binding.id);
+        if let Some(index) = known.filter(|_| binding.owner == InferenceProvider::Gpt) {
+            // The saved conversation is the record of which provider, mode
+            // and workspace it was left with. The binding only adds what a
+            // crash between its write and the next save would have lost: the
+            // thread of a turn that had already been sent.
+            let conversation = &mut state.conversations[index];
+            if binding.ownership_revision < conversation.gpt_ownership_revision { continue; }
+            for thread_id in binding.archived_gpt_thread_ids {
+                if !conversation.archived_gpt_thread_ids.contains(&thread_id) {
+                    conversation.archived_gpt_thread_ids.push(thread_id);
+                }
+            }
+            let retired = binding.thread_id.as_ref().is_some_and(|id| conversation.archived_gpt_thread_ids.contains(id));
+            let same_environment = conversation.agent_enabled == binding.coding && conversation.workspace == binding.workspace;
+            if let Some(session) = conversation.gpt.as_mut() {
+                if session.thread_id.is_none() && !retired && same_environment {
+                    session.thread_id = binding.thread_id;
+                    session.handoff_from_taceta = binding.handoff_from_taceta;
+                    session.pending_handoff = binding.pending_handoff;
+                }
+                if matches!(session.status, GptRunStatus::Running | GptRunStatus::AwaitingApproval) {
+                    session.status = GptRunStatus::Interrupted;
+                }
+            } else if !retired && same_environment && conversation.provider == Some(InferenceProvider::Gpt) {
+                conversation.gpt = Some(GptConversation {
+                    thread_id: binding.thread_id,
+                    handoff_from_taceta: binding.handoff_from_taceta,
+                    pending_handoff: binding.pending_handoff,
+                    status: GptRunStatus::Interrupted,
+                    ..Default::default()
+                });
+            }
+            continue;
+        }
+        let conversation = if let Some(index) = known {
             &mut state.conversations[index]
         } else {
             state.conversations.push(Conversation {
@@ -784,6 +819,46 @@ mod tests {
         std::fs::remove_file(archived).unwrap();
         std::fs::remove_dir(root.join("archived")).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn a_restart_leaves_a_conversation_with_the_provider_mode_and_workspace_it_was_saved_with() {
+        let root = tempfile::tempdir().unwrap();
+        // A GPT chat turn leaves its thread binding on disk.
+        let mut conversation = Conversation::for_provider(InferenceProvider::Gpt);
+        conversation.agent_enabled = false;
+        conversation.gpt.as_mut().unwrap().thread_id = Some("chat-thread".into());
+        save_gpt_binding(root.path(), &conversation).unwrap();
+        // The conversation then continued with Grok as a task in a workspace.
+        conversation.provider = Some(InferenceProvider::Grok);
+        conversation.workspace = Some("/fixture/project".into());
+        let id = conversation.id;
+        let mut state = PersistedAppState { active_conversation_id: id, conversations: vec![conversation], ..Default::default() };
+        state.inference_provider = InferenceProvider::Grok;
+
+        assert_eq!(recover_gpt_bindings(&mut state, root.path()).unwrap(), 0);
+        let restored = state.active_conversation();
+        assert_eq!(restored.provider, Some(InferenceProvider::Grok));
+        assert_eq!(restored.workspace.as_deref(), Some(std::path::Path::new("/fixture/project")));
+        assert!(!restored.agent_enabled);
+        assert_eq!(state.inference_provider, InferenceProvider::Grok);
+        // Its GPT thread is still there for when GPT is chosen again.
+        assert_eq!(restored.gpt.as_ref().unwrap().thread_id.as_deref(), Some("chat-thread"));
+    }
+
+    #[test]
+    fn a_thread_that_was_retired_is_not_brought_back_by_its_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let mut conversation = Conversation::for_provider(InferenceProvider::Gpt);
+        conversation.gpt.as_mut().unwrap().thread_id = Some("old-thread".into());
+        save_gpt_binding(root.path(), &conversation).unwrap();
+        let id = conversation.id;
+        let mut state = PersistedAppState { active_conversation_id: id, conversations: vec![conversation], ..Default::default() };
+        state.inference_provider = InferenceProvider::Gpt;
+        // Changing the mode retires the thread; the binding on disk still names it.
+        state.configure_gpt_environment(false, None);
+        recover_gpt_bindings(&mut state, root.path()).unwrap();
+        assert_eq!(state.active_conversation().gpt.as_ref().unwrap().thread_id, None);
     }
 
     #[test]
