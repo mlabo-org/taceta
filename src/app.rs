@@ -907,7 +907,10 @@ impl TacetaApp {
                                 kind: NoticeKind::Error,
                                 text: error.clone(),
                             });
+                            // Neither the error text nor a cut-off answer is
+                            // model output to build on in a later turn.
                             self.update_assistant(conversation_id, assistant_id, |message| {
+                                message.interrupted = true;
                                 if message.content.is_empty() {
                                     message.content = error;
                                 }
@@ -1366,11 +1369,14 @@ impl TacetaApp {
         let Some(active) = self.generation.take() else {
             return;
         };
-        self.external_preview_ids.remove(&active.assistant_id);
+        let external_preview_remains = self.external_preview_ids.remove(&active.assistant_id);
         active.task.abort();
         let language = self.language();
         self.update_assistant(active.conversation_id, active.assistant_id, |message| {
             message.interrupted = true;
+            if external_preview_remains {
+                message.content.clear();
+            }
             if message.content.is_empty() {
                 message.content =
                     text(language, "生成を停止しました。", "Generation stopped.").to_owned();
@@ -4843,7 +4849,9 @@ mod model_manager_tests {
         assert!(matches!(app.connection, ConnectionState::Unavailable(_)));
 
         assert!(finish_turn(&mut app, "partial model answer", false, failure()));
-        assert_eq!(app.state.active_conversation().messages.last().unwrap().content, "partial model answer");
+        let kept = app.state.active_conversation().messages.last().unwrap();
+        assert_eq!(kept.content, "partial model answer");
+        assert!(kept.interrupted);
     }
 }
 
