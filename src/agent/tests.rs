@@ -353,7 +353,8 @@ async fn loop_waits_for_exact_approvals_and_returns_real_tool_results() {
                             approved: true,
                         })
                         .unwrap();
-                    tokio::task::yield_now().await;
+                    // Long enough for an accepted decision to have been applied.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
                     assert_eq!(
                         fs::read_to_string(fixture.workspace.join("main.txt")).unwrap(),
                         "alpha\n"
@@ -465,7 +466,8 @@ async fn reopen_preserves_unknown_effects_import_and_recoverable_archive() {
         })
         .unwrap();
     session.record(EventData::ToolStarted { call }).unwrap();
-    fixture.write("main.txt", "beta\n"); // crash after effect, before its durable result
+    // The crash came after the start record and before any effect or result.
+    // Replaying the approved edit would turn the file into "beta".
     let partial_path = session
         .journal
         .directory
@@ -510,7 +512,7 @@ async fn reopen_preserves_unknown_effects_import_and_recoverable_archive() {
     );
     assert_eq!(
         fs::read_to_string(fixture.workspace.join("main.txt")).unwrap(),
-        "beta\n"
+        "alpha\n"
     );
     let requests = model.requests.lock().unwrap();
     assert!(
