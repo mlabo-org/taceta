@@ -22,8 +22,18 @@ const RPC_SESSION_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
 const INTERRUPT_GRACE: Duration = Duration::from_secs(3);
 
+/// One operation at a time. Between turns the App Server that ran the last
+/// one is kept here, because a new process answers its first turn seconds
+/// later than one that is already running.
 #[derive(Clone, Default)]
-pub struct GptClient { coordination: Arc<Mutex<()>> }
+pub struct GptClient { coordination: Arc<Mutex<Option<Kept>>> }
+
+struct Kept { connection: Connection, chat: bool }
+
+/// Ends the kept App Server. Everything except a turn starts from a new one.
+async fn release(kept: &mut Option<Kept>) {
+    if let Some(mut kept) = kept.take() { kept.connection.shutdown().await; }
+}
 
 struct Paths { home: PathBuf, chat: PathBuf, executable: PathBuf }
 
@@ -36,8 +46,9 @@ impl GptClient {
             biased;
             _ = events.closed() => Err("GPT sign-in was cancelled.".into()),
             result = timeout(LOGIN_TIMEOUT, async {
-                let _guard = timeout(Duration::from_secs(30),self.coordination.lock()).await
+                let mut guard = timeout(Duration::from_secs(30),self.coordination.lock()).await
                     .map_err(|_|"GPT is busy. Stop the active GPT operation before signing in.")?;
+                release(&mut guard).await;
                 let mut connection = open(true).await?;
                 if account(&mut connection).await?.is_some() {
                     let _ = events.send(GptLoginEvent::Progress("ChatGPT is already connected.".into()));
@@ -74,7 +85,8 @@ impl GptClient {
 
     pub async fn sign_out(&self) -> Result<(), String> {
         timeout(RPC_SESSION_TIMEOUT,async {
-            let _guard=timeout(Duration::from_secs(30),self.coordination.lock()).await.map_err(|_|"GPT is busy. Stop its active operation before signing out.")?;
+            let mut guard=timeout(Duration::from_secs(30),self.coordination.lock()).await.map_err(|_|"GPT is busy. Stop its active operation before signing out.")?;
+            release(&mut guard).await;
             let mut connection=open(true).await?;
             if account(&mut connection).await?.is_some() { connection.call("account/logout",json!({})).await?; }
             connection.shutdown().await;
@@ -84,7 +96,8 @@ impl GptClient {
 
     pub async fn list_models(&self) -> Result<Vec<ModelDescriptor>, String> {
         timeout(RPC_SESSION_TIMEOUT,async {
-            let _guard=timeout(Duration::from_secs(30),self.coordination.lock()).await.map_err(|_|"GPT is busy. Wait for or stop its active operation before refreshing models.")?;
+            let mut guard=timeout(Duration::from_secs(30),self.coordination.lock()).await.map_err(|_|"GPT is busy. Wait for or stop its active operation before refreshing models.")?;
+            release(&mut guard).await;
             let mut connection=open(true).await?;
             require_account(&mut connection).await?;
             let catalog=models(&mut connection).await?;
@@ -98,7 +111,8 @@ impl GptClient {
     pub async fn archive_thread(&self, thread_id: &str) -> Result<(), String> {
         if thread_id.trim().is_empty() { return Err("No GPT conversation ID was supplied.".into()); }
         timeout(RPC_SESSION_TIMEOUT,async {
-            let _guard=timeout(Duration::from_secs(30),self.coordination.lock()).await.map_err(|_|"GPT is busy. Stop the active operation before archiving its conversation.")?;
+            let mut guard=timeout(Duration::from_secs(30),self.coordination.lock()).await.map_err(|_|"GPT is busy. Stop the active operation before archiving its conversation.")?;
+            release(&mut guard).await;
             let mut connection=open(true).await?;
             require_account(&mut connection).await?;
             connection.call("thread/archive",json!({"threadId":thread_id})).await?;
@@ -113,7 +127,7 @@ impl GptClient {
     ) -> Result<GptRunOutcome, String> {
         validate_request(&request)?;
         let deadline=Instant::now().checked_add(Duration::from_secs(request.max_duration_secs)).ok_or("The GPT time limit is too large.")?;
-        let _guard=tokio::select! {
+        let mut guard=tokio::select! {
             biased;
             _=cancelled(&mut cancel)=>return Ok(stopped_before_turn(&request,GptRunStatus::Interrupted,"GPT operation was cancelled.")),
             _=events.closed()=>return Ok(stopped_before_turn(&request,GptRunStatus::Interrupted,"The GPT view was closed.")),
@@ -121,6 +135,8 @@ impl GptClient {
             guard=self.coordination.lock()=>guard,
         };
         if controls.is_closed() { return Ok(stopped_before_turn(&request,GptRunStatus::Interrupted,"The GPT control channel was closed.")); }
+        let chat=request.mode==GptMode::Chat;
+        let kept=guard.take();
         let setup=async {
             let paths=paths().await?;
             let cwd=match request.mode {
@@ -132,9 +148,31 @@ impl GptClient {
                     path
                 }
             };
-            let mut connection=Connection::spawn(&paths.executable,&paths.home,&paths.chat,request.mode==GptMode::Chat).await?;
-            connection.initialize().await?;
-            let prepared=prepare(&mut connection,&request,&cwd).await?;
+            // The kept App Server is used again when it was started for the
+            // same mode, nothing unexpected arrived while it was idle, and
+            // it still answers. Otherwise it is ended and a new one starts.
+            let mut reused=None;
+            if let Some(mut kept)=kept {
+                if kept.chat==chat && kept.connection.discard_idle() && require_account(&mut kept.connection).await.is_ok() {
+                    kept.connection.discard_idle();
+                    reused=Some(kept.connection);
+                } else {
+                    kept.connection.shutdown().await;
+                }
+            }
+            let account_confirmed=reused.is_some();
+            let mut connection=match reused {
+                Some(connection)=>connection,
+                None=>{
+                    let mut connection=Connection::spawn(&paths.executable,&paths.home,&paths.chat,chat).await?;
+                    connection.initialize().await?;
+                    connection
+                }
+            };
+            let prepared=match prepare(&mut connection,&request,&cwd,account_confirmed).await {
+                Ok(prepared)=>prepared,
+                Err(error)=>{ connection.shutdown().await; return Err(error); }
+            };
             Ok::<_,String>((connection,cwd,prepared))
         };
         let (mut connection,cwd,prepared)=tokio::select! {
@@ -156,7 +194,10 @@ impl GptClient {
         let mut state=RunState::new(prepared.thread_id.clone(),&request,events.clone());
         let result=execute(&mut connection,&mut state,&request,cwd.to_str().ok_or("The GPT workspace path is not valid UTF-8.")?,prepared.input,prepared.effort,prepared.transfer,&events,&mut controls,&mut cancel,deadline).await;
         state.resolve_all();
-        connection.shutdown().await;
+        // Only a turn that ran to its end leaves the App Server in a known
+        // state worth keeping for the next one.
+        if matches!(result,Ok((GptRunStatus::Completed,None))) { *guard=Some(Kept{connection,chat}); }
+        else { connection.shutdown().await; }
         match result {
             Ok((status,error))=>Ok(GptRunOutcome{thread_id:prepared.thread_id,status,error}),
             Err(error)=>Ok(GptRunOutcome{thread_id:prepared.thread_id,status:GptRunStatus::Failed,error:Some(error)}),
@@ -166,8 +207,8 @@ impl GptClient {
 
 struct Prepared { thread_id:String, input:Vec<Value>, effort:Option<String>, transfer:Transfer }
 
-async fn prepare(connection:&mut Connection, request:&GptRunRequest, cwd:&Path)->Result<Prepared,String> {
-    require_account(connection).await?;
+async fn prepare(connection:&mut Connection, request:&GptRunRequest, cwd:&Path, account_confirmed:bool)->Result<Prepared,String> {
+    if !account_confirmed { require_account(connection).await?; }
     let catalog=models(connection).await?;
     let selected=catalog.iter().find(|model|model.model==request.model)
         .ok_or("The selected GPT model is no longer in this account's catalog. Refresh models and select one.")?;

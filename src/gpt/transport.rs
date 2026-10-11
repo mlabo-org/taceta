@@ -168,6 +168,20 @@ impl Connection {
         self.incoming.recv().await.ok_or_else(|| "Codex App Server closed the connection before completion.".to_owned())?
     }
 
+    /// Drops the notifications that arrived while nothing was in flight.
+    /// Returns false when the connection can no longer be trusted: it ended,
+    /// or something other than a notification is waiting.
+    pub(super) fn discard_idle(&mut self) -> bool {
+        self.deferred.clear();
+        loop {
+            match self.incoming.try_recv() {
+                Ok(Ok(WireMessage::Notification { .. })) => {}
+                Ok(_) | Err(mpsc::error::TryRecvError::Disconnected) => return false,
+                Err(mpsc::error::TryRecvError::Empty) => return true,
+            }
+        }
+    }
+
     pub async fn next(&mut self) -> Result<WireMessage, String> {
         if let Some(message) = self.deferred.pop_front() { return Ok(message); }
         self.receive().await
