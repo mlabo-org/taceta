@@ -3,6 +3,7 @@ mod capability;
 mod client;
 mod endpoint;
 mod lifecycle;
+mod memory;
 mod router;
 mod stream;
 

@@ -37,7 +37,9 @@ Google 検索では、AI による概要があれば生成完了を確認して�
 
 表示言語、テーマ、モデル管理、Web Search、モデル保存先、context length を設定できます。
 
-画面右上の「全モデル解放」で、接続先のOllamaに読み込み中の全モデルをメモリから解放できます。生成中・モデル取得中は操作できません。モデルファイルと会話は残り、次の送信時に再読み込みします。他のアプリが使用するモデルも対象です。何も読み込まれていなければ「読み込み中のモデルはありません」と表示します。一部の解放に失敗した場合は対象名を表示し、全件成功とは扱いません。Tacetaを終了するだけでは自動解放しません。
+Ollamaのモデルは、Tacetaが次の2つの時点でメモリから解放します。別のモデルで送信するときは、そのモデルを読み込む前に、読み込み中の他のモデルを解放します。2つのモデルを同時に抱えてメモリが足りなくなることを防ぐためです。Tacetaを終了するときは、その起動中にローカルのモデルを使っていれば、読み込み中のモデルを解放してから終了します。どちらも接続先のOllamaに読み込まれている全モデルが対象で、他のアプリが使用するモデルも含みます。モデルファイルと会話は残ります。解放できなかった場合、送信は新しいモデルを読み込まずに失敗として表示します。終了時の待ち時間は20秒までで、強制終了や異常終了では解放されません。
+
+画面右上の「全モデル解放」は、上の自動解放で足りないときに手動で使うものです。接続先のOllamaに読み込み中の全モデルを解放します。生成中・モデル取得中は操作できません。何も読み込まれていなければ「読み込み中のモデルはありません」と表示します。一部の解放に失敗した場合は対象名を表示し、全件成功とは扱いません。
 
 ![Tacetaの日本語設定画面](docs/images/taceta-settings-ja.png)
 
@@ -241,6 +243,10 @@ The main view keeps local-model output, the Thinking trace, Markdown tables and 
 ### Settings
 
 Configure language, theme, model management, Web Search, the model location, and context length.
+
+Taceta releases Ollama models from memory at two points. When you send with a different model, the other loaded models are released before that model is loaded, so two models are never held at once. When you quit Taceta after using a local model in that session, loaded models are released before the app exits. Both apply to every model loaded on the connected Ollama, including models another app is using. Model files and conversations are kept. If a model cannot be released, the send fails visibly without loading the new model. Quitting waits at most 20 seconds, and a forced or abnormal exit releases nothing.
+
+"Unload all models" at the top right is the manual fallback for when that is not enough. It releases every model loaded on the connected Ollama and is unavailable while generating or downloading. A partial failure names the models and is not reported as success.
 
 ![Taceta settings in English](docs/images/taceta-settings-en.png)
 
