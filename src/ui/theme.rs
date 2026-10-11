@@ -23,7 +23,7 @@ pub struct TacetaPalette {
 
 /// Applies Taceta's look to the root UI: neutral surfaces, text in two
 /// strengths, and controls that stay quiet until the pointer is on them.
-pub fn apply_text_contrast(ui: &mut egui::Ui) {
+pub fn apply_style(ui: &mut egui::Ui) {
     let palette = palette(ui);
     let visuals = ui.visuals_mut();
     visuals.override_text_color = Some(palette.contrast_text);
@@ -33,7 +33,8 @@ pub fn apply_text_contrast(ui: &mut egui::Ui) {
     visuals.window_stroke = Stroke::new(1.0, palette.border);
     visuals.window_corner_radius = CornerRadius::same(12);
     visuals.menu_corner_radius = CornerRadius::same(10);
-    visuals.extreme_bg_color = palette.background;
+    // Text fields sit one step away from the page they are on.
+    visuals.extreme_bg_color = palette.sidebar;
     visuals.faint_bg_color = palette.hover;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.border);
     visuals.widgets.noninteractive.bg_fill = palette.composer;
