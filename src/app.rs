@@ -3720,6 +3720,8 @@ pub(super) enum ActionMark {
     Running,
     Done,
     Failed,
+    /// Started, and its turn ended before it reported a result.
+    Stopped,
     /// A section that is not an action, such as a thinking trace or a diff.
     Section,
 }
@@ -3739,6 +3741,7 @@ pub(super) fn show_action_row(
         ActionMark::Running => ("…", palette.weak_text),
         ActionMark::Done => ("✓", palette.success),
         ActionMark::Failed => ("✗", palette.error),
+        ActionMark::Stopped => ("■", palette.weak_text),
         ActionMark::Section => ("", palette.weak_text),
     };
     let title = title.lines().find(|line| !line.trim().is_empty()).unwrap_or_default().trim();
