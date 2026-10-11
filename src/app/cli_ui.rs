@@ -506,7 +506,7 @@ impl TacetaApp {
                     show_action(
                         ui,
                         (message.id, index),
-                        if action.succeeded { "✓" } else { "✗" },
+                        if action.succeeded { super::ActionMark::Done } else { super::ActionMark::Failed },
                         &action.title,
                         &action.detail,
                         action.diff.as_deref(),
@@ -520,9 +520,9 @@ impl TacetaApp {
                             ui,
                             (active.assistant_id, &tool.id),
                             match tool.status {
-                                ToolStatus::Running => "…",
-                                ToolStatus::Completed => "✓",
-                                ToolStatus::Failed => "✗",
+                                ToolStatus::Running => super::ActionMark::Running,
+                                ToolStatus::Completed => super::ActionMark::Done,
+                                ToolStatus::Failed => super::ActionMark::Failed,
                             },
                             &tool.title,
                             &tool.detail,
@@ -612,23 +612,21 @@ impl TacetaApp {
 fn show_action(
     ui: &mut Ui,
     id: impl std::hash::Hash,
-    mark: &str,
+    mark: super::ActionMark,
     title: &str,
     detail: &str,
     diff: Option<&str>,
 ) {
-    egui::CollapsingHeader::new(format!("{mark} {title}"))
-        .id_salt(("cli-action", id))
-        .show(ui, |ui| {
-            ScrollArea::both().max_height(360.0).show(ui, |ui| {
-                if let Some(diff) = diff {
-                    show_diff_text(ui, diff);
-                }
-                if !detail.is_empty() {
-                    ui.monospace(detail);
-                }
-            });
+    super::show_action_row(ui, ("cli-action", id), mark, title, false, |ui| {
+        ScrollArea::both().max_height(360.0).show(ui, |ui| {
+            if let Some(diff) = diff {
+                show_diff_text(ui, diff);
+            }
+            if !detail.is_empty() {
+                ui.monospace(detail);
+            }
         });
+    });
 }
 
 /// Draws text in which lines starting with `+ ` and `- ` are a change.
