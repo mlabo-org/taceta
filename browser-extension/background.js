@@ -52,20 +52,22 @@ function connect() {
   connecting = false;
   const p = port;
   chrome.alarms.clear?.("taceta-link-reconnect");
-  p.onMessage.addListener(m => { try { execute(m).catch(() => {}); } catch (_) {} });
-  port.onDisconnect.addListener(() => {
-    const ignored=chrome.runtime.lastError; void ignored;
-    if (port !== p) return;
-    port=null;
-    if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
-    // A Native Messaging disconnect invalidates the current session. Release
-    // the in-flight owned scope before reconnecting so a stale engine cannot
-    // leak a window/group or report its result through the new port.
-    sessionId = crypto.randomUUID();
-    releaseOwnedScope().finally(scheduleReconnect).catch(() => {});
-  });
+  // A message that cannot be handled leaves no poll scheduled. Drop the
+  // connection so the normal reconnect path starts a fresh session.
+  p.onMessage.addListener(m => { execute(m).catch(() => { if (port === p) p.disconnect(); dropConnection(p); }); });
+  port.onDisconnect.addListener(() => { const ignored=chrome.runtime.lastError; void ignored; dropConnection(p); });
   reply(request("extension_ready", {name:"Taceta Link", version:PRODUCT_VERSION}));
   poll();
+}
+function dropConnection(p) {
+  if (port !== p) return;
+  port=null;
+  if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+  // A Native Messaging disconnect invalidates the current session. Release
+  // the in-flight owned scope before reconnecting so a stale engine cannot
+  // leak a window/group or report its result through the new port.
+  sessionId = crypto.randomUUID();
+  releaseOwnedScope().finally(scheduleReconnect).catch(() => {});
 }
 async function releaseOwnedScope() { try { await cdp.detach(); } finally { await scope.close(); } }
 async function initialize() {
