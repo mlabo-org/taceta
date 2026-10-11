@@ -154,6 +154,8 @@ pub struct TacetaApp {
     conversation_bulk_delete_confirmation: Option<ConversationBulkDeleteConfirmation>,
     scroll_to_bottom: bool,
     web_key_draft: String,
+    /// Looked up when the provider's settings are first shown and after Save or Delete.
+    web_key_status: Option<(&'static str, web_search::KeychainStatus)>,
     model_catalog_result_tx: std_mpsc::Sender<(String, Result<Vec<ModelCandidate>, String>)>,
     model_catalog_result_rx: std_mpsc::Receiver<(String, Result<Vec<ModelCandidate>, String>)>,
     model_catalog_pending: bool,
@@ -363,6 +365,7 @@ impl TacetaApp {
             conversation_bulk_delete_confirmation: None,
             scroll_to_bottom: true,
             web_key_draft: String::new(),
+            web_key_status: None,
             model_catalog_result_tx,
             model_catalog_result_rx,
             model_catalog_pending: false,
@@ -2469,6 +2472,7 @@ impl TacetaApp {
                                     if ui.button(text(language, "保存", "Save")).clicked() {
                                         let secret = std::mem::take(&mut self.web_key_draft);
                                         let result = web_search::save_keychain_secret(account, &secret);
+                                        self.web_key_status = None;
                                         self.notice = Some(match result {
                                             Ok(()) => Notice { kind: NoticeKind::Info, text: text(language, "APIキーをKeychainに保存しました。", "API key saved to Keychain.").to_owned() },
                                             Err(error) => Notice { kind: NoticeKind::Error, text: error.to_string() },
@@ -2476,12 +2480,25 @@ impl TacetaApp {
                                     }
                                     if ui.button(text(language, "削除", "Delete")).clicked() {
                                         let result = web_search::delete_keychain_secret(account);
+                                        self.web_key_status = None;
                                         self.notice = Some(match result {
                                             Ok(()) => Notice { kind: NoticeKind::Info, text: text(language, "APIキーを削除しました。", "API key deleted.").to_owned() },
                                             Err(error) => Notice { kind: NoticeKind::Error, text: error.to_string() },
                                         });
                                     }
-                                    let status = if web_search::has_keychain_secret(account) { text(language, "設定済み", "Configured") } else { text(language, "未設定", "Not configured") };
+                                    let key_status = match self.web_key_status {
+                                        Some((checked, status)) if checked == account => status,
+                                        _ => {
+                                            let status = web_search::keychain_status(account);
+                                            self.web_key_status = Some((account, status));
+                                            status
+                                        }
+                                    };
+                                    let status = match key_status {
+                                        web_search::KeychainStatus::Configured => text(language, "設定済み", "Configured"),
+                                        web_search::KeychainStatus::Missing => text(language, "未設定", "Not configured"),
+                                        web_search::KeychainStatus::Unavailable => text(language, "Keychainを確認できません", "Keychain could not be checked"),
+                                    };
                                     ui.label(RichText::new(status).weak());
                                 });
                             } else if matches!(
