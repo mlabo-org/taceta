@@ -14,7 +14,7 @@ impl InferenceProvider {
     pub fn label(self) -> &'static str {
         match self {
             Self::Ollama => "Ollama",
-            Self::Grok => "Grok (OAuth)",
+            Self::Grok => "Grok",
             Self::Gpt => "GPT (OAuth)",
             Self::Claude => "Claude",
         }

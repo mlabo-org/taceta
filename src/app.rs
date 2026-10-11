@@ -132,7 +132,6 @@ pub struct TacetaApp {
     model_result_tx: std_mpsc::Sender<(u64, Result<Vec<ModelDescriptor>, String>)>,
     model_result_rx: std_mpsc::Receiver<(u64, Result<Vec<ModelDescriptor>, String>)>,
     model_list_epoch: u64,
-    provider_ui: provider_ui::ProviderUiState,
     agent_ui: agent_ui::AgentUiState,
     gpt_ui: gpt_ui::GptUiState,
     cli_ui: cli_ui::CliUiState,
@@ -262,11 +261,7 @@ impl TacetaApp {
                 });
             }
         }
-        if app.state.inference_provider == InferenceProvider::Grok {
-            app.backend = Some(Arc::clone(&app.provider_ui.grok) as Arc<dyn InferenceBackend>);
-            app.refresh_models();
-        } else if app.state.inference_provider == InferenceProvider::Gpt {
-            app.backend = None;
+        if app.state.inference_provider != InferenceProvider::Ollama {
             app.refresh_models();
         } else if let Some(error) = initial_endpoint_error {
             let error = ollama_endpoint_error_message(app.language(), &error);
@@ -308,7 +303,7 @@ impl TacetaApp {
         let (delete_result_tx, delete_result_rx) = std_mpsc::channel();
         let ollama_endpoint_mode_draft = state.ollama_endpoint_mode;
         let ollama_custom_endpoint_draft = state.ollama_custom_endpoint.clone();
-        let backend = (state.inference_provider != InferenceProvider::Gpt).then_some(backend);
+        let backend = (state.inference_provider == InferenceProvider::Ollama).then_some(backend);
         Self {
             shell_preferences,
             system_language: system_language(),
@@ -320,10 +315,9 @@ impl TacetaApp {
             model_result_tx,
             model_result_rx,
             model_list_epoch: 0,
-            provider_ui: provider_ui::ProviderUiState::default(),
             agent_ui: agent_ui::AgentUiState::new(data_roots.agent_sessions),
             gpt_ui: gpt_ui::GptUiState::new(data_roots.gpt_bindings),
-            cli_ui: cli_ui::CliUiState::new(),
+            cli_ui: cli_ui::CliUiState::new(data_roots.grok_approval_plugin),
             model_refresh_pending: false,
             models: Vec::new(),
             connection: ConnectionState::Connecting,
@@ -679,7 +673,6 @@ impl TacetaApp {
     }
 
     fn drain_background_work(&mut self) {
-        self.drain_provider_work();
         self.drain_agent_work();
         self.drain_gpt_work();
         self.drain_cli_work();
@@ -1348,10 +1341,6 @@ impl TacetaApp {
     }
 
     fn stop_generation(&mut self) {
-        if self.gpt_ui.is_transferring() {
-            self.cancel_gpt_reverse_transfer();
-            return;
-        }
         if self.gpt_ui.active.is_some() {
             self.stop_gpt_run();
             return;
@@ -3356,7 +3345,7 @@ impl TacetaApp {
                                     } else {
                                         text(language, "Web: OFF", "Web: OFF")
                                     };
-                                    if matches!(self.state.inference_provider, InferenceProvider::Ollama | InferenceProvider::Grok) && ui
+                                    if self.state.inference_provider == InferenceProvider::Ollama && ui
                                         .add_enabled(
                                             web_available && !self.is_generating(),
                                             Button::new(web_label)
@@ -3789,7 +3778,7 @@ impl eframe::App for TacetaApp {
         self.drain_background_work();
         self.persist_gpt_thread(frame.storage_mut());
 
-        if self.is_generating() || self.provider_ui.login.is_some() || self.gpt_ui.auth_busy() || self.agent_ui.is_recovering()
+        if self.is_generating() || self.gpt_ui.auth_busy() || self.agent_ui.is_recovering()
             || self.model_refresh_pending || self.model_pull.is_some()
             || self.model_unload_result.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -3818,7 +3807,6 @@ impl eframe::App for TacetaApp {
         self.show_agent_approval(ui.ctx());
         self.show_gpt_requests(ui.ctx());
         self.show_cli_approval(ui.ctx());
-        self.show_gpt_transfer(ui.ctx());
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -3836,9 +3824,6 @@ impl Drop for TacetaApp {
         self.abort_agent_on_exit();
         self.abort_gpt_on_exit();
         self.abort_cli_on_exit();
-        if let Some(login) = self.provider_ui.login.take() {
-            login.task.abort();
-        }
         if let Some(generation) = self.generation.take() {
             generation.task.abort();
         }
@@ -3910,6 +3895,7 @@ fn thinking_mode_label(language: AppShellLanguage, mode: ThinkingMode) -> &'stat
 struct DataRoots {
     home: PathBuf,
     agent_sessions: PathBuf,
+    grok_approval_plugin: PathBuf,
     gpt_bindings: PathBuf,
     model_storage: PathBuf,
 }
@@ -3920,6 +3906,7 @@ impl DataRoots {
         Self {
             home: home.to_path_buf(),
             agent_sessions: taceta.join("AgentSessions"),
+            grok_approval_plugin: taceta.join("GrokApprovalPlugin"),
             gpt_bindings: taceta.join("GptBindings"),
             model_storage: resolve_model_storage_path(home),
         }
@@ -4563,6 +4550,7 @@ mod model_manager_tests {
             DataRoots {
                 home: PathBuf::from("/tmp/taceta-test-unused-home"),
                 agent_sessions: std::env::temp_dir().join(format!("taceta-ui-{}", Uuid::new_v4())),
+                grok_approval_plugin: std::env::temp_dir().join(format!("taceta-grok-plugin-{}", Uuid::new_v4())),
                 gpt_bindings: std::env::temp_dir().join(format!("taceta-gpt-ui-{}", Uuid::new_v4())),
                 model_storage: PathBuf::from("/tmp/taceta-test-unused-home/.ollama/models"),
             },
@@ -4733,7 +4721,7 @@ mod model_manager_tests {
         }
         impl InferenceBackend for ModelRouteRecorder {
             fn list_models(&self) -> BackendFuture<Vec<ModelDescriptor>> {
-                Box::pin(async { Ok(vec![model("grok-4.5"), model("grok-4.6")]) })
+                Box::pin(async { Ok(vec![model("model-a"), model("model-b")]) })
             }
 
             fn stream_chat(
@@ -4758,10 +4746,9 @@ mod model_manager_tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let mut app = test_app(Arc::new(RecordingServices::default()));
         app.backend = Some(Arc::new(ModelRouteRecorder { requests: Arc::clone(&requests) }));
-        app.state.inference_provider = InferenceProvider::Grok;
-        app.models = vec![model("grok-4.5"), model("grok-4.6")];
+        app.models = vec![model("model-a"), model("model-b")];
         let conversation_id = app.state.active_conversation().id;
-        for selected in ["grok-4.5", "grok-4.6"] {
+        for selected in ["model-a", "model-b"] {
             app.state.selected_model = Some(selected.into());
             app.state.draft = "Describe yourself briefly.".into();
             app.start_generation();
@@ -4773,7 +4760,7 @@ mod model_manager_tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.iter().map(|request| request.model.as_str()).collect::<Vec<_>>(),
-            ["grok-4.5", "grok-4.6"]);
+            ["model-a", "model-b"]);
         assert_eq!(requests[0].messages.len(), 1);
         assert_eq!(requests[1].messages.len(), 3);
         assert_eq!(requests[1].messages[1].content, "Recorded answer");
@@ -4786,10 +4773,10 @@ mod model_manager_tests {
         let identities = restored.active_conversation().messages.iter()
             .filter_map(|message| message.model_identity.as_ref()).collect::<Vec<_>>();
         assert_eq!(identities.len(), 2);
-        assert_eq!(identities[0].requested_model, "grok-4.5");
-        assert_eq!(identities[0].reported_model.as_deref(), Some("grok-4.5-build"));
-        assert_eq!(identities[1].requested_model, "grok-4.6");
-        assert_eq!(identities[1].reported_model.as_deref(), Some("grok-4.6-build"));
+        assert_eq!(identities[0].requested_model, "model-a");
+        assert_eq!(identities[0].reported_model.as_deref(), Some("model-a-build"));
+        assert_eq!(identities[1].requested_model, "model-b");
+        assert_eq!(identities[1].reported_model.as_deref(), Some("model-b-build"));
     }
 
     #[test]

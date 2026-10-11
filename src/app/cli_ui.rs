@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use taceta::{
     cli_agent::{
         ApprovalPolicy, ApprovalRequest, CliAgent, Control, Event, ModelOption, Readiness,
-        RunOutcome, RunRequest, RunStatus, ToolItem, ToolStatus, claude::ClaudeCode,
+        RunOutcome, RunRequest, RunStatus, ToolItem, ToolStatus, claude::ClaudeCode, grok::GrokCli,
     },
     domain::ActionRecord,
     prior_context::{prior_context, with_prior_context},
@@ -41,15 +41,19 @@ pub(super) struct ActiveCli {
 
 pub(super) struct CliUiState {
     claude: Arc<dyn CliAgent>,
+    grok: Arc<dyn CliAgent>,
     pub(super) active: Option<ActiveCli>,
     readiness: HashMap<InferenceProvider, Result<Readiness, String>>,
     readiness_result: Option<(InferenceProvider, std_mpsc::Receiver<Result<Readiness, String>>)>,
 }
 
 impl CliUiState {
-    pub(super) fn new() -> Self {
+    /// `grok_approval_plugin` is where the Grok driver keeps the small plugin
+    /// that makes its CLI ask before each action.
+    pub(super) fn new(grok_approval_plugin: PathBuf) -> Self {
         Self {
             claude: Arc::new(ClaudeCode),
+            grok: Arc::new(GrokCli::new(grok_approval_plugin)),
             active: None,
             readiness: HashMap::new(),
             readiness_result: None,
@@ -60,7 +64,8 @@ impl CliUiState {
     pub(super) fn agent(&self, provider: InferenceProvider) -> Option<Arc<dyn CliAgent>> {
         match provider {
             InferenceProvider::Claude => Some(Arc::clone(&self.claude)),
-            InferenceProvider::Ollama | InferenceProvider::Grok | InferenceProvider::Gpt => None,
+            InferenceProvider::Grok => Some(Arc::clone(&self.grok)),
+            InferenceProvider::Ollama | InferenceProvider::Gpt => None,
         }
     }
 }

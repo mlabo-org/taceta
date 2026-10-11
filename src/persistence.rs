@@ -113,34 +113,8 @@ impl Conversation {
             || (self.provider.is_none() && self.gpt.is_some())
     }
 
-    pub fn requires_gpt_reverse_transfer(&self) -> bool {
-        self.is_gpt() && self.agent_enabled && self.has_history()
-    }
-
     pub fn has_gpt_history(&self) -> bool {
         self.is_gpt() || !self.archived_gpt_thread_ids.is_empty() || self.gpt_ownership_revision > 0
-    }
-
-    pub fn returned_to_grok(&self) -> Result<Self, String> {
-        let gpt = self.gpt.as_ref().ok_or("GPT task metadata is missing")?;
-        let thread_id = gpt.thread_id.as_ref().filter(|id| !id.is_empty());
-        if thread_id.is_none() && !(gpt.handoff_from_taceta && gpt.pending_handoff) {
-            return Err("The GPT task has no saved Codex conversation to transfer".into());
-        }
-        if !self.requires_gpt_reverse_transfer() || self.workspace.is_none() {
-            return Err("Select a saved GPT coding task with its workspace before transferring it".into());
-        }
-        let mut next = self.clone();
-        next.provider = Some(InferenceProvider::Grok);
-        next.gpt = None;
-        next.web_search_enabled = false;
-        next.gpt_ownership_revision = next.gpt_ownership_revision.saturating_add(1);
-        if let Some(thread_id) = thread_id {
-            if !next.archived_gpt_thread_ids.contains(thread_id) {
-                next.archived_gpt_thread_ids.push(thread_id.clone());
-            }
-        }
-        Ok(next)
     }
 
     pub fn has_history(&self) -> bool {
@@ -322,11 +296,6 @@ impl PersistedAppState {
         if self.active_conversation().provider.is_none() {
             self.active_conversation_mut().provider = Some(current_provider);
         }
-        // This ownership change requires the asynchronous canonical export,
-        // durable AgentSession import, and checkpoint commit in gpt_ui.
-        if provider == InferenceProvider::Grok && self.active_conversation().requires_gpt_reverse_transfer() {
-            return;
-        }
         let transfer_work = provider == InferenceProvider::Gpt
             && !self.active_conversation().is_gpt()
             && self.active_conversation().agent_enabled
@@ -360,23 +329,6 @@ impl PersistedAppState {
             }
             self.active_conversation_mut().provider = Some(provider);
         }
-    }
-
-    pub fn commit_gpt_reverse_transfer(&mut self, mut conversation: Conversation) -> Result<(), String> {
-        let current = self.conversations.iter_mut().find(|current| current.id == conversation.id)
-            .ok_or("The transferred conversation no longer exists")?;
-        if !current.is_gpt() || conversation.provider != Some(InferenceProvider::Grok)
-            || current.gpt_ownership_revision.saturating_add(1) != conversation.gpt_ownership_revision {
-            return Err("The conversation owner changed while the GPT work was being transferred".into());
-        }
-        conversation.title = current.title.clone();
-        conversation.title_is_custom = current.title_is_custom;
-        let id = conversation.id;
-        *current = conversation;
-        if self.active_conversation_id == id {
-            self.remember_provider_model(InferenceProvider::Grok);
-        }
-        Ok(())
     }
 
     pub fn select_conversation(&mut self, id: Uuid) -> bool {
@@ -518,29 +470,6 @@ pub fn save_gpt_binding(root: &std::path::Path, conversation: &Conversation) -> 
         archived_gpt_thread_ids: conversation.archived_gpt_thread_ids.clone(),
     };
     write_gpt_binding(root, &binding)
-}
-
-pub fn save_gpt_reverse_ownership(root: &std::path::Path, previous: &Conversation, next: &Conversation) -> Result<(), String> {
-    if previous.id != next.id || !previous.is_gpt() || next.provider != Some(InferenceProvider::Grok) {
-        return Err("The GPT ownership checkpoint does not match the transferred task".into());
-    }
-    let thread_id = previous.gpt.as_ref().and_then(|gpt| gpt.thread_id.clone());
-    let binding = GptBinding {
-        id: next.id, title: next.title.clone(), title_is_custom: next.title_is_custom,
-        thread_id, coding: true, workspace: next.workspace.clone(),
-        handoff_from_taceta: false, pending_handoff: false,
-        owner: InferenceProvider::Grok, ownership_revision: next.gpt_ownership_revision,
-        archived_gpt_thread_ids: next.archived_gpt_thread_ids.clone(),
-    };
-    if let Err(error) = write_gpt_binding(root, &binding) {
-        // A sync error can follow rename. Restore the original owner before
-        // reporting a failed transfer; imported records remain idempotent.
-        if let Err(restore_error) = save_gpt_binding(root, previous) {
-            return Err(format!("{error}; could not restore the prior GPT checkpoint: {restore_error}"));
-        }
-        return Err(error);
-    }
-    Ok(())
 }
 
 fn write_gpt_binding(root: &std::path::Path, binding: &GptBinding) -> Result<(), String> {
@@ -777,10 +706,10 @@ mod tests {
         let session = state.active_conversation().gpt.as_ref().unwrap();
         assert!(session.handoff_from_taceta && session.pending_handoff);
         assert!(session.thread_id.is_none());
-        // No account action is performed by a persisted-state transition.
+        // Leaving GPT keeps the GPT conversation as it is and continues elsewhere.
         state.switch_provider(InferenceProvider::Grok);
-        assert_eq!(state.active_conversation_id, original_id);
-        assert_eq!(state.inference_provider, InferenceProvider::Gpt); // Await the durable reverse-transfer receipt.
+        assert_ne!(state.active_conversation_id, original_id);
+        assert_eq!(state.inference_provider, InferenceProvider::Grok);
         assert_eq!(state.conversations.iter().find(|chat| chat.id == original_id).unwrap().messages.len(), 2);
     }
 

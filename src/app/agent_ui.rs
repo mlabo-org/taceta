@@ -393,8 +393,7 @@ impl TacetaApp {
                 self.ollama_used = true;
                 Arc::new(OllamaClient::new(self.ollama_endpoint.clone()))
             }
-            InferenceProvider::Grok => Arc::clone(&self.provider_ui.grok) as Arc<dyn AgentModel>,
-            InferenceProvider::Gpt | InferenceProvider::Claude => return,
+            InferenceProvider::Grok | InferenceProvider::Gpt | InferenceProvider::Claude => return,
         };
         let (event_tx, events) = mpsc::unbounded_channel();
         let (approval_tx, approval_rx) = mpsc::unbounded_channel();
