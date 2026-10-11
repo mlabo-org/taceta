@@ -1,5 +1,6 @@
 use super::api::{ChatBody, ChatChunk, ChatOptions, WireMessage};
 use crate::backend::BackendError;
+use crate::domain::ThinkingCapability;
 use serde::Deserialize;
 
 const WEB_ROUTER_PROMPT: &str = r#"You are Taceta's local Web-routing controller, not an answering assistant.
@@ -45,8 +46,9 @@ pub(super) async fn classify(
     model: &str,
     current_input: &str,
     context_length: u32,
+    thinking: &ThinkingCapability,
 ) -> Result<WebRouteDecision, BackendError> {
-    let body = routing_body(model, current_input, context_length);
+    let body = routing_body(model, current_input, context_length, thinking);
     let response = http
         .post(chat_url)
         .json(&body)
@@ -73,7 +75,24 @@ fn routing_request_error(error: reqwest::Error) -> BackendError {
     BackendError::Web(format!("web routing request failed: {error}"))
 }
 
-fn routing_body(model: &str, current_input: &str, context_length: u32) -> ChatBody {
+/// Routing asks for the least reasoning that the model's confirmed control
+/// allows, and sends no Thinking field when no control is confirmed.
+fn routing_think(thinking: &ThinkingCapability) -> Option<serde_json::Value> {
+    match thinking {
+        ThinkingCapability::Toggle => Some(false.into()),
+        ThinkingCapability::Levels => Some("low".into()),
+        ThinkingCapability::None
+        | ThinkingCapability::Unverified
+        | ThinkingCapability::Efforts { .. } => None,
+    }
+}
+
+fn routing_body(
+    model: &str,
+    current_input: &str,
+    context_length: u32,
+    thinking: &ThinkingCapability,
+) -> ChatBody {
     ChatBody {
         model: model.to_owned(),
         messages: vec![
@@ -94,7 +113,7 @@ fn routing_body(model: &str, current_input: &str, context_length: u32) -> ChatBo
         ],
         stream: false,
         options: ChatOptions::web_routing(context_length),
-        think: Some(false.into()),
+        think: routing_think(thinking),
         tools: None,
         format: Some(route_schema()),
     }
@@ -210,6 +229,7 @@ mod tests {
             "qwen3.8:27b-mlx",
             "今日リリースされたOAIのGPT-6はAGIですか？",
             32_768,
+            &ThinkingCapability::Toggle,
         );
         assert_eq!(body.messages.len(), 2);
         assert_eq!(body.messages[0].role, "system");
@@ -221,5 +241,14 @@ mod tests {
         assert_eq!(body.think, Some(false.into()));
         assert!(body.tools.is_none());
         assert!(body.format.is_some());
+    }
+
+    #[test]
+    fn routing_never_sends_a_boolean_thinking_control_the_model_has_not_confirmed() {
+        let think = |thinking| routing_body("model", "question", 32_768, &thinking).think;
+        assert_eq!(think(ThinkingCapability::Toggle), Some(false.into()));
+        assert_eq!(think(ThinkingCapability::Levels), Some("low".into()));
+        assert_eq!(think(ThinkingCapability::Unverified), None);
+        assert_eq!(think(ThinkingCapability::None), None);
     }
 }

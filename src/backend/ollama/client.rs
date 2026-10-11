@@ -245,6 +245,7 @@ impl InferenceBackend for OllamaClient {
             }
             lifecycle::ensure_ready(&client.http, &client.endpoint).await?;
             let tools = validate_tools(request.tools.as_ref())?;
+            let mut routing_thinking = crate::domain::ThinkingCapability::Unverified;
             if tools.is_some() {
                 let show: ShowResponse = client
                     .http
@@ -260,6 +261,7 @@ impl InferenceBackend for OllamaClient {
                         "selected Ollama model does not advertise tool support".into(),
                     ));
                 }
+                routing_thinking = capability::classify(&request.model, &show.details.family);
             }
             let provider_kind = request
                 .web_search_provider
@@ -288,7 +290,7 @@ impl InferenceBackend for OllamaClient {
                     BackendError::Web("Web routing requires a current user input".into())
                 })?;
             let route = if tools.is_some() {
-                determine_web_route(&client, &request, current_input, &events).await?
+                determine_web_route(&client, &request, current_input, &routing_thinking, &events).await?
             } else {
                 router::WebRouteDecision::Local
             };
@@ -603,6 +605,7 @@ async fn determine_web_route(
     client: &OllamaClient,
     request: &ChatRequest,
     current_input: &ChatMessage,
+    thinking: &crate::domain::ThinkingCapability,
     events: &UnboundedSender<GenerationEvent>,
 ) -> Result<router::WebRouteDecision, BackendError> {
     if web_search::requires_mandatory_search(&current_input.content) {
@@ -619,6 +622,7 @@ async fn determine_web_route(
         &request.model,
         &current_input.content,
         request.context_length,
+        thinking,
     )
     .await
 }
