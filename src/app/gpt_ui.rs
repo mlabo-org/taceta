@@ -154,7 +154,7 @@ impl TacetaApp {
 
     pub(super) fn show_gpt_controls(&mut self, root_ui: &mut Ui) {
         let language = self.language();
-        Panel::top("taceta-agent-controls").show_inside(root_ui, |ui| {
+        super::controls_strip(root_ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 self.show_provider_selector(ui);
                 if self.state.inference_provider != InferenceProvider::Gpt { return; }
@@ -568,40 +568,35 @@ impl TacetaApp {
 
     pub(super) fn show_gpt_chat(&mut self, root_ui: &mut Ui) {
         let language = self.language();
-        CentralPanel::default().show_inside(root_ui, |ui| {
-            self.show_notice(ui);
-            ScrollArea::vertical().id_salt("gpt-transcript")
-                .stick_to_bottom(self.scroll_to_bottom || self.is_generating()).show(ui, |ui| {
-                let conversation = self.state.active_conversation();
-                if conversation.messages.is_empty() {
-                    ui.label(text(language,
-                        "作業フォルダーとモデルを選び、実行したいことを入力してください。普通の会話には「チャット」を選べます。",
-                        "Choose a workspace and model, then describe the work. Select Chat for an ordinary conversation."));
+        self.show_transcript(root_ui, "gpt-transcript", |app, ui| {
+            let conversation = app.state.active_conversation();
+            if conversation.messages.is_empty() {
+                ui.label(text(language,
+                    "作業フォルダーとモデルを選び、実行したいことを入力してください。普通の会話には「チャット」を選べます。",
+                    "Choose a workspace and model, then describe the work. Select Chat for an ordinary conversation."));
+            }
+            for message in &conversation.messages { app.show_message(ui, message, app.is_generating()); }
+            if let Some(session) = &conversation.gpt {
+                if app.state.show_thinking_trace && !session.thinking.is_empty() {
+                    egui::CollapsingHeader::new(text(language, "思考過程", "Thinking trace"))
+                        .id_salt(("gpt-thinking", conversation.id)).default_open(true).show(ui, |ui| { ui.label(&session.thinking); });
                 }
-                for message in &conversation.messages { self.show_message(ui, message, self.is_generating()); }
-                if let Some(session) = &conversation.gpt {
-                    if self.state.show_thinking_trace && !session.thinking.is_empty() {
-                        egui::CollapsingHeader::new(text(language, "思考過程", "Thinking trace"))
-                            .id_salt(("gpt-thinking", conversation.id)).default_open(true).show(ui, |ui| { ui.label(&session.thinking); });
-                    }
-                    for item in &session.tools {
-                        egui::CollapsingHeader::new(format!("{} {}", if item.completed { "✓" } else { "…" }, item.title))
-                            .id_salt(("gpt-tool", conversation.id, &item.id)).show(ui, |ui| {
-                                ScrollArea::both().id_salt(("gpt-output", &item.id)).max_height(480.0)
-                                    .show(ui, |ui| { ui.monospace(&item.detail); });
-                            });
-                    }
-                    if !session.diff.is_empty() {
-                        egui::CollapsingHeader::new(text(language, "ファイルの変更差分", "File changes"))
-                            .id_salt(("gpt-diff", conversation.id)).show(ui, |ui| {
-                                ScrollArea::both().max_height(480.0).show(ui, |ui| { ui.monospace(&session.diff); });
-                            });
-                    }
-                    if let Some(error) = &session.error { ui.colored_label(theme::palette(ui).error, error); }
+                for item in &session.tools {
+                    egui::CollapsingHeader::new(format!("{} {}", if item.completed { "✓" } else { "…" }, item.title))
+                        .id_salt(("gpt-tool", conversation.id, &item.id)).show(ui, |ui| {
+                            ScrollArea::both().id_salt(("gpt-output", &item.id)).max_height(480.0)
+                                .show(ui, |ui| { ui.monospace(&item.detail); });
+                        });
                 }
-            });
+                if !session.diff.is_empty() {
+                    egui::CollapsingHeader::new(text(language, "ファイルの変更差分", "File changes"))
+                        .id_salt(("gpt-diff", conversation.id)).show(ui, |ui| {
+                            ScrollArea::both().max_height(480.0).show(ui, |ui| { ui.monospace(&session.diff); });
+                        });
+                }
+                if let Some(error) = &session.error { ui.colored_label(theme::palette(ui).error, error); }
+            }
         });
-        self.scroll_to_bottom = false;
     }
 
     pub(super) fn show_gpt_requests(&mut self, ctx: &Context) {

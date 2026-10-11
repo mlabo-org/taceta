@@ -62,8 +62,13 @@ const COMPOSER_EDITOR_MAX_HEIGHT_FRACTION: f32 = 0.42;
 const COMPOSER_PANEL_BASE_HEIGHT: f32 = 154.0;
 const COMPOSER_ATTACHMENT_EXTRA_HEIGHT: f32 = 30.0;
 const COMPOSER_CARD_INNER_MARGIN: f32 = 12.0;
-const SIDEBAR_WIDTH: f32 = 238.0;
-const SIDEBAR_FOOTER_HEIGHT: f32 = 58.0;
+const SIDEBAR_WIDTH: f32 = 260.0;
+const SIDEBAR_FOOTER_HEIGHT: f32 = 50.0;
+const SIDEBAR_ROW_HEIGHT: f32 = 32.0;
+const READING_COLUMN_WIDTH: f32 = 780.0;
+const READING_COLUMN_MARGIN: f32 = 24.0;
+const MESSAGE_GAP: f32 = 18.0;
+const SIDEBAR_ROW_MENU_WIDTH: f32 = 28.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -1205,6 +1210,9 @@ impl TacetaApp {
     }
 
     fn start_generation(&mut self) {
+        // Sending from the keyboard leaves the line break it was sent with.
+        let kept = self.state.draft.trim_end().len();
+        self.state.draft.truncate(kept);
         if self.state.inference_provider == InferenceProvider::Gpt {
             self.start_gpt_send();
             return;
@@ -1462,146 +1470,73 @@ impl TacetaApp {
                 .any(|(conversation_id, _, _)| conversation_id == id)
         });
 
-        let sidebar_palette = theme::palette(root_ui);
-        let sidebar_fill = sidebar_palette.sidebar;
-        let sidebar_footer_frame = egui::Frame::side_top_panel(root_ui.style())
-            .fill(sidebar_fill)
-            .inner_margin(egui::Margin::symmetric(8, 8));
+        let palette = theme::palette(root_ui);
+        let frame = egui::Frame::new().fill(palette.sidebar).inner_margin(egui::Margin::symmetric(8, 0));
         Panel::left("taceta-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
-            .frame(egui::Frame::side_top_panel(root_ui.style()).fill(sidebar_fill))
+            .show_separator_line(false)
+            .frame(frame)
             .show_inside(root_ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 Panel::bottom("taceta-sidebar-footer")
                     .exact_size(SIDEBAR_FOOTER_HEIGHT)
                     .resizable(false)
-                    .frame(sidebar_footer_frame)
+                    .show_separator_line(false)
+                    .frame(egui::Frame::new().fill(palette.sidebar).inner_margin(egui::Margin::symmetric(0, 8)))
                     .show_inside(ui, |ui| {
                         let selected = matches!(self.screen, Screen::Settings | Screen::Models);
-                        let button_fill = if selected {
-                            ui.visuals().selection.bg_fill
-                        } else {
-                            sidebar_palette.composer
-                        };
-                        let button_text = if selected {
-                            egui::Color32::WHITE
-                        } else {
-                            sidebar_palette.contrast_text
-                        };
-                        if ui
-                            .add_sized(
-                                [ui.available_width(), 40.0],
-                                Button::new(
-                                    RichText::new(format!(
-                                        "⚙ {}",
-                                        text(language, "設定", "Settings")
-                                    ))
-                                    .color(button_text),
-                                )
-                                .fill(button_fill)
-                                .stroke(egui::Stroke::new(1.0, sidebar_palette.border)),
-                            )
-                            .clicked()
-                        {
+                        if sidebar_row(ui, &format!("⚙  {}", text(language, "設定", "Settings")), selected, 0.0).clicked() {
                             self.screen = Screen::Settings;
                         }
                     });
 
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.heading(RichText::new("Taceta").size(19.0));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("tacet").small().weak());
-                    });
-                });
-                ui.add_space(12.0);
-
-                if ui
-                    .add_enabled(
-                        !generating && !self.conversation_bulk_delete_mode,
-                        Button::new(format!(
-                            "＋ {}",
-                            text(language, "新しいチャット", "New chat")
-                        ))
-                        .min_size(Vec2::new(ui.available_width(), 34.0)),
-                    )
-                    .clicked()
-                {
-                    self.state.start_new_conversation();
-                    self.screen = Screen::Chat;
-                }
-
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(text(language, "会話", "Chats"))
-                            .small()
-                            .weak(),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if self.conversation_bulk_delete_mode {
-                            if ui
-                                .small_button(text(language, "キャンセル", "Cancel"))
-                                .clicked()
-                            {
-                                self.conversation_bulk_delete_mode = false;
-                                self.conversation_bulk_selection.clear();
-                            }
-                        } else if ui
-                            .add_enabled(
-                                !generating,
-                                Button::new(text(language, "一括削除", "Bulk delete")).small(),
-                            )
-                            .on_disabled_hover_text(text(
-                                language,
-                                "生成中は削除できません",
-                                "Chats cannot be deleted while generating",
-                            ))
-                            .clicked()
-                        {
-                            self.conversation_bulk_delete_mode = true;
-                            self.conversation_bulk_selection.clear();
-                            self.conversation_title_editor = None;
-                            self.conversation_delete_confirmation = None;
-                        }
-                    });
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Taceta").size(17.0).strong());
                 });
-                if self.conversation_bulk_delete_mode {
-                    ui.add_space(5.0);
-                    ui.horizontal(|ui| {
+                ui.add_space(12.0);
+
+                ui.add_enabled_ui(!generating && !self.conversation_bulk_delete_mode, |ui| {
+                    if sidebar_row(ui, &format!("＋  {}", text(language, "新しいチャット", "New chat")), false, 0.0).clicked() {
+                        self.state.start_new_conversation();
+                        self.screen = Screen::Chat;
+                    }
+                });
+
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    if self.conversation_bulk_delete_mode {
                         let selected_count = self.conversation_bulk_selection.len();
                         ui.label(
                             RichText::new(match language {
                                 AppShellLanguage::Japanese => format!("{selected_count}件選択"),
-                                AppShellLanguage::English => {
-                                    format!("{selected_count} selected")
-                                }
+                                AppShellLanguage::English => format!("{selected_count} selected"),
                             })
-                            .small(),
+                            .small()
+                            .weak(),
                         );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let palette = theme::palette(ui);
+                    } else {
+                        ui.label(RichText::new(text(language, "会話", "Chats")).small().weak());
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self.conversation_bulk_delete_mode {
+                            if ui.add(Button::new(RichText::new(text(language, "キャンセル", "Cancel")).small()).frame(false)).clicked() {
+                                self.conversation_bulk_delete_mode = false;
+                                self.conversation_bulk_selection.clear();
+                            }
+                            let selected_count = self.conversation_bulk_selection.len();
                             if ui
                                 .add_enabled(
                                     selected_count > 0 && !generating,
-                                    Button::new(
-                                        RichText::new(text(language, "削除", "Delete"))
-                                            .color(palette.error),
-                                    )
-                                    .small(),
+                                    Button::new(RichText::new(text(language, "削除", "Delete")).small().color(palette.error)).frame(false),
                                 )
                                 .on_disabled_hover_text(if generating {
-                                    text(
-                                        language,
-                                        "生成が終了してから削除してください",
-                                        "Wait for generation to finish before deleting",
-                                    )
+                                    text(language, "生成が終了してから削除してください", "Wait for generation to finish before deleting")
                                 } else {
-                                    text(
-                                        language,
-                                        "削除するチャットを選択してください",
-                                        "Select chats to delete",
-                                    )
+                                    text(language, "削除するチャットを選択してください", "Select chats to delete")
                                 })
                                 .clicked()
                             {
@@ -1613,10 +1548,30 @@ impl TacetaApp {
                                 self.conversation_bulk_delete_confirmation =
                                     Some(ConversationBulkDeleteConfirmation { conversation_ids });
                             }
-                        });
+                        } else {
+                            let mut bulk_requested = false;
+                            let (menu_response, _) = egui::containers::menu::MenuButton::from_button(
+                                Button::new(RichText::new("…").weak()).frame(false),
+                            )
+                            .ui(ui, |ui| {
+                                bulk_requested = ui
+                                    .add_enabled(!generating, Button::new(text(language, "まとめて削除…", "Delete several…")))
+                                    .on_disabled_hover_text(text(language, "生成中は削除できません", "Chats cannot be deleted while generating"))
+                                    .clicked();
+                            });
+                            menu_response.on_hover_text(text(language, "会話の一覧の操作", "Chat list actions"));
+                            if bulk_requested {
+                                self.conversation_bulk_delete_mode = true;
+                                self.conversation_bulk_selection.clear();
+                                self.conversation_title_editor = None;
+                                self.conversation_delete_confirmation = None;
+                            }
+                        }
                     });
-                }
-                ui.add_space(5.0);
+                });
+                ui.add_space(4.0);
+                let open_menu_id = egui::Id::new("taceta-conversation-row-menu");
+                let open_menu: Option<Uuid> = ui.data(|data| data.get_temp(open_menu_id)).flatten();
                 ScrollArea::vertical()
                     .id_salt("conversation-history")
                     .auto_shrink([false, false])
@@ -1627,21 +1582,11 @@ impl TacetaApp {
                             } else {
                                 &title
                             };
-                            let mut select_requested = false;
-                            let mut rename_requested = false;
-                            let mut delete_requested = false;
                             if self.conversation_bulk_delete_mode {
                                 ui.horizontal(|ui| {
-                                    let mut checked =
-                                        self.conversation_bulk_selection.contains(&id);
+                                    let mut checked = self.conversation_bulk_selection.contains(&id);
                                     let checkbox_changed = ui.checkbox(&mut checked, "").changed();
-                                    let row_clicked = ui
-                                        .add_sized(
-                                            [ui.available_width(), 28.0],
-                                            Button::selectable(checked, display_title).truncate(),
-                                        )
-                                        .on_hover_text(display_title)
-                                        .clicked();
+                                    let row_clicked = sidebar_row(ui, display_title, checked, 0.0).clicked();
                                     if row_clicked {
                                         checked = !checked;
                                     }
@@ -1655,61 +1600,43 @@ impl TacetaApp {
                                 });
                                 continue;
                             }
-                            ui.horizontal(|ui| {
-                                let menu_width = 28.0;
-                                let label_width = (ui.available_width()
-                                    - menu_width
-                                    - ui.spacing().item_spacing.x)
-                                    .max(0.0);
-                                select_requested = ui
-                                    .add_sized(
-                                        [label_width, 28.0],
-                                        Button::selectable(id == active_id, display_title)
-                                            .truncate(),
-                                    )
-                                    .on_hover_text(display_title)
-                                    .clicked();
+                            let mut rename_requested = false;
+                            let mut delete_requested = false;
+                            let row = sidebar_row(ui, display_title, id == active_id, SIDEBAR_ROW_MENU_WIDTH);
+                            // The row's actions appear on the row the pointer
+                            // is on, the current one, and the one whose menu is open.
+                            if ui.rect_contains_pointer(row.rect) || id == active_id || open_menu == Some(id) {
+                                let menu_rect = egui::Rect::from_min_max(
+                                    egui::pos2(row.rect.right() - SIDEBAR_ROW_MENU_WIDTH, row.rect.top()),
+                                    row.rect.max,
+                                );
+                                let mut menu_ui = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(menu_rect)
+                                        .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
+                                );
+                                let (menu_response, opened) = egui::containers::menu::MenuButton::from_button(
+                                    Button::new(RichText::new("…").weak()).frame(false),
+                                )
+                                .ui(&mut menu_ui, |ui| {
+                                    rename_requested = ui.button(text(language, "表題を変更", "Rename")).clicked();
+                                    delete_requested = ui
+                                        .add_enabled(
+                                            !generating,
+                                            Button::new(RichText::new(text(language, "削除", "Delete")).color(palette.error)),
+                                        )
+                                        .on_disabled_hover_text(text(language, "生成中は削除できません", "Chats cannot be deleted while generating"))
+                                        .clicked();
+                                });
+                                menu_response.on_hover_text(text(language, "チャット操作", "Chat actions"));
+                                if opened.is_some() {
+                                    ui.data_mut(|data| data.insert_temp(open_menu_id, Some(id)));
+                                } else if open_menu == Some(id) {
+                                    ui.data_mut(|data| data.insert_temp(open_menu_id, None::<Uuid>));
+                                }
+                            }
 
-                                let (menu_response, _) =
-                                    egui::containers::menu::MenuButton::from_button(
-                                        Button::new("...")
-                                            .small()
-                                            .min_size(Vec2::new(menu_width, 28.0)),
-                                    )
-                                    .ui(ui, |ui| {
-                                        if ui
-                                            .button(text(language, "表題を変更", "Rename"))
-                                            .clicked()
-                                        {
-                                            rename_requested = true;
-                                        }
-                                        let palette = theme::palette(ui);
-                                        if ui
-                                            .add_enabled(
-                                                !generating,
-                                                Button::new(
-                                                    RichText::new(text(language, "削除", "Delete"))
-                                                        .color(palette.error),
-                                                ),
-                                            )
-                                            .on_disabled_hover_text(text(
-                                                language,
-                                                "生成中は削除できません",
-                                                "Chats cannot be deleted while generating",
-                                            ))
-                                            .clicked()
-                                        {
-                                            delete_requested = true;
-                                        }
-                                    });
-                                menu_response.on_hover_text(text(
-                                    language,
-                                    "チャット操作",
-                                    "Chat actions",
-                                ));
-                            });
-
-                            if select_requested {
+                            if row.clicked() {
                                 self.select_saved_conversation(id);
                                 self.screen = Screen::Chat;
                                 self.scroll_to_bottom = true;
@@ -1728,6 +1655,7 @@ impl TacetaApp {
                                     });
                             }
                         }
+                        ui.add_space(8.0);
                     });
             });
     }
@@ -1994,10 +1922,12 @@ impl TacetaApp {
                     {
                         self.screen = Screen::Settings;
                     }
-                    ui.label(RichText::new(title).strong());
+                    ui.add_space(8.0);
+                    ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(4.0);
                         if ui
-                            .add_enabled(!self.model_refresh_pending, Button::new("↻").small())
+                            .add_enabled(!self.model_refresh_pending, Button::new("↻").frame(false))
                             .on_hover_text(text(
                                 language,
                                 "接続とモデル一覧を更新",
@@ -2041,7 +1971,9 @@ impl TacetaApp {
                         } else {
                             text(language, "全モデル解放", "Unload all models")
                         };
-                        if ui.add_enabled(self.can_unload_model(), Button::new(label).small())
+                        // Releasing memory only concerns the local server.
+                        if self.state.inference_provider == InferenceProvider::Ollama
+                            && ui.add_enabled(self.can_unload_model(), Button::new(RichText::new(label).small()).frame(false))
                             .on_hover_text(text(language,
                                 "接続先で読み込み中の全モデルをメモリから解放します。モデルファイルと会話は残ります。他のアプリが使用するモデルも対象です。",
                                 "Unload every model currently loaded on the connected server, including models used by other apps. Files and conversations remain."))
@@ -3073,55 +3005,67 @@ impl TacetaApp {
             .generation
             .as_ref()
             .map(|generation| generation.assistant_id);
+        self.show_transcript(root_ui, "chat-transcript", |app, ui| {
+            let messages = &app.state.active_conversation().messages;
+            if messages.is_empty() {
+                ui.add_space(110.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading(RichText::new("Taceta").size(26.0));
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(text(
+                            language,
+                            "深く考える。経過は、必要な時だけ。",
+                            "Think deeply. Show the trace only when you need it.",
+                        ))
+                        .weak(),
+                    );
+                });
+            }
+            for message in messages {
+                app.show_message(ui, message, active_generation_target == Some(message.id));
+            }
+        });
+    }
+
+    /// The scrolling conversation area shared by every provider's view: one
+    /// centered reading column, with the scroll bar at the window's edge.
+    pub(super) fn show_transcript(
+        &mut self,
+        root_ui: &mut Ui,
+        id_salt: &'static str,
+        body: impl FnOnce(&Self, &mut Ui),
+    ) {
+        let stick_to_bottom = self.scroll_to_bottom || self.is_generating();
         CentralPanel::default().show_inside(root_ui, |ui| {
             let available = ui.available_width();
-            let available_height = ui.available_height();
-            let reading_width = available.min(820.0);
-            ui.horizontal(|ui| {
-                ui.add_space(((available - reading_width) / 2.0).max(0.0));
-                ui.allocate_ui_with_layout(
-                    Vec2::new(reading_width, available_height),
-                    Layout::top_down(Align::Min),
-                    |ui| {
+            let column = (available - 2.0 * READING_COLUMN_MARGIN).clamp(1.0, READING_COLUMN_WIDTH);
+            let side = ((available - column) / 2.0).max(0.0);
+            if self.notice.is_some() {
+                ui.horizontal(|ui| {
+                    ui.add_space(side);
+                    ui.vertical(|ui| {
+                        ui.set_width(column);
+                        ui.add_space(8.0);
                         self.show_notice(ui);
-                        let messages = &self.state.active_conversation().messages;
-                        let transcript_height = ui.available_height();
-                        ScrollArea::vertical()
-                            .id_salt("chat-transcript")
-                            .auto_shrink([false, false])
-                            .min_scrolled_height(transcript_height)
-                            .max_height(transcript_height)
-                            .stick_to_bottom(self.scroll_to_bottom || self.is_generating())
-                            .show(ui, |ui| {
-                                ui.add_space(18.0);
-                                if messages.is_empty() {
-                                    ui.add_space(110.0);
-                                    ui.vertical_centered(|ui| {
-                                        ui.heading(RichText::new("Taceta").size(26.0));
-                                        ui.add_space(8.0);
-                                        ui.label(
-                                        RichText::new(text(
-                                            language,
-                                            "深く考える。経過は、必要な時だけ。",
-                                            "Think deeply. Show the trace only when you need it.",
-                                        ))
-                                        .weak(),
-                                    );
-                                    });
-                                }
-                                for message in messages {
-                                    self.show_message(
-                                        ui,
-                                        message,
-                                        active_generation_target == Some(message.id),
-                                    );
-                                    ui.add_space(18.0);
-                                }
-                                ui.add_space(12.0);
-                            });
-                    },
-                );
-            });
+                    });
+                });
+            }
+            ScrollArea::vertical()
+                .id_salt(id_salt)
+                .auto_shrink([false, false])
+                .stick_to_bottom(stick_to_bottom)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(side);
+                        ui.vertical(|ui| {
+                            ui.set_width(column);
+                            ui.add_space(20.0);
+                            body(self, ui);
+                            ui.add_space(16.0);
+                        });
+                    });
+                });
         });
         self.scroll_to_bottom = false;
     }
@@ -3130,28 +3074,44 @@ impl TacetaApp {
         let language = self.language();
         let palette = theme::palette(ui);
         let available = ui.available_width();
-        let max_width = available * 0.82;
-        let row_layout = match message.role {
-            Role::User => Layout::right_to_left(Align::Min),
-            _ => Layout::left_to_right(Align::Min),
-        };
-
-        ui.with_layout(row_layout, |ui| {
-            let content_layout = match message.role {
-                Role::User => Layout::top_down(Align::Max),
-                _ => Layout::top_down(Align::Min),
+        if message.role == Role::User {
+            // The user's own words sit on the right in a bubble as wide as
+            // its text, up to three quarters of the column.
+            const BUBBLE_MARGIN: i8 = 12;
+            let content = message.content.trim_end();
+            let text_width = available * 0.75 - 2.0 * f32::from(BUBBLE_MARGIN);
+            // With attachments the bubble takes the full allowance; otherwise
+            // it is measured so that a short message gets a short bubble.
+            let content_width = if message.attachments.is_empty() {
+                egui::WidgetText::from(content)
+                    .into_galley(ui, Some(egui::TextWrapMode::Wrap), text_width, egui::TextStyle::Body)
+                    .size()
+                    .x
+                    .min(text_width)
+            } else {
+                text_width
             };
+            ui.horizontal(|ui| {
+                ui.add_space((available - content_width - 2.0 * f32::from(BUBBLE_MARGIN) - 2.0).max(0.0));
+                theme::card(palette.user_bubble, palette.user_bubble, 16, BUBBLE_MARGIN).show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.set_max_width(content_width);
+                        self.show_attachment_names(ui, message, &palette);
+                        if !content.is_empty() {
+                            ui.label(content);
+                        }
+                    });
+                });
+            });
+            ui.add_space(MESSAGE_GAP);
+            return;
+        }
+
+        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
             ui.vertical(|ui| {
-                ui.set_width(max_width);
-                ui.with_layout(content_layout, |ui| match message.role {
-                    Role::User => {
-                        theme::card(palette.user_bubble, palette.border, 14, 14).show(ui, |ui| {
-                            self.show_attachment_names(ui, message, &palette);
-                            if !message.content.is_empty() {
-                                ui.label(&message.content);
-                            }
-                        });
-                    }
+                ui.set_width(available);
+                ui.with_layout(Layout::top_down(Align::Min), |ui| match message.role {
+                    Role::User => {}
                     Role::Assistant => {
                         if let Some(identity) = &message.model_identity {
                             ui.horizontal_wrapped(|ui| {
@@ -3170,16 +3130,14 @@ impl TacetaApp {
                             ui.add_space(5.0);
                         }
                         if self.state.show_thinking_trace && !message.thinking.is_empty() {
-                            theme::card(palette.thinking, palette.border, 10, 12).show(ui, |ui| {
+                            theme::card(palette.thinking, palette.thinking, 10, 12).show(ui, |ui| {
                                 ui.label(
                                     RichText::new(text(language, "思考過程", "Thinking trace"))
                                         .small()
-                                        .color(palette.accent),
+                                        .weak(),
                                 );
                                 ui.add_space(5.0);
-                                ui.label(
-                                    RichText::new(&message.thinking).color(palette.contrast_text),
-                                );
+                                ui.label(RichText::new(message.thinking.trim_end()).color(palette.weak_text));
                             });
                             ui.add_space(10.0);
                         }
@@ -3211,6 +3169,7 @@ impl TacetaApp {
                 });
             });
         });
+        ui.add_space(MESSAGE_GAP);
     }
 
     fn show_attachment_names(&self, ui: &mut Ui, message: &ChatMessage, palette: &TacetaPalette) {
@@ -3241,8 +3200,10 @@ impl TacetaApp {
             .ctx()
             .input(|input| !input.raw.hovered_files.is_empty());
         let language = self.language();
-        let editor_wrap_width =
-            (root_ui.available_width() - COMPOSER_CARD_INNER_MARGIN * 2.0).max(1.0);
+        // The composer is as wide as the reading column above it.
+        let composer_width = (root_ui.available_width() - 2.0 * READING_COLUMN_MARGIN)
+            .clamp(1.0, READING_COLUMN_WIDTH);
+        let editor_wrap_width = (composer_width - COMPOSER_CARD_INNER_MARGIN * 2.0).max(1.0);
         let editor_viewport_height = composer_editor_viewport_height(
             root_ui,
             &self.state.draft,
@@ -3259,9 +3220,9 @@ impl TacetaApp {
             + attachment_height;
         Panel::bottom("taceta-composer-panel")
             .exact_size(panel_height)
+            .show_separator_line(false)
             .show_inside(root_ui, |ui| {
                 let available = ui.available_width();
-                let composer_width = available;
                 ui.horizontal(|ui| {
                     ui.add_space(((available - composer_width) / 2.0).max(0.0));
                     ui.vertical(|ui| {
@@ -3675,6 +3636,53 @@ impl TacetaApp {
             }
         }
     }
+}
+
+/// One full-width row of the sidebar: text on the left, filled only when it
+/// is current or under the pointer. `trailing` reserves room on the right.
+fn sidebar_row(ui: &mut Ui, label: &str, selected: bool, trailing: f32) -> egui::Response {
+    let palette = theme::palette(ui);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), SIDEBAR_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    let enabled = ui.is_enabled();
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, label));
+    if selected {
+        ui.painter().rect_filled(rect, 8.0, palette.selected);
+    } else if enabled && ui.rect_contains_pointer(rect) {
+        ui.painter().rect_filled(rect, 8.0, palette.hover);
+    }
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 10.0, rect.top()),
+        egui::pos2(rect.right() - 8.0 - trailing, rect.bottom()),
+    );
+    let mut text_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(text_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    text_ui.add(egui::Label::new(label).truncate().selectable(false));
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The row of controls under the composer that says where and how the next
+/// request runs: provider, mode, workspace and what each provider adds.
+pub(super) fn controls_strip(root_ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    Panel::bottom("taceta-agent-controls")
+        .show_separator_line(false)
+        .frame(egui::Frame::side_top_panel(root_ui.style()).inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 10 }))
+        .show_inside(root_ui, |ui| {
+            let available = ui.available_width();
+            let column = (available - 2.0 * READING_COLUMN_MARGIN).clamp(1.0, READING_COLUMN_WIDTH);
+            ui.horizontal(|ui| {
+                ui.add_space(((available - column) / 2.0).max(0.0));
+                ui.vertical(|ui| {
+                    ui.set_width(column);
+                    add_contents(ui);
+                });
+            });
+        });
 }
 
 fn show_notice_card(ui: &mut Ui, text_value: &str, color: egui::Color32) -> (bool, egui::Response) {
@@ -4322,7 +4330,8 @@ mod chat_layout_tests {
         assert!(rows.iter().any(|(text, _)| text.contains("After the link")));
         for (text, rect) in &rows {
             assert!(rect.left() >= 299.0, "left overflow: {text:?} at {rect:?}");
-            assert!(rect.right() <= 891.5, "right overflow: {text:?} at {rect:?}");
+            // An answer uses the whole reading column it is given.
+            assert!(rect.right() <= 1020.5, "right overflow: {text:?} at {rect:?}");
         }
         assert!(actual.left() >= 299.0 && actual.right() <= 1021.0, "message expanded: {actual:?}");
     }
@@ -4337,7 +4346,7 @@ mod chat_layout_tests {
         for marker in ["Before wide", "After code", "After table"] {
             let (_, rect) = rows.iter().find(|(text, _)| text.contains(marker)).expect("paragraph was drawn");
             assert!((rect.left() - 300.0).abs() <= 1.0, "shifted {marker}: {rect:?}");
-            assert!(rect.right() <= 891.5, "paragraph overflow: {rect:?}");
+            assert!(rect.right() <= 1020.5, "paragraph overflow: {rect:?}");
         }
         assert!(actual.left() >= 299.0 && actual.right() <= 1021.0, "message expanded: {actual:?}");
     }

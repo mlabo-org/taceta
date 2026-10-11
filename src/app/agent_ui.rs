@@ -244,7 +244,7 @@ impl TacetaApp {
             return;
         }
         let language = self.language();
-        Panel::top("taceta-agent-controls").show_inside(root_ui, |ui| {
+        super::controls_strip(root_ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let enabled = self.state.active_conversation().agent_enabled;
                 let mut selected = enabled;
@@ -723,59 +723,53 @@ impl TacetaApp {
     pub(super) fn show_agent_chat(&mut self, root_ui: &mut Ui) {
         let id = self.state.active_conversation_id;
         let language = self.language();
-        CentralPanel::default().show_inside(root_ui, |ui| {
-            self.show_notice(ui);
-            ScrollArea::vertical()
-                .stick_to_bottom(self.scroll_to_bottom || self.is_generating())
-                .show(ui, |ui| {
-                    if let Some(snapshot) = self.agent_ui.snapshots.get(&id) {
-                        if snapshot.summary.is_some() {
-                            ui.label(
-                                RichText::new(text(
-                                    language,
-                                    "コンパクション済み・原文履歴は保存されています。",
-                                    "Context compacted. Original history is preserved.",
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                        }
-                        for (index, message) in snapshot.messages.iter().enumerate() {
-                            if let Some(transcript) = transcript_message(id, index, message) {
-                                self.show_message(ui, &transcript, false);
-                            } else if message.role == AgentRole::Tool || external_tool_evidence(message).is_some() {
-                                egui::CollapsingHeader::new(
-                                    message.tool_name.as_deref().unwrap_or("Tool result"),
-                                )
-                                .id_salt(("agent-tool", id, index))
-                                .show(ui, |ui| {
-                                    ui.label(external_tool_evidence(message).unwrap_or_else(|| message.content.clone()));
-                                });
-                            }
-                        }
-                    } else {
-                        for message in &self.state.active_conversation().messages {
-                            self.show_message(ui, message, false);
-                        }
-                        ui.label(text(
+        self.show_transcript(root_ui, "agent-transcript", |app, ui| {
+            if let Some(snapshot) = app.agent_ui.snapshots.get(&id) {
+                if snapshot.summary.is_some() {
+                    ui.label(
+                        RichText::new(text(
                             language,
-                            "作業フォルダーとモデルを選び、実行したいことを入力してください。",
-                            "Choose a workspace and model, then describe the work.",
-                        ));
+                            "コンパクション済み・原文履歴は保存されています。",
+                            "Context compacted. Original history is preserved.",
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+                for (index, message) in snapshot.messages.iter().enumerate() {
+                    if let Some(transcript) = transcript_message(id, index, message) {
+                        app.show_message(ui, &transcript, false);
+                    } else if message.role == AgentRole::Tool || external_tool_evidence(message).is_some() {
+                        egui::CollapsingHeader::new(
+                            message.tool_name.as_deref().unwrap_or("Tool result"),
+                        )
+                        .id_salt(("agent-tool", id, index))
+                        .show(ui, |ui| {
+                            ui.label(external_tool_evidence(message).unwrap_or_else(|| message.content.clone()));
+                        });
                     }
-                    if let Some(active) = self.agent_ui.active.as_ref() {
-                        if active.conversation_id == id
-                            && (!active.content.is_empty() || !active.thinking.is_empty())
-                        {
-                            let mut message = ChatMessage::new_assistant(active.content.clone());
-                            message.id = id;
-                            message.thinking = active.thinking.clone();
-                            self.show_message(ui, &message, true);
-                        }
-                    }
-                });
+                }
+            } else {
+                for message in &app.state.active_conversation().messages {
+                    app.show_message(ui, message, false);
+                }
+                ui.label(text(
+                    language,
+                    "作業フォルダーとモデルを選び、実行したいことを入力してください。",
+                    "Choose a workspace and model, then describe the work.",
+                ));
+            }
+            if let Some(active) = app.agent_ui.active.as_ref() {
+                if active.conversation_id == id
+                    && (!active.content.is_empty() || !active.thinking.is_empty())
+                {
+                    let mut message = ChatMessage::new_assistant(active.content.clone());
+                    message.id = id;
+                    message.thinking = active.thinking.clone();
+                    app.show_message(ui, &message, true);
+                }
+            }
         });
-        self.scroll_to_bottom = false;
     }
 
     pub(super) fn show_agent_approval(&mut self, ctx: &Context) {

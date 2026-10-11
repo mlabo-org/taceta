@@ -113,7 +113,7 @@ impl TacetaApp {
     pub(super) fn show_cli_controls(&mut self, root_ui: &mut Ui) {
         let language = self.language();
         let provider = self.state.inference_provider;
-        Panel::top("taceta-agent-controls").show_inside(root_ui, |ui| {
+        super::controls_strip(root_ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 self.show_provider_selector(ui);
                 if self.state.inference_provider != provider {
@@ -491,58 +491,51 @@ impl TacetaApp {
 
     pub(super) fn show_cli_chat(&mut self, root_ui: &mut Ui) {
         let language = self.language();
-        CentralPanel::default().show_inside(root_ui, |ui| {
-            self.show_notice(ui);
-            ScrollArea::vertical()
-                .id_salt("cli-transcript")
-                .stick_to_bottom(self.scroll_to_bottom || self.is_generating())
-                .show(ui, |ui| {
-                    let conversation = self.state.active_conversation();
-                    if conversation.messages.is_empty() {
-                        ui.label(text(
-                            language,
-                            "作業フォルダーとモデルを選び、実行したいことを入力してください。",
-                            "Choose a workspace and model, then describe the work.",
-                        ));
+        self.show_transcript(root_ui, "cli-transcript", |app, ui| {
+            let conversation = app.state.active_conversation();
+            if conversation.messages.is_empty() {
+                ui.label(text(
+                    language,
+                    "作業フォルダーとモデルを選び、実行したいことを入力してください。",
+                    "Choose a workspace and model, then describe the work.",
+                ));
+            }
+            for message in &conversation.messages {
+                app.show_message(ui, message, app.is_generating());
+                for (index, action) in message.actions.iter().enumerate() {
+                    show_action(
+                        ui,
+                        (message.id, index),
+                        if action.succeeded { "✓" } else { "✗" },
+                        &action.title,
+                        &action.detail,
+                        action.diff.as_deref(),
+                    );
+                }
+            }
+            if let Some(active) = &app.cli_ui.active {
+                if active.conversation_id == conversation.id {
+                    for tool in &active.tools {
+                        show_action(
+                            ui,
+                            (active.assistant_id, &tool.id),
+                            match tool.status {
+                                ToolStatus::Running => "…",
+                                ToolStatus::Completed => "✓",
+                                ToolStatus::Failed => "✗",
+                            },
+                            &tool.title,
+                            &tool.detail,
+                            tool.diff.as_deref(),
+                        );
                     }
-                    for message in &conversation.messages {
-                        self.show_message(ui, message, self.is_generating());
-                        for (index, action) in message.actions.iter().enumerate() {
-                            show_action(
-                                ui,
-                                (message.id, index),
-                                if action.succeeded { "✓" } else { "✗" },
-                                &action.title,
-                                &action.detail,
-                                action.diff.as_deref(),
-                            );
-                        }
-                    }
-                    if let Some(active) = &self.cli_ui.active {
-                        if active.conversation_id == conversation.id {
-                            for tool in &active.tools {
-                                show_action(
-                                    ui,
-                                    (active.assistant_id, &tool.id),
-                                    match tool.status {
-                                        ToolStatus::Running => "…",
-                                        ToolStatus::Completed => "✓",
-                                        ToolStatus::Failed => "✗",
-                                    },
-                                    &tool.title,
-                                    &tool.detail,
-                                    tool.diff.as_deref(),
-                                );
-                            }
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(text(language, "作業中…", "Working…"));
-                            });
-                        }
-                    }
-                });
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(text(language, "作業中…", "Working…"));
+                    });
+                }
+            }
         });
-        self.scroll_to_bottom = false;
     }
 
     pub(super) fn show_cli_approval(&mut self, ctx: &Context) {
