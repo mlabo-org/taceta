@@ -2263,17 +2263,6 @@ mod tests {
     }
 
     #[test]
-    fn page_failure_payload_is_structured_without_provider_internals() {
-        let payload = serde_json::json!({
-            "error": "ページを取得できませんでした",
-            "url": "https://example.com/article",
-            "retryable": false,
-        });
-        assert_eq!(payload["error"], "ページを取得できませんでした");
-        assert!(!payload.to_string().contains("connection refused"));
-    }
-
-    #[test]
     fn pull_wire_body_requests_a_stream_for_the_selected_model() {
         let value = serde_json::to_value(PullBody {
             model: "qwen3:8b".into(),

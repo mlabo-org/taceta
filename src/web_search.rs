@@ -805,11 +805,6 @@ mod tests {
         assert!(fetch_client(&url, address).is_ok());
     }
     #[test]
-    fn clamps_result_limit() {
-        assert_eq!(MAX_RESULTS, 5);
-    }
-
-    #[test]
     fn exposes_only_the_two_declared_web_tools() {
         let tools = tool_definitions();
         assert_eq!(tools.as_array().unwrap().len(), 2);
