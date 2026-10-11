@@ -772,22 +772,11 @@ async fn start_session(
     ];
     for (config_id, step, value) in options {
         let Some(value) = value else { continue };
-        let params = json!({
-            "sessionId": session_id,
-            "configId": config_id,
-            "value": {"value": value}
-        });
-        call(
-            process,
-            next_id,
-            "session/set_config_option",
-            params,
-            step,
-            timing.startup,
-            watch,
-        )
-        .await
-        .map_err(|stop| fail(&known, stop))?;
+        // The chosen value goes as a plain string, as the protocol describes.
+        let params = json!({"sessionId": session_id, "configId": config_id, "value": value});
+        call(process, next_id, "session/set_config_option", params, step, timing.startup, watch)
+            .await
+            .map_err(|stop| fail(&known, stop))?;
         next_id += 1;
     }
     Ok(Started {
@@ -1630,11 +1619,11 @@ mod tests {
         assert_eq!(seen[1]["params"], json!({"cwd": "/ws", "mcpServers": []}));
         assert_eq!(
             seen[2]["params"],
-            json!({"sessionId": "s-1", "configId": "model", "value": {"value": "grok-4.7"}})
+            json!({"sessionId": "s-1", "configId": "model", "value": "grok-4.7"})
         );
         assert_eq!(
             seen[3]["params"],
-            json!({"sessionId": "s-1", "configId": "reasoning_effort", "value": {"value": "high"}})
+            json!({"sessionId": "s-1", "configId": "reasoning_effort", "value": "high"})
         );
         assert_eq!(
             seen[4]["params"],
