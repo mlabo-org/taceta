@@ -369,6 +369,15 @@ impl TacetaApp {
             .resolve(self.system_language)
     }
 
+    /// A model list belongs to the request that produced it. After the
+    /// provider, endpoint or account changes, a reply still in flight must not
+    /// become the new list, and a new request must be allowed to start.
+    fn invalidate_model_list(&mut self) {
+        self.model_list_epoch = self.model_list_epoch.wrapping_add(1);
+        self.model_refresh_pending = false;
+        self.models.clear();
+    }
+
     fn bind_ollama_endpoint(&mut self, endpoint: OllamaEndpoint) -> bool {
         if self.ollama_endpoint == endpoint {
             return false;
@@ -377,7 +386,7 @@ impl TacetaApp {
             self.backend = Some(Arc::new(
                 OllamaClient::new(endpoint.clone()).with_link_service(Arc::clone(&self.link_service)),
             ));
-            self.models.clear();
+            self.invalidate_model_list();
             self.connection = ConnectionState::Connecting;
         }
         self.model_manager = Arc::new(OllamaModelManager::new(endpoint.clone()));
