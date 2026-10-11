@@ -223,7 +223,7 @@ ChatGPT Web／Google 検索を使う前に、既定の Brave／Chrome を起動�
 
 Taceta のコードと同梱アセットは [MIT License](LICENSE) で提供します。Copyright (c) 2026 Makoto Suzuki.
 
-Ollama、ブラウザー、検索 API、ChatGPT Web、モデル、および Rust の依存クレートは Taceta とは別の製品・サービスです。それぞれのライセンス、利用規約、商標条件が適用されます。Taceta はそれらの提供元から承認、後援、提携を受けていません。
+Ollama、Codex CLI、Grok CLI、Claude Code、ブラウザー、検索 API、ChatGPT Web、モデル、および Rust の依存クレートは Taceta とは別の製品・サービスです。Taceta はこれらの CLI を同梱せず、改変もせず、このMacに入っているものをそのまま起動します。それぞれのライセンス、利用規約、商標条件が適用されます。Taceta はそれらの提供元から承認、後援、提携を受けていません。
 
 ---
 
@@ -452,4 +452,4 @@ To uninstall, stop active Taceta Link work, choose **Remove** for Taceta Link in
 
 Taceta's code and bundled assets are released under the [MIT License](LICENSE). Copyright (c) 2026 Makoto Suzuki.
 
-Ollama, browsers, search APIs, ChatGPT Web, models, and Rust dependency crates are separate products and services. Their own licenses, terms, and trademark conditions apply. Taceta is not endorsed, sponsored, or affiliated with their providers.
+Ollama, Codex CLI, Grok CLI, Claude Code, browsers, search APIs, ChatGPT Web, models, and Rust dependency crates are separate products and services. Taceta does not bundle or modify these CLIs; it starts the ones installed on this Mac as they are. Their own licenses, terms, and trademark conditions apply. Taceta is not endorsed, sponsored, or affiliated with their providers.
