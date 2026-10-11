@@ -1,6 +1,6 @@
 import { OwnedScope } from "./scope.js";
 import { CdpExecutor } from "./cdp.js";
-import { envelope, jobProgressPayload, jobResultPayload, validateEnvelope, validateJob } from "./protocol.js";
+import { PRODUCT_VERSION, envelope, jobProgressPayload, jobResultPayload, validateEnvelope, validateJob } from "./protocol.js";
 import { fetchPage } from "./engines/fetch.js";
 import { searchGoogle } from "./engines/search.js";
 import { runChatGPTWeb } from "./engines/chatgpt-web.js";
@@ -64,7 +64,7 @@ function connect() {
     sessionId = crypto.randomUUID();
     releaseOwnedScope().finally(scheduleReconnect).catch(() => {});
   });
-  reply(request("extension_ready", {name:"Taceta Link", version:"0.1.0"}));
+  reply(request("extension_ready", {name:"Taceta Link", version:PRODUCT_VERSION}));
   poll();
 }
 async function releaseOwnedScope() { try { await cdp.detach(); } finally { await scope.close(); } }

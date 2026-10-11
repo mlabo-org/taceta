@@ -18,6 +18,8 @@ PACKAGE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1
 EXT_VERSION="$(tr -d '[:space:]' < browser-extension/VERSION)"
 MANIFEST_VERSION="$(/usr/bin/plutil -extract version raw -o - browser-extension/manifest.json)"
 PROTOCOL_VERSION="$(sed -n 's/^pub const PROTOCOL_VERSION: u16 = \([0-9][0-9]*\);/\1/p' src/browser_harness/mod.rs)"
+SCRIPT_PRODUCT_VERSION="$(sed -n 's/^export const PRODUCT_VERSION = "\([^"]*\)";/\1/p' browser-extension/protocol.js)"
+SCRIPT_PROTOCOL_VERSION="$(sed -n 's/^export const PROTOCOL_VERSION = \([0-9][0-9]*\);/\1/p' browser-extension/protocol.js)"
 CONTRACT_SCHEMA_VERSION="$(/usr/bin/plutil -extract properties.schema_version.const raw -o - protocol/contract.json)"
 CONTRACT_PRODUCT_VERSION="$(/usr/bin/plutil -extract properties.product_version.const raw -o - protocol/contract.json)"
 CONTRACT_PROTOCOL_VERSION="$(/usr/bin/plutil -extract properties.protocol_version.const raw -o - protocol/contract.json)"
@@ -26,6 +28,8 @@ test -n "$PACKAGE_VERSION" && test "$PACKAGE_VERSION" = "$EXT_VERSION" \
   && test "$PACKAGE_VERSION" = "$CONTRACT_PRODUCT_VERSION" \
   && test "$CONTRACT_SCHEMA_VERSION" = "1" \
   && test "$PROTOCOL_VERSION" = "$CONTRACT_PROTOCOL_VERSION" \
+  && test "$PACKAGE_VERSION" = "$SCRIPT_PRODUCT_VERSION" \
+  && test "$PROTOCOL_VERSION" = "$SCRIPT_PROTOCOL_VERSION" \
   || { echo "Taceta Link version/protocol mismatch" >&2; exit 1; }
 cargo build --release
 
