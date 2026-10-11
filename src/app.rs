@@ -153,6 +153,8 @@ pub struct TacetaApp {
     conversation_bulk_selection: HashSet<Uuid>,
     conversation_bulk_delete_confirmation: Option<ConversationBulkDeleteConfirmation>,
     scroll_to_bottom: bool,
+    /// Why this launch could not serve the browser link, when it could not.
+    link_socket_error: Option<String>,
     web_key_draft: String,
     /// Looked up when the provider's settings are first shown and after Save or Delete.
     web_key_status: Option<(&'static str, web_search::KeychainStatus)>,
@@ -205,33 +207,7 @@ impl TacetaApp {
             Ok(endpoint) => (endpoint, None),
             Err(error) => (OllamaEndpoint::default_local(), Some(error)),
         };
-        #[cfg(unix)]
-        {
-            if let (Ok(root), Ok(path)) = (
-                taceta::browser_harness::default_socket_root(),
-                taceta::browser_harness::default_socket_path(),
-            ) {
-                if let Ok(server) = taceta::browser_harness::SocketServer::bind(&root, &path) {
-                    let service = Arc::clone(&link_service);
-                    std::thread::Builder::new()
-                        .name("taceta-link-socket".into())
-                        .spawn(move || {
-                            loop {
-                                match server.accept() {
-                                    Ok(stream) => {
-                                        let service = Arc::clone(&service);
-                                        let _ = std::thread::spawn(move || {
-                                            let _ = service.serve_connection(stream);
-                                        });
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        })
-                        .ok();
-                }
-            }
-        }
+        let link_socket_error = start_link_socket(&link_service).err();
         let app_bundle = std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(PathBuf::from))
@@ -306,6 +282,7 @@ impl TacetaApp {
         if let Err(error) = gpt_recovery {
             app.notice = Some(Notice { kind: NoticeKind::Error, text: error });
         }
+        app.link_socket_error = link_socket_error;
         app.unreadable_state_dialog = unreadable_state.is_some();
         app.unreadable_state = unreadable_state;
         app
@@ -364,6 +341,7 @@ impl TacetaApp {
             conversation_bulk_selection: HashSet::new(),
             conversation_bulk_delete_confirmation: None,
             scroll_to_bottom: true,
+            link_socket_error: None,
             web_key_draft: String::new(),
             web_key_status: None,
             model_catalog_result_tx,
@@ -2062,6 +2040,19 @@ impl TacetaApp {
             }
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs(15));
+        }
+        if let Some(error) = &self.link_socket_error {
+            ui.label(
+                RichText::new(format!(
+                    "{}: {error}",
+                    text(
+                        language,
+                        "このTacetaはブラウザーからの接続を受けられません",
+                        "This Taceta cannot accept the browser connection",
+                    )
+                ))
+                .color(theme::palette(ui).warning),
+            );
         }
         let status_text = self
             .link_status
@@ -3958,6 +3949,33 @@ fn capability_label(capability: &ThinkingCapability, language: AppShellLanguage)
         ThinkingCapability::Efforts { .. } => text(language, "思考レベル", "thinking: levels"),
         ThinkingCapability::Unverified => text(language, "思考未確認", "thinking: unknown"),
     }
+}
+
+/// Binds the per-user socket and serves the browser link on its own thread.
+fn start_link_socket(link_service: &Arc<TacetaLinkService>) -> Result<(), String> {
+    let root = taceta::browser_harness::default_socket_root().map_err(|error| error.to_string())?;
+    let path = taceta::browser_harness::default_socket_path().map_err(|error| error.to_string())?;
+    let server = taceta::browser_harness::SocketServer::bind(&root, &path)
+        .map_err(|error| error.to_string())?;
+    let service = Arc::clone(link_service);
+    std::thread::Builder::new()
+        .name("taceta-link-socket".into())
+        .spawn(move || {
+            loop {
+                match server.accept() {
+                    Ok(stream) => {
+                        let service = Arc::clone(&service);
+                        std::thread::spawn(move || {
+                            let _ = service.serve_connection(stream);
+                        });
+                    }
+                    // One failed accept must not end the service for the session.
+                    Err(_) => std::thread::sleep(Duration::from_millis(200)),
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn web_search_error_message(error: &str, language: AppShellLanguage) -> String {
