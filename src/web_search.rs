@@ -448,27 +448,33 @@ impl WebSearchProvider {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if !content_type.is_empty()
-                && ![
-                    "text/html",
-                    "text/plain",
-                    "application/xhtml+xml",
-                    "application/json",
-                ]
-                .iter()
-                .any(|v| content_type.starts_with(v))
-            {
+            let media_type = content_type.split(';').next().unwrap_or_default().trim();
+            let html = matches!(media_type, "text/html" | "application/xhtml+xml");
+            if !html && !matches!(media_type, "text/plain" | "application/json") {
                 return Err(WebError::Protocol("unsupported content type".into()));
             }
-            let bytes = response.bytes().await?;
-            if bytes.len() > MAX_BODY {
-                return Err(WebError::Protocol("response exceeds 1 MiB".into()));
+            if content_type
+                .split(';')
+                .skip(1)
+                .filter_map(|parameter| parameter.trim().strip_prefix("charset="))
+                .any(|charset| !matches!(charset.trim_matches('"'), "utf-8" | "utf8" | "us-ascii"))
+            {
+                return Err(WebError::Protocol("page text is not UTF-8".into()));
             }
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let mut response = response;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if bytes.len() + chunk.len() > MAX_BODY {
+                    return Err(WebError::Protocol("response exceeds 1 MiB".into()));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let text = String::from_utf8(bytes)
+                .map_err(|_| WebError::Protocol("page text is not UTF-8".into()))?;
             return Ok(FetchedPage {
                 url: current.to_string(),
                 content_type,
-                text: strip_html(&text),
+                text: if html { html_to_text(&text) } else { text },
             });
         }
         Err(WebError::Protocol("too many redirects".into()))
@@ -662,17 +668,34 @@ fn keychain_secret(account: &'static str) -> Option<String> {
         })
 }
 
-fn strip_html(input: &str) -> String {
+/// Reduces an HTML document to its visible text. Tags, comments and the
+/// contents of script and style elements are dropped; a `<` that does not
+/// start a tag is ordinary text.
+fn html_to_text(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    let mut tag = false;
-    for c in input.chars() {
-        match c {
-            '<' => tag = true,
-            '>' => tag = false,
-            _ if !tag => out.push(c),
-            _ => {}
-        }
+    let mut rest = input;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let tag = &rest[open + 1..];
+        let lower_start = tag.get(..8).unwrap_or(tag).to_ascii_lowercase();
+        rest = if tag.starts_with("!--") {
+            tag.find("-->").map_or("", |end| &tag[end + 3..])
+        } else if let Some(element) = ["script", "style"]
+            .into_iter()
+            .find(|element| lower_start.starts_with(element))
+        {
+            let closing = format!("</{element}");
+            let end = tag.to_ascii_lowercase().find(&closing).unwrap_or(tag.len());
+            tag[end..].find('>').map_or("", |close| &tag[end + close + 1..])
+        } else if tag.starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?')) {
+            out.push(' ');
+            tag.find('>').map_or("", |close| &tag[close + 1..])
+        } else {
+            out.push('<');
+            tag
+        };
     }
+    out.push_str(rest);
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -743,6 +766,20 @@ mod tests {
         for url in ["http://198.51.100.7/article", "https://127.0.0.1/"] {
             assert!(matches!(validated_fetch_target(url), Err(WebError::UnsafeUrl(_))), "{url}");
         }
+    }
+
+    #[test]
+    fn html_text_keeps_comparisons_and_drops_scripts_styles_and_tags() {
+        assert_eq!(
+            html_to_text("<p>if a < b then</p><p>next</p>"),
+            "if a < b then next"
+        );
+        assert_eq!(
+            html_to_text("<style>p { color: red }</style><h1>Title</h1><!-- note --><SCRIPT>alert(1 < 2)</SCRIPT>Body"),
+            "Title Body"
+        );
+        assert_eq!(html_to_text("1 < 2 and 3 > 2"), "1 < 2 and 3 > 2");
+        assert_eq!(html_to_text("日本語<br/>の本文"), "日本語 の本文");
     }
 
     #[test]
