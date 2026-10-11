@@ -57,6 +57,30 @@ test("scope cleanup ungroups then removes the exact agent tab",async()=>{let cal
 test("scope removes a browser-reparented owned tab without closing its destination window",async()=>{let removedTab;let removedWindow=false;let storageRemoved;const ids={windowId:7,groupId:9,tabId:8};const api={windows:{remove:async()=>{removedWindow=true}},tabs:{get:async()=>({id:8,windowId:10,groupId:9}),remove:async id=>{removedTab=id}},tabGroups:{get:async()=>({id:9,windowId:10})},storage:{local:{get:async()=>({taceta_owned_scope:ids}),remove:async key=>{storageRemoved=key}}}};const scope=new OwnedScope(api);await scope.recoverAndClose();assert.equal(removedTab,8);assert.equal(removedWindow,false);assert.equal(storageRemoved,"taceta_owned_scope");});
 test("scope removes only the exact agent tab while preserving unrelated resources",async()=>{let removedTab;const ids={windowId:7,groupId:9,tabId:8};const api={tabs:{get:async()=>({id:8,windowId:10,groupId:9}),ungroup:async()=>{},remove:async id=>{removedTab=id}},tabGroups:{get:async()=>({id:9,windowId:10})},storage:{local:{get:async()=>({taceta_owned_scope:ids}),remove:async()=>{}}}};await new OwnedScope(api).recoverAndClose();assert.equal(removedTab,8);});
 test("scope serializes concurrent cleanup of the same ledger",async()=>{let removals=0;let release;const gate=new Promise(resolve=>{release=resolve});const ids={windowId:7,groupId:9,tabId:8};const api={tabs:{get:async()=>({id:8,windowId:7,groupId:9}),ungroup:async()=>{},remove:async()=>{removals++;await gate}},storage:{local:{remove:async()=>{}}}};const scope=new OwnedScope(api);scope.ledger=ids;const first=scope.close();const second=scope.close();release();await Promise.all([first,second]);assert.equal(removals,1);});
+test("recovery forgets a stored record whose tab left the Taceta group, and closes nothing",async()=>{
+  const ids={windowId:7,groupId:9,tabId:8};
+  for (const [tab, group] of [
+    [{id:8,windowId:7,groupId:-1}, {id:9,windowId:7}],
+    [{id:8,windowId:7,groupId:12}, {id:9,windowId:7}],
+    [{id:8,windowId:7,groupId:9}, null],
+    [null, {id:9,windowId:7}],
+  ]) {
+    let removedTab=false; let storageRemoved;
+    const missing=()=>{throw new Error("not_found")};
+    const api={tabs:{get:async()=>tab||missing(),ungroup:async()=>{},remove:async()=>{removedTab=true}},tabGroups:{get:async()=>group||missing()},storage:{local:{get:async()=>({taceta_owned_scope:ids}),remove:async key=>{storageRemoved=key}}}};
+    const scope=new OwnedScope(api);
+    await scope.recoverAndClose();
+    assert.equal(removedTab,false);
+    assert.equal(storageRemoved,"taceta_owned_scope");
+    assert.equal(scope.ledger,null);
+  }
+});
+test("recovery closes the stored tab while it is still in the Taceta group",async()=>{
+  let removedTab; const ids={windowId:7,groupId:9,tabId:8};
+  const api={tabs:{get:async()=>({id:8,windowId:7,groupId:9}),ungroup:async()=>{},remove:async id=>{removedTab=id}},tabGroups:{get:async()=>({id:9,windowId:7})},storage:{local:{get:async()=>({taceta_owned_scope:ids}),remove:async()=>{}}}};
+  await new OwnedScope(api).recoverAndClose();
+  assert.equal(removedTab,8);
+});
 test("scope clears stale persisted IDs without closing any window",async()=>{let removedWindow=false;let storageRemoved;const ids={windowId:7,groupId:9,tabId:8};const api={windows:{remove:async()=>{removedWindow=true}},tabs:{get:async()=>{throw new Error("not_found")}},tabGroups:{get:async()=>{throw new Error("not_found")}},storage:{local:{get:async()=>({taceta_owned_scope:ids}),remove:async key=>{storageRemoved=key}}}};const scope=new OwnedScope(api);assert.equal(await scope.recover(),null);assert.equal(removedWindow,false);assert.equal(storageRemoved,"taceta_owned_scope");});
 test("CDP attach uses the supported protocol on the exact owned tab",async()=>{let attachArgs;const scope={ledger:{windowId:7,groupId:9,tabId:8},validate:()=>true};const api={debugger:{attach:async(...args)=>{attachArgs=args},sendCommand:async()=>{}}};await new CdpExecutor(api,scope).attach();assert.deepEqual(attachArgs,[{tabId:8},"1.3"]);});
 test("page evaluation validates the exact tab and uses scripting execution",async()=>{const calls=[];const scope={ledger:{windowId:7,groupId:9,tabId:8},validate:()=>true};const api={tabs:{get:async id=>{calls.push(["get",id]);return{id,windowId:7,url:"https://www.google.com/search?q=x",status:"complete"};}},scripting:{executeScript:async details=>{calls.push(["execute",details]);return[{result:[{title:"x",url:"https://example.com",snippet:""}]}];}},debugger:{sendCommand:async()=>{throw new Error("legacy evaluator must not be used");}}};const value=await new CdpExecutor(api,scope).evaluate(function extractSearchResults() {},[3]);assert.deepEqual(value,[{title:"x",url:"https://example.com",snippet:""}]);assert.equal(calls[0][0],"get");assert.equal(calls[1][0],"execute");assert.equal(calls[1][1].target.tabId,8);assert.equal(typeof calls[1][1].func,"function");assert.deepEqual(calls[1][1].args,[3]);});
