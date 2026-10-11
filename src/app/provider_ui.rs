@@ -24,7 +24,7 @@ impl Default for ProviderUiState {
 impl TacetaApp {
     pub(super) fn is_generating(&self) -> bool {
         self.generation.is_some() || self.agent_ui.active.is_some() || self.gpt_ui.active.is_some()
-            || self.gpt_ui.is_transferring()
+            || self.cli_ui.active.is_some() || self.gpt_ui.is_transferring()
     }
 
     fn can_change_provider(&self) -> bool {
@@ -56,7 +56,7 @@ impl TacetaApp {
             InferenceProvider::Grok => {
                 Some(Arc::clone(&self.provider_ui.grok) as Arc<dyn InferenceBackend>)
             }
-            InferenceProvider::Gpt => None,
+            InferenceProvider::Gpt | InferenceProvider::Claude => None,
         };
         self.invalidate_model_list();
         self.notice = None;
@@ -80,7 +80,7 @@ impl TacetaApp {
                 .selected_text(selected.label())
                 .width(126.0)
                 .show_ui(ui, |ui| {
-                    for provider in [InferenceProvider::Ollama, InferenceProvider::Grok, InferenceProvider::Gpt] {
+                    for provider in [InferenceProvider::Ollama, InferenceProvider::Grok, InferenceProvider::Gpt, InferenceProvider::Claude] {
                         ui.selectable_value(&mut selected, provider, provider.label());
                     }
                 });

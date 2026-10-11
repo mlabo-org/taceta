@@ -236,6 +236,10 @@ impl TacetaApp {
             self.show_gpt_controls(root_ui);
             return;
         }
+        if self.is_cli_provider() {
+            self.show_cli_controls(root_ui);
+            return;
+        }
         let language = self.language();
         Panel::top("taceta-agent-controls").show_inside(root_ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -390,7 +394,7 @@ impl TacetaApp {
                 Arc::new(OllamaClient::new(self.ollama_endpoint.clone()))
             }
             InferenceProvider::Grok => Arc::clone(&self.provider_ui.grok) as Arc<dyn AgentModel>,
-            InferenceProvider::Gpt => return,
+            InferenceProvider::Gpt | InferenceProvider::Claude => return,
         };
         let (event_tx, events) = mpsc::unbounded_channel();
         let (approval_tx, approval_rx) = mpsc::unbounded_channel();

@@ -7,6 +7,7 @@ pub enum InferenceProvider {
     Ollama,
     Grok,
     Gpt,
+    Claude,
 }
 
 impl InferenceProvider {
@@ -15,6 +16,7 @@ impl InferenceProvider {
             Self::Ollama => "Ollama",
             Self::Grok => "Grok (OAuth)",
             Self::Gpt => "GPT (OAuth)",
+            Self::Claude => "Claude",
         }
     }
 }
@@ -132,6 +134,12 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    pub fn parse(value: &str) -> Option<Self> {
+        [Self::None, Self::Minimal, Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max, Self::Ultra]
+            .into_iter()
+            .find(|effort| effort.as_str() == value)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
