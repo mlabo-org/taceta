@@ -398,9 +398,9 @@ impl TacetaApp {
         let (result_tx, result) = std_mpsc::channel();
         let task = self.runtime.spawn(async move {
             let preparation = tokio::task::spawn_blocking(move || {
-                let (mut session, created) =
+                let (mut session, _created) =
                     AgentSession::open_or_create(&data_root, id, &workspace)?;
-                if created && !prior.is_empty() {
+                if session.is_untouched() && !prior.is_empty() {
                     session.import_messages(prior)?;
                 }
                 Ok::<_, String>(session)

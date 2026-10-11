@@ -132,10 +132,11 @@ impl AgentSession {
             Err(error) => return Err(error.to_string()),
             Ok(_) => {}
         }
-        let journal = Journal::open(root, id)?;
-        let _lock = journal.lock()?;
-        let archive = journal
-            .directory
+        // Archiving moves the directory as it is. It must work for a session
+        // whose records can no longer be read, so nothing is parsed here.
+        let directory = Journal::locate(root, id)?;
+        let _lock = Journal::lock_directory(&directory)?;
+        let archive = directory
             .parent()
             .ok_or("Missing session root")?
             .join("archive");
@@ -147,7 +148,7 @@ impl AgentSession {
         }
         journal::private_directory(&archive)?;
         let destination = archive.join(format!("{id}-{}", Uuid::new_v4()));
-        fs::rename(&journal.directory, &destination).map_err(|e| e.to_string())?;
+        fs::rename(&directory, &destination).map_err(|e| e.to_string())?;
         fs::File::open(&archive)
             .and_then(|f| f.sync_all())
             .map_err(|e| e.to_string())?;
@@ -155,6 +156,13 @@ impl AgentSession {
             .and_then(|f| f.sync_all())
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// True until anything follows the creation record. Whether prior chat
+    /// still needs importing is read from this, not from who created the session,
+    /// so an import that failed the first time is retried.
+    pub fn is_untouched(&self) -> bool {
+        self.journal.records.len() == 1
     }
 
     /// Imports existing plain chat exactly once, before any agent run or input.

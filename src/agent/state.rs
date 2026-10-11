@@ -46,7 +46,7 @@ pub(super) struct State {
 impl State {
     pub fn restore(records: &[Record]) -> Result<Self, String> {
         let Some(Record {
-            event: EventData::Created { id, workspace },
+            event: EventData::Created { id, workspace, .. },
             ..
         }) = records.first()
         else {
