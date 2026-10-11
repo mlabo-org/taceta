@@ -108,9 +108,14 @@ impl TacetaApp {
             ui.horizontal_wrapped(|ui| {
                 let enabled = self.state.active_conversation().agent_enabled;
                 let mut selected = enabled;
-                ui.add_enabled_ui(!self.is_generating(), |ui| {
-                    ui.selectable_value(&mut selected, false, text(language, "チャット", "Chat"));
-                    ui.selectable_value(&mut selected, true, text(language, "作業", "Agent"));
+                // A task's record owns this conversation's transcript, so its
+                // mode stays fixed once the task exists.
+                let mode_fixed = self.agent_ui.snapshots.contains_key(&self.state.active_conversation_id);
+                ui.add_enabled_ui(!self.is_generating() && !mode_fixed, |ui| {
+                    ui.selectable_value(&mut selected, false, text(language, "チャット", "Chat"))
+                        .on_disabled_hover_text(text(language, "作業を始めた会話は切り替えられません。チャットは新しい会話で行えます。", "A conversation with a task keeps its mode. Use a new chat for ordinary chat."));
+                    ui.selectable_value(&mut selected, true, text(language, "作業", "Agent"))
+                        .on_disabled_hover_text(text(language, "この会話には作業の記録があります。作業は新しい会話で行えます。", "This conversation already has a task record. Use a new chat for a task."));
                 });
                 self.state.active_conversation_mut().agent_enabled = selected;
                 self.show_provider_selector(ui);
@@ -507,12 +512,16 @@ impl TacetaApp {
             .find(|conversation| conversation.id == id)
         {
             conversation.workspace = Some(snapshot.workspace.clone());
-            conversation.messages = snapshot
-                .messages
-                .iter()
-                .enumerate()
-                .filter_map(|(index, message)| transcript_message(id, index, message))
-                .collect();
+            // In chat mode the conversation holds turns the task record never
+            // received; replacing them would lose them.
+            if conversation.agent_enabled {
+                conversation.messages = snapshot
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, message)| transcript_message(id, index, message))
+                    .collect();
+            }
         }
         self.agent_ui.snapshots.insert(id, snapshot);
     }
@@ -766,6 +775,32 @@ mod tests {
         assert_eq!(app.state.active_conversation().messages[0].content, "Current GPT result");
         assert!(app.state.active_conversation().workspace.is_none());
         assert!(!app.agent_ui.snapshots.contains_key(&id));
+    }
+
+    #[test]
+    fn task_record_replaces_the_transcript_only_while_the_conversation_is_in_task_mode() {
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        let id = app.state.active_conversation_id;
+        let snapshot = || SessionSnapshot {
+            id, workspace: PathBuf::from("/fixture/workspace"), status: SessionStatus::Interrupted,
+            goal: "Task".into(), user_instructions: vec![], work_state: Default::default(),
+            messages: vec![AgentMessage {
+                role: AgentRole::Assistant, content: "Task result".into(), tool_calls: vec![],
+                tool_call_id: None, tool_name: None,
+            }], error: None, event_count: 1, summary: None, latest_model: None,
+        };
+        let contents = |app: &TacetaApp| app.state.active_conversation().messages.iter()
+            .map(|message| message.content.clone()).collect::<Vec<_>>();
+
+        app.state.active_conversation_mut().agent_enabled = false;
+        app.state.active_conversation_mut().messages.push(ChatMessage::new(Role::User, "Chat-only turn"));
+        app.remember_agent_snapshot(snapshot());
+        assert_eq!(contents(&app), ["Chat-only turn"]);
+        assert!(app.agent_ui.snapshots.contains_key(&id));
+
+        app.state.active_conversation_mut().agent_enabled = true;
+        app.remember_agent_snapshot(snapshot());
+        assert_eq!(contents(&app), ["Task result"]);
     }
 
     #[test]
