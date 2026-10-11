@@ -165,6 +165,9 @@ pub struct TacetaApp {
     conversation_bulk_selection: HashSet<Uuid>,
     conversation_bulk_delete_confirmation: Option<ConversationBulkDeleteConfirmation>,
     scroll_to_bottom: bool,
+    /// Set when the newest message must come into view whatever the scroll
+    /// position: a conversation was opened or a request was sent.
+    jump_to_latest: bool,
     /// Why this launch could not serve the browser link, when it could not.
     link_socket_error: Option<String>,
     web_key_draft: String,
@@ -346,6 +349,7 @@ impl TacetaApp {
             conversation_bulk_selection: HashSet::new(),
             conversation_bulk_delete_confirmation: None,
             scroll_to_bottom: true,
+            jump_to_latest: true,
             link_socket_error: None,
             web_key_draft: String::new(),
             web_key_status: None,
@@ -1394,6 +1398,7 @@ impl TacetaApp {
         });
         self.notice = None;
         self.scroll_to_bottom = true;
+        self.jump_to_latest = true;
     }
 
     fn stop_generation(&mut self) {
@@ -1683,6 +1688,7 @@ impl TacetaApp {
                                 self.select_saved_conversation(id);
                                 self.screen = Screen::Chat;
                                 self.scroll_to_bottom = true;
+                                self.jump_to_latest = true;
                             }
                             if rename_requested {
                                 self.conversation_title_editor = Some(ConversationTitleEditor {
@@ -3095,6 +3101,7 @@ impl TacetaApp {
         body: impl FnOnce(&Self, &mut Ui),
     ) {
         let stick_to_bottom = self.scroll_to_bottom || self.is_generating();
+        let jump_to_latest = std::mem::take(&mut self.jump_to_latest);
         CentralPanel::default().show_inside(root_ui, |ui| {
             let available = ui.available_width();
             let column = (available - 2.0 * READING_COLUMN_MARGIN).clamp(1.0, READING_COLUMN_WIDTH);
@@ -3121,6 +3128,9 @@ impl TacetaApp {
                             ui.add_space(20.0);
                             body(self, ui);
                             ui.add_space(16.0);
+                            if jump_to_latest {
+                                ui.scroll_to_cursor(Some(Align::BOTTOM));
+                            }
                         });
                     });
                 });

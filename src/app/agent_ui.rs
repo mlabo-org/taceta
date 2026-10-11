@@ -456,6 +456,7 @@ impl TacetaApp {
         });
         self.notice = None;
         self.scroll_to_bottom = true;
+        self.jump_to_latest = true;
     }
 
     fn agent_notice(&mut self, ja: &str, en: &str) {
@@ -798,6 +799,7 @@ impl TacetaApp {
             .collapsible(false)
             .resizable(true)
             .default_width(680.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(&request.description);
                 if let Some(conversation) = self
