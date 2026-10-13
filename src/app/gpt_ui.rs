@@ -578,7 +578,7 @@ impl TacetaApp {
         let language = self.language();
         self.show_transcript(root_ui, "gpt-transcript", |app, ui| {
             let conversation = app.state.active_conversation();
-            if conversation.messages.is_empty() {
+            if conversation.messages.is_empty() && conversation.agent_enabled {
                 ui.label(text(language,
                     "フォルダーとモデルを選び、実行したいことを入力してください。普通の会話には「Chat」を選べます。",
                     "Choose a folder and model, then describe the work. Select Chat for an ordinary conversation."));

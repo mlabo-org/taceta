@@ -515,7 +515,7 @@ impl TacetaApp {
         let language = self.language();
         self.show_transcript(root_ui, "cli-transcript", |app, ui| {
             let conversation = app.state.active_conversation();
-            if conversation.messages.is_empty() {
+            if conversation.messages.is_empty() && !conversation.cli_chat {
                 ui.label(text(
                     language,
                     "フォルダーとモデルを選び、実行したいことを入力してください。",
