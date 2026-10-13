@@ -172,6 +172,16 @@ pub(super) struct AgentUiState {
 }
 
 impl AgentUiState {
+    /// Whether the conversation has a task record, which fixes its mode and folder.
+    pub(super) fn has_record(&self, id: Uuid) -> bool {
+        self.snapshots.contains_key(&id)
+    }
+
+    /// The conversation whose task is running.
+    pub(super) fn running(&self) -> Option<Uuid> {
+        self.active.as_ref().map(|active| active.conversation_id)
+    }
+
     pub(super) fn new(data_root: PathBuf) -> Self {
         Self {
             active: None,
@@ -234,73 +244,44 @@ impl TacetaApp {
         ui.add_space(20.0);
     }
 
-    pub(super) fn show_agent_controls(&mut self, root_ui: &mut Ui) {
-        if self.state.inference_provider == InferenceProvider::Gpt {
-            self.show_gpt_controls(root_ui);
-            return;
-        }
-        if self.is_cli_provider() {
-            self.show_cli_controls(root_ui);
-            return;
-        }
+    fn agent_can_resume(&self) -> bool {
+        self.agent_ui.snapshots.get(&self.state.active_conversation_id).is_some_and(|snapshot| {
+            !matches!(snapshot.status, SessionStatus::Completed | SessionStatus::Running | SessionStatus::AwaitingApproval)
+        })
+    }
+
+    pub(super) fn agent_status_visible(&self) -> bool {
+        self.state.active_conversation().agent_enabled
+            && (self.agent_ui.running() == Some(self.state.active_conversation_id) || self.agent_can_resume())
+    }
+
+    /// A running task's progress, or that it stopped short and can resume.
+    pub(super) fn show_agent_status(&mut self, ui: &mut Ui) {
         let language = self.language();
-        super::controls_strip(root_ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let enabled = self.state.active_conversation().agent_enabled;
-                let mut selected = enabled;
-                // A task's record owns this conversation's transcript, so its
-                // mode stays fixed once the task exists.
-                let mode_fixed = self.agent_ui.snapshots.contains_key(&self.state.active_conversation_id);
-                ui.add_enabled_ui(!self.is_generating() && !mode_fixed, |ui| {
-                    ui.selectable_value(&mut selected, false, text(language, "チャット", "Chat"))
-                        .on_disabled_hover_text(text(language, "作業を始めた会話は切り替えられません。チャットは新しい会話で行えます。", "A conversation with a task keeps its mode. Use a new chat for ordinary chat."));
-                    ui.selectable_value(&mut selected, true, text(language, "作業", "Agent"))
-                        .on_disabled_hover_text(text(language, "この会話には作業の記録があります。作業は新しい会話で行えます。", "This conversation already has a task record. Use a new chat for a task."));
-                });
-                self.state.active_conversation_mut().agent_enabled = selected;
-                self.show_provider_selector(ui);
-                if self.state.inference_provider == InferenceProvider::Gpt { return; }
-                if !selected { return; }
-                let id = self.state.active_conversation_id;
-                let workspace = self.state.active_conversation().workspace.clone();
-                let label = workspace.as_ref().and_then(|path| path.file_name())
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| text(language, "作業フォルダーを選ぶ", "Choose workspace").into());
-                let has_session = self.agent_ui.snapshots.contains_key(&id);
-                if ui.add_enabled(!self.is_generating() && !has_session, Button::new(label))
-                    .on_hover_text(workspace.as_ref().map(|path| path.display().to_string())
-                        .unwrap_or_default()).clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.state.active_conversation_mut().workspace = Some(path);
-                    }
-                }
-                if has_session {
-                    ui.label(RichText::new(text(language, "フォルダー変更は新しい会話で行えます。", "Use a new chat to change workspace.")).small().weak());
-                }
-                let status = self.agent_ui.snapshots.get(&id).map(|snapshot| snapshot.status.clone());
-                if let Some(status) = status {
-                    ui.label(status_label(language, &status));
-                    if !matches!(status, SessionStatus::Completed | SessionStatus::Running | SessionStatus::AwaitingApproval)
-                        && ui.add_enabled(!self.is_generating(), Button::new(text(language, "再開", "Resume"))).clicked() {
-                        self.start_agent_run(true);
-                    }
-                }
-                if has_session && ui.add_enabled(!self.is_generating(), Button::new(text(language,
-                    "コンテキストを整理", "Compact context"))).clicked() {
-                    self.start_agent_action(true, true);
-                }
-            });
-            if self.state.active_conversation().agent_enabled {
-                ui.label(RichText::new(text(language,
-                    "このフォルダーを読み取り、編集とコマンドは内容を確認してから実行します。コマンドの通信は無効です。",
-                    "Reads this workspace. Edits and commands require approval of their exact contents. Commands have no network access.")).small().weak());
-                if let Some(active) = self.agent_ui.active.as_ref() {
-                    if active.conversation_id == self.state.active_conversation_id {
-                        ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label(&active.progress); });
-                    }
-                }
+        let id = self.state.active_conversation_id;
+        if let Some(active) = self.agent_ui.active.as_ref().filter(|active| active.conversation_id == id) {
+            ui.spinner();
+            ui.add(egui::Label::new(RichText::new(&active.progress).small().weak()).truncate());
+        } else if self.agent_can_resume() {
+            let status = self.agent_ui.snapshots.get(&id).map(|snapshot| snapshot.status.clone());
+            if let Some(status) = status {
+                ui.label(RichText::new(status_label(language, &status)).small().weak());
             }
-        });
+            if ui.add_enabled(!self.is_generating(), Button::new(text(language, "再開", "Resume"))).clicked() {
+                self.start_agent_run(true);
+            }
+        }
+    }
+
+    pub(super) fn show_agent_menu_items(&mut self, ui: &mut Ui) {
+        let language = self.language();
+        let has_record = self.agent_ui.has_record(self.state.active_conversation_id);
+        if ui
+            .add_enabled(has_record && !self.is_generating(), Button::new(text(language, "コンテキストを整理", "Compact context")))
+            .clicked()
+        {
+            self.start_agent_action(true, true);
+        }
     }
 
     pub(super) fn start_agent_run(&mut self, resume: bool) {
@@ -349,8 +330,8 @@ impl TacetaApp {
         }
         let Some(workspace) = self.state.active_conversation().workspace.clone() else {
             self.agent_notice(
-                "作業フォルダーを選択してください。",
-                "Choose the task's workspace.",
+                "フォルダーを選んでください。",
+                "Choose a folder.",
             );
             return;
         };
@@ -571,8 +552,10 @@ impl TacetaApp {
                 .unwrap_or_default();
             match result {
                 Ok(snapshot) => {
+                    // A turn that simply finished needs no announcement; the answer is there.
+                    let finished = snapshot.status == SessionStatus::Completed && snapshot.error.is_none();
                     let status = status_label(self.language(), &snapshot.status).to_owned();
-                    self.notice = Some(Notice {
+                    self.notice = (!finished).then(|| Notice {
                         kind: if matches!(snapshot.status, SessionStatus::Failed) {
                             NoticeKind::Error
                         } else {
@@ -759,8 +742,8 @@ impl TacetaApp {
                 }
                 ui.label(text(
                     language,
-                    "作業フォルダーとモデルを選び、実行したいことを入力してください。",
-                    "Choose a workspace and model, then describe the work.",
+                    "フォルダーとモデルを選び、実行したいことを入力してください。",
+                    "Choose a folder and model, then describe the work.",
                 ));
             }
             if let Some(active) = app.agent_ui.active.as_ref() {
