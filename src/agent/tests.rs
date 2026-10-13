@@ -939,3 +939,49 @@ fn a_session_written_before_the_format_field_existed_still_opens() {
         .unwrap();
     assert!(!session.is_untouched());
 }
+
+#[tokio::test]
+async fn the_request_ends_with_the_prompt_being_answered_and_keeps_the_turns_in_order() {
+    for imported in [false, true] {
+        let fixture = Fixture::new();
+        let id = Uuid::new_v4();
+        let mut session = AgentSession::create(&fixture.store, id, &fixture.workspace).unwrap();
+        if imported {
+            session.import_messages(vec![
+                AgentMessage::text(AgentRole::User, "first question"),
+                AgentMessage::text(AgentRole::Assistant, "first answer"),
+                AgentMessage::text(AgentRole::User, "second question"),
+                AgentMessage::text(AgentRole::Assistant, "second answer"),
+            ]).unwrap();
+        } else {
+            for (question, reply) in [("first question", "first answer"), ("second question", "second answer")] {
+                let model = Arc::new(ScriptModel::new(vec![answer(reply)]));
+                let (events, _received) = mpsc::unbounded_channel();
+                let (_approvals, approval_rx) = mpsc::unbounded_channel();
+                let (_cancel, cancel_rx) = watch::channel(false);
+                AgentSession::open(&fixture.store, id).unwrap()
+                    .run(config(Some(question)), model, events, approval_rx, cancel_rx).await.unwrap();
+            }
+        }
+        drop(session);
+        let session = AgentSession::open(&fixture.store, id).unwrap();
+        let model = Arc::new(ScriptModel::new(vec![answer("third answer")]));
+        let (events, _received) = mpsc::unbounded_channel();
+        let (_approvals, approval_rx) = mpsc::unbounded_channel();
+        let (_cancel, cancel_rx) = watch::channel(false);
+        session.run(config(Some("third question")), model.clone(), events, approval_rx, cancel_rx).await.unwrap();
+        let sent: Vec<(AgentRole, String)> = model.requests.lock().unwrap()[0]
+            .messages
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+        let (role, content) = sent.last().unwrap();
+        assert_eq!(*role, AgentRole::User, "imported={imported}");
+        assert!(content.contains("third question"), "imported={imported}: {content}");
+        let position = |needle: &str| sent.iter().rposition(|(_, content)| content.contains(needle)).unwrap();
+        assert!(position("first question") < position("first answer"));
+        assert!(position("first answer") < position("second question"));
+        assert!(position("second question") < position("second answer"));
+        assert!(position("second answer") < position("third question"));
+    }
+}
