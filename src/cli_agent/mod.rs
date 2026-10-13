@@ -144,7 +144,15 @@ pub trait CliAgent: Send + Sync {
     /// done by the user in the CLI; Taceta never handles its credentials.
     fn readiness(&self) -> CliFuture<Result<Readiness, String>>;
 
+    /// The models to offer now. Answers as soon as the CLI can name any.
     fn models(&self) -> CliFuture<Result<Vec<ModelOption>, String>>;
+
+    /// A newer list the CLI announced after [`CliAgent::models`] answered,
+    /// for a CLI that first answers from a list it had stored. `None` when
+    /// there is no such list or it did not arrive.
+    fn refreshed_models(&self) -> CliFuture<Option<Vec<ModelOption>>> {
+        Box::pin(async { None })
+    }
 
     /// Runs one prompt to its end. Dropping the returned future, or setting
     /// `cancel`, stops the CLI and everything it started.
