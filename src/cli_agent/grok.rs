@@ -44,8 +44,8 @@ struct Timing {
     startup: Duration,
     /// How long a cancelled turn may take to answer before the CLI is ended.
     cancel_grace: Duration,
-    /// How long to wait after `initialize` for the CLI's refreshed model
-    /// list before settling for the one `initialize` carried.
+    /// How long to wait after `initialize` for the CLI to announce its
+    /// current model list.
     model_refresh: Duration,
 }
 
@@ -61,12 +61,16 @@ pub struct GrokCli {
     /// Where the approval hook plugin is written. Used only for
     /// [`ApprovalPolicy::AskEveryTime`].
     approval_plugin_dir: PathBuf,
+    /// The CLI that answered the last model listing, kept until its
+    /// refreshed list has been waited for.
+    listing: std::sync::Arc<tokio::sync::Mutex<Option<CliProcess>>>,
 }
 
 impl GrokCli {
     pub fn new(approval_plugin_dir: PathBuf) -> Self {
         Self {
             approval_plugin_dir,
+            listing: Default::default(),
         }
     }
 }
@@ -90,6 +94,7 @@ impl CliAgent for GrokCli {
 
     fn models(&self) -> CliFuture<Result<Vec<ModelOption>, String>> {
         let plugin_dir = self.approval_plugin_dir.clone();
+        let listing = self.listing.clone();
         Box::pin(async move {
             let executable = locate()?;
             let home = std::env::var_os("HOME")
@@ -97,10 +102,35 @@ impl CliAgent for GrokCli {
                 .unwrap_or_else(|| "/".into());
             let args = agent_args(ApprovalPolicy::FollowCli, &plugin_dir);
             let mut process = CliProcess::spawn(&executable, &args, &home)?;
-            let result = fetch_models(&mut process, Timing::DEFAULT).await;
-            process.close_input();
+            match stored_models(&mut process, Timing::DEFAULT).await {
+                // The stored list is offered at once; the CLI stays up for
+                // `refreshed_models` to wait for the current one.
+                Ok(Some(models)) => {
+                    if let Some(previous) = listing.lock().await.replace(process) {
+                        previous.shutdown().await;
+                    }
+                    Ok(models)
+                }
+                Ok(None) => {
+                    let announced = announced_models(&mut process, Timing::DEFAULT).await;
+                    process.shutdown().await;
+                    announced.ok_or_else(|| "Grok's initialize answer lists no models.".to_owned())
+                }
+                Err(error) => {
+                    process.shutdown().await;
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    fn refreshed_models(&self) -> CliFuture<Option<Vec<ModelOption>>> {
+        let listing = self.listing.clone();
+        Box::pin(async move {
+            let mut process = listing.lock().await.take()?;
+            let announced = announced_models(&mut process, Timing::DEFAULT).await;
             process.shutdown().await;
-            result
+            announced
         })
     }
 
@@ -531,10 +561,12 @@ fn parse_model_option(model: &Value) -> Result<ModelOption, String> {
     })
 }
 
-async fn fetch_models(
+/// Starts the protocol and returns the model list the CLI had stored, which
+/// `initialize` carries. `None` when it carries none.
+async fn stored_models(
     process: &mut CliProcess,
     timing: Timing,
-) -> Result<Vec<ModelOption>, String> {
+) -> Result<Option<Vec<ModelOption>>, String> {
     let result = call(
         process,
         1,
@@ -549,26 +581,26 @@ async fn fetch_models(
         Stop::Failed(message) => message,
         Stop::Interrupted | Stop::LimitReached => "Listing Grok's models was stopped.".to_owned(),
     })?;
-    // `initialize` answers from a cached list that can lack the newest
-    // models. The CLI then fetches the current list and announces it; that
-    // announcement is the one to use when it arrives in time.
-    let refreshed = tokio::time::timeout(timing.model_refresh, async {
+    result.pointer("/_meta/modelState").map(parse_model_options).transpose()
+}
+
+/// After `initialize` the CLI fetches the current model list and announces
+/// it, sometimes more than once. The stored list can lack the newest models,
+/// so the last list announced within the wait replaces it.
+async fn announced_models(process: &mut CliProcess, timing: Timing) -> Option<Vec<ModelOption>> {
+    let mut announced = None;
+    let _ = tokio::time::timeout(timing.model_refresh, async {
         while let Some(Ok(message)) = process.next().await {
             if message.get("method").and_then(Value::as_str) == Some("_x.ai/models/update") {
-                return message.get("params").cloned();
+                let listed = message.get("params").filter(|state| state.get("availableModels").is_some());
+                if let Some(models) = listed.and_then(|state| parse_model_options(state).ok()) {
+                    announced = Some(models);
+                }
             }
         }
-        None
     })
-    .await
-    .ok()
-    .flatten();
-    let state = refreshed
-        .as_ref()
-        .filter(|state| state.get("availableModels").is_some())
-        .or_else(|| result.pointer("/_meta/modelState"))
-        .ok_or("Grok's initialize answer lists no models.")?;
-    parse_model_options(state)
+    .await;
+    announced
 }
 
 // ---------------------------------------------------------------------------
@@ -2108,7 +2140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_models_reads_the_initialize_answer_without_a_session() {
+    async fn the_stored_model_list_is_read_from_the_initialize_answer_without_waiting() {
         let (ours, theirs) = tokio::io::duplex(64 * 1024);
         let (our_read, our_write) = tokio::io::split(ours);
         let (their_read, their_write) = tokio::io::split(theirs);
@@ -2117,18 +2149,18 @@ mod tests {
             reader: BufReader::new(their_read),
             writer: their_write,
         };
-        let task = tokio::spawn(async move { fetch_models(&mut process, TEST_TIMING).await });
+        let task = tokio::spawn(async move { stored_models(&mut process, TEST_TIMING).await });
         let initialize = peer.read().await;
         assert_eq!(initialize["method"], "initialize");
         peer.respond(&initialize, json!({"_meta": {"modelState": model_state()}}))
             .await;
-        let options = task.await.unwrap().unwrap();
+        let options = task.await.unwrap().unwrap().unwrap();
         assert_eq!(options[0].id, "grok-4.7");
         assert_eq!(options[0].efforts.first().map(String::as_str), Some("low"));
     }
 
     #[tokio::test]
-    async fn the_refreshed_model_list_announced_after_initialize_replaces_the_cached_one() {
+    async fn the_model_list_announced_after_initialize_is_offered_as_the_refreshed_one() {
         let (ours, theirs) = tokio::io::duplex(64 * 1024);
         let (our_read, our_write) = tokio::io::split(ours);
         let (their_read, their_write) = tokio::io::split(theirs);
@@ -2137,15 +2169,21 @@ mod tests {
             reader: BufReader::new(their_read),
             writer: their_write,
         };
-        let task = tokio::spawn(async move { fetch_models(&mut process, TEST_TIMING).await });
+        let task = tokio::spawn(async move {
+            let stored = stored_models(&mut process, TEST_TIMING).await;
+            (stored, announced_models(&mut process, TEST_TIMING).await)
+        });
         let initialize = peer.read().await;
         let cached = json!({"availableModels": [{"modelId": "older-model", "name": "Older"}]});
         peer.respond(&initialize, json!({"_meta": {"modelState": cached}})).await;
         peer.write(json!({"jsonrpc": "2.0", "method": "_x.ai/settings/update", "params": {}})).await;
         peer.write(json!({"jsonrpc": "2.0", "method": "_x.ai/models/update", "params": model_state()})).await;
-        let ids: Vec<String> = task.await.unwrap().unwrap().into_iter().map(|option| option.id).collect();
-        assert!(ids.contains(&"grok-4.7".to_owned()), "{ids:?}");
-        assert!(!ids.contains(&"older-model".to_owned()), "{ids:?}");
+        let (stored, announced) = task.await.unwrap();
+        let ids = |options: Vec<ModelOption>| options.into_iter().map(|option| option.id).collect::<Vec<_>>();
+        assert_eq!(ids(stored.unwrap().unwrap()), ["older-model"]);
+        let announced = ids(announced.unwrap());
+        assert!(announced.contains(&"grok-4.7".to_owned()), "{announced:?}");
+        assert!(!announced.contains(&"older-model".to_owned()), "{announced:?}");
     }
 
     #[test]

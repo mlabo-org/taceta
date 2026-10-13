@@ -117,8 +117,15 @@ impl TacetaApp {
                 Ok(_) => agent.models().await.map(|models| models.into_iter().map(model_descriptor).collect()),
                 Err(error) => Err(error.clone()),
             };
+            let listed = models.is_ok();
             let _ = readiness_tx.send(readiness);
             let _ = result_tx.send((epoch, models));
+            // A CLI that answered from a stored list may announce a newer one.
+            if listed {
+                if let Some(refreshed) = agent.refreshed_models().await {
+                    let _ = result_tx.send((epoch, Ok(refreshed.into_iter().map(model_descriptor).collect())));
+                }
+            }
         });
     }
 
