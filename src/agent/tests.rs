@@ -977,6 +977,8 @@ async fn the_request_ends_with_the_prompt_being_answered_and_keeps_the_turns_in_
             .collect();
         let (role, content) = sent.last().unwrap();
         assert_eq!(*role, AgentRole::User, "imported={imported}");
+        // The model is told its own name: the runner's instructions say nothing else about it.
+        assert!(sent.iter().any(|(role, content)| *role == AgentRole::System && content.contains("`fixture-model`")));
         assert!(content.contains("third question"), "imported={imported}: {content}");
         let position = |needle: &str| sent.iter().rposition(|(_, content)| content.contains(needle)).unwrap();
         assert!(position("first question") < position("first answer"));
