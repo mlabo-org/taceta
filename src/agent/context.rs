@@ -24,11 +24,16 @@ pub(super) fn cost(messages: &[AgentMessage], tools: &[ToolDefinition]) -> usize
         .saturating_add(messages.len().saturating_mul(MESSAGE_ENVELOPE))
 }
 /// What every request starts with, ahead of the conversation itself.
-fn preamble(state: &State, workspace_instructions: &[(String, String)]) -> Vec<AgentMessage> {
+fn preamble(state: &State, workspace_instructions: &[(String, String)], model: &str) -> Vec<AgentMessage> {
     let mut messages = vec![AgentMessage::text(
         AgentRole::System,
         EXECUTION_INSTRUCTIONS,
     )];
+    // The runner's own instructions replace whatever a model is told about
+    // itself by default, and earlier answers may come from another engine.
+    messages.push(AgentMessage::text(AgentRole::System, format!(
+        "The model answering now is `{model}`, selected by the user in Taceta. When asked who or which model you are, give this name. Earlier assistant messages in this conversation may have been written by a different model or engine; what they say about themselves does not describe you."
+    )));
     messages.push(AgentMessage::text(AgentRole::System, serde_json::json!({
         "workspace": state.snapshot.workspace,
         "workspace_instruction_documents": workspace_instructions.iter().map(|(path, text)|
@@ -185,7 +190,7 @@ pub(super) fn assemble(
     // User instructions are never compacted or shortened. They are sent at
     // their place among the message groups, so a request reads in the order
     // the conversation happened and ends with what is being answered.
-    let mut current = preamble(state, workspace_instructions);
+    let mut current = preamble(state, workspace_instructions, model);
     let mut pinned = current.clone();
     pinned.extend(state.instructions.iter().map(instruction));
     let pinned_cost = cost(&pinned, tools);
