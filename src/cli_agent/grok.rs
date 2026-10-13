@@ -558,6 +558,7 @@ fn parse_model_option(model: &Value) -> Result<ModelOption, String> {
         context_window,
         efforts,
         default_effort,
+        images: false,
     })
 }
 
@@ -889,6 +890,8 @@ impl Turn {
                             self.begin_stop(process, Stop::Failed(error)).await;
                         }
                     }
+                    // This CLI asks no questions through this protocol.
+                    Some(Control::Answers { .. }) => {}
                     None => {
                         self.controls_open = false;
                         if !self.pending.is_empty() {
@@ -1492,6 +1495,7 @@ mod tests {
             model: None,
             effort: None,
             prompt: "do it".to_owned(),
+            attachments: Vec::new(),
             approval: ApprovalPolicy::FollowCli,
             max_duration_secs: 60,
         }
@@ -2122,6 +2126,7 @@ mod tests {
                 context_window: Some(256000),
                 efforts: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
                 default_effort: Some("high".into()),
+                images: false,
             }]
         );
         let plain = json!({"availableModels": [{"modelId": "m"}]});
@@ -2132,7 +2137,8 @@ mod tests {
                 label: "m".into(),
                 context_window: None,
                 efforts: vec![],
-                default_effort: None
+                default_effort: None,
+                images: false,
             }]
         );
         assert!(parse_model_options(&json!({})).is_err());

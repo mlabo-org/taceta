@@ -1,5 +1,4 @@
-use super::transport::Connection;
-use crate::domain::{ModelDescriptor, ReasoningEffort, ThinkingCapability, ThinkingLevel, ThinkingMode};
+use super::{super::ModelOption, transport::Connection};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -22,62 +21,40 @@ pub(super) struct CatalogModel {
 #[serde(rename_all = "camelCase")]
 struct EffortOption { reasoning_effort: String }
 
-fn known_effort(value: &str) -> Option<ReasoningEffort> {
-    serde_json::from_value(json!(value)).ok()
-}
-
 impl CatalogModel {
-    pub fn descriptor(&self) -> ModelDescriptor {
-        let mut supported = Vec::new();
+    /// Only what the catalog states: no effort, image support or context
+    /// size is assumed for a model that does not advertise it.
+    pub fn option(&self) -> ModelOption {
+        let mut efforts: Vec<String> = Vec::new();
         for option in &self.supported_reasoning_efforts {
-            if let Some(effort) = known_effort(&option.reasoning_effort) {
-                if !supported.contains(&effort) { supported.push(effort); }
-            }
+            if !efforts.contains(&option.reasoning_effort) { efforts.push(option.reasoning_effort.clone()); }
         }
-        let default = self.default_reasoning_effort.as_deref().and_then(known_effort)
-            .filter(|effort| supported.contains(effort));
-        ModelDescriptor {
-            name: self.model.clone(), size: 0,
-            thinking: ThinkingCapability::Efforts { supported, default },
-            vision: self.vision(), tools: true, context_length: None,
+        let default_effort = self.default_reasoning_effort.clone().filter(|effort| efforts.contains(effort));
+        ModelOption {
+            id: self.model.clone(), label: self.model.clone(), context_window: None,
+            efforts, default_effort, images: self.images(),
         }
     }
 
-    pub fn vision(&self) -> bool { self.input_modalities.iter().any(|value| value == "image") }
+    pub fn images(&self) -> bool { self.input_modalities.iter().any(|value| value == "image") }
 
-    pub fn effort(&self, thinking: ThinkingMode) -> Result<Option<String>, String> {
-        let requested = match thinking {
-            ThinkingMode::Default => return Ok(None),
-            ThinkingMode::On => self.default_reasoning_effort.as_deref()
-                .ok_or("This GPT model did not advertise a default reasoning effort.")?,
-            ThinkingMode::Off => "none",
-            ThinkingMode::Level(ThinkingLevel::Low) => "low",
-            ThinkingMode::Level(ThinkingLevel::Medium) => "medium",
-            ThinkingMode::Level(ThinkingLevel::High) => "high",
-            ThinkingMode::Effort(effort) => effort.as_str(),
-        };
-        if !self.supported_reasoning_efforts.iter().any(|option| option.reasoning_effort == requested) {
-            return Err(format!("{} does not advertise reasoning effort '{requested}'. Select an available effort.", self.model));
-        }
-        Ok(Some(requested.into()))
+    pub fn supports_effort(&self, effort: &str) -> bool {
+        self.supported_reasoning_efforts.iter().any(|option| option.reasoning_effort == effort)
     }
 }
 
-pub(super) async fn account(connection: &mut Connection) -> Result<Option<Value>, String> {
+/// Whether the CLI is signed in. Only that is read; the account itself is
+/// never kept.
+pub(super) async fn signed_in(connection: &mut Connection) -> Result<bool, String> {
     let response = connection.call("account/read", json!({"refreshToken":false})).await?;
     let account = response.get("account").ok_or("Codex account/read response has no account field.")?;
-    if account.is_null() { return Ok(None); }
-    if account.get("type").and_then(Value::as_str) != Some("chatgpt") {
-        return Err("Taceta GPT requires ChatGPT OAuth. The isolated Codex account uses another authentication type.".into());
-    }
-    Ok(Some(account.clone()))
+    Ok(!account.is_null())
 }
 
+pub(super) const SIGNED_OUT: &str = "The Codex CLI is not signed in. Run `codex login` in a terminal, then try again.";
+
 pub(super) async fn require_account(connection: &mut Connection) -> Result<(), String> {
-    if account(connection).await?.is_none() {
-        return Err("GPT is signed out. Use the GPT sign-in button to connect your ChatGPT account.".into());
-    }
-    Ok(())
+    if signed_in(connection).await? { Ok(()) } else { Err(SIGNED_OUT.into()) }
 }
 
 pub(super) async fn models(connection: &mut Connection) -> Result<Vec<CatalogModel>, String> {
@@ -102,7 +79,7 @@ pub(super) async fn models(connection: &mut Connection) -> Result<Vec<CatalogMod
         let Some(next) = &cursor else { break; };
         if !cursors.insert(next.clone()) { return Err("Codex repeated a model catalog cursor.".into()); }
     }
-    if models.is_empty() { return Err("No GPT models are available for this ChatGPT account.".into()); }
+    if models.is_empty() { return Err("No GPT models are available for this account.".into()); }
     Ok(models)
 }
 
@@ -112,21 +89,21 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
 
     #[test]
-    fn gpt_catalog_never_invents_reasoning_vision_or_context() {
+    fn a_catalog_entry_offers_only_what_it_advertises() {
         let model: CatalogModel = serde_json::from_value(json!({
             "model":"account-model","supportedReasoningEfforts":[{"reasoningEffort":"high"},{"reasoningEffort":"ultra"}],
             "defaultReasoningEffort":"high","inputModalities":["text"]
         })).unwrap();
-        let descriptor = model.descriptor();
-        assert!(!descriptor.vision);
-        assert_eq!(descriptor.context_length, None);
-        assert_eq!(model.effort(ThinkingMode::Off), Err("account-model does not advertise reasoning effort 'none'. Select an available effort.".into()));
-        assert_eq!(model.effort(ThinkingMode::Effort(ReasoningEffort::Ultra)).unwrap(), Some("ultra".into()));
-        assert_eq!(model.effort(ThinkingMode::Default).unwrap(), None);
+        let option = model.option();
+        assert!(!option.images);
+        assert_eq!(option.context_window, None);
+        assert_eq!(option.efforts, ["high", "ultra"]);
+        assert_eq!(option.default_effort.as_deref(), Some("high"));
+        assert!(model.supports_effort("ultra") && !model.supports_effort("none"));
     }
 
     #[tokio::test]
-    async fn gpt_catalog_paginates_and_rejects_non_oauth_accounts() {
+    async fn the_catalog_is_read_page_by_page_and_a_missing_account_is_reported() {
         let (client, server) = duplex(8192);
         let (read, write) = split(client);
         let mut connection = Connection::from_io(read, write);
@@ -139,13 +116,13 @@ mod tests {
                 let result = match index {
                     0 => { assert!(request["params"]["cursor"].is_null()); json!({"data":[{"model":"one"}],"nextCursor":"next"}) },
                     1 => { assert_eq!(request["params"]["cursor"], "next"); json!({"data":[{"model":"two"}],"nextCursor":null}) },
-                    _ => json!({"account":{"type":"apiKey"}}),
+                    _ => json!({"account":null}),
                 };
                 write.write_all(format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes()).await.unwrap();
             }
         });
         assert_eq!(models(&mut connection).await.unwrap().iter().map(|model| model.model.as_str()).collect::<Vec<_>>(), vec!["one", "two"]);
-        assert!(require_account(&mut connection).await.unwrap_err().contains("ChatGPT OAuth"));
+        assert_eq!(require_account(&mut connection).await.unwrap_err(), SIGNED_OUT);
         peer.await.unwrap();
     }
 }

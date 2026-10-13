@@ -8,8 +8,9 @@ use super::*;
 use std::collections::{HashMap, VecDeque};
 use taceta::{
     cli_agent::{
-        ApprovalPolicy, ApprovalRequest, CliAgent, Control, Event, ModelOption, Readiness,
-        RunOutcome, RunRequest, RunStatus, ToolItem, ToolStatus, claude::ClaudeCode, grok::GrokCli,
+        ApprovalPolicy, ApprovalRequest, CliAgent, Control, Event, ModelOption, Question, Readiness,
+        RunOutcome, RunRequest, RunStatus, ToolItem, ToolStatus, claude::ClaudeCode, codex::CodexCli,
+        grok::GrokCli,
     },
     domain::ActionRecord,
     prior_context::with_prior_context,
@@ -31,9 +32,17 @@ pub(super) struct ActiveCli {
     result: std_mpsc::Receiver<RunOutcome>,
     tools: Vec<ToolItem>,
     approvals: VecDeque<(ApprovalRequest, std::time::Instant)>,
+    questions: VecDeque<PendingQuestions>,
     session_id: Option<String>,
     /// The turn is conversation only; anything that asks is refused.
     no_tools: bool,
+}
+
+/// Questions the CLI asked together, with the answer typed so far for each.
+struct PendingQuestions {
+    id: Uuid,
+    questions: Vec<Question>,
+    answers: Vec<String>,
 }
 
 impl ActiveCli {
@@ -44,6 +53,7 @@ impl ActiveCli {
 
 pub(super) struct CliUiState {
     claude: Arc<dyn CliAgent>,
+    codex: Arc<dyn CliAgent>,
     grok: Arc<dyn CliAgent>,
     pub(super) active: Option<ActiveCli>,
     readiness: HashMap<InferenceProvider, Result<Readiness, String>>,
@@ -59,6 +69,7 @@ impl CliUiState {
     pub(super) fn new(grok_approval_plugin: PathBuf) -> Self {
         Self {
             claude: Arc::new(ClaudeCode),
+            codex: Arc::new(CodexCli::new()),
             chat_workspace: grok_approval_plugin.with_file_name("CliChatWorkspace"),
             grok: Arc::new(GrokCli::new(grok_approval_plugin)),
             active: None,
@@ -72,7 +83,8 @@ impl CliUiState {
         match provider {
             InferenceProvider::Claude => Some(Arc::clone(&self.claude)),
             InferenceProvider::Grok => Some(Arc::clone(&self.grok)),
-            InferenceProvider::Ollama | InferenceProvider::Gpt => None,
+            InferenceProvider::Gpt => Some(Arc::clone(&self.codex)),
+            InferenceProvider::Ollama => None,
         }
     }
 }
@@ -95,7 +107,7 @@ pub(super) fn model_descriptor(option: ModelOption) -> ModelDescriptor {
         } else {
             ThinkingCapability::Efforts { default, supported }
         },
-        vision: false,
+        vision: option.images,
         tools: true,
         context_length: option.context_window.and_then(|window| u32::try_from(window).ok()),
     }
@@ -178,7 +190,13 @@ impl TacetaApp {
                 show_app_shell_menu_row(ui, &mut selected, true, text(language, "毎回確認", "Ask every time"));
                 show_app_shell_menu_row(ui, &mut selected, false, text(language, "自動承認", "Automatic"));
             });
-            response.on_hover_text(if ask {
+            response.on_hover_text(if ask && self.state.inference_provider == InferenceProvider::Gpt {
+                text(
+                    language,
+                    "操作の承認：ファイルの変更とコマンドの実行をこの画面で確認します。Codexが安全と判断する読み取りだけのコマンドは確認なしで実行されます。書き込みはこのフォルダーの中だけ、コマンドの通信は無効です。",
+                    "Approval: file changes and commands are confirmed here. Read-only commands Codex considers safe run without asking. Writes stay inside this folder, and commands have no network access.",
+                )
+            } else if ask {
                 text(
                     language,
                     "操作の承認：ファイルの変更とコマンドの実行は、1件ずつこの画面で確認します。",
@@ -242,7 +260,8 @@ impl TacetaApp {
         if self.is_generating() {
             return;
         }
-        if self.state.draft.trim().is_empty() {
+        let accepts_attachments = agent.accepts_attachments();
+        if self.state.draft.trim().is_empty() && (self.state.pending_attachments.is_empty() || !accepts_attachments) {
             return;
         }
         let chat = self.state.active_conversation().cli_chat;
@@ -266,6 +285,21 @@ impl TacetaApp {
             return;
         };
         let model = self.selected_model().cloned();
+        if accepts_attachments
+            && !model.as_ref().is_some_and(|model| model.vision)
+            && self.state.pending_attachments.iter().any(|attachment| matches!(attachment.payload, AttachmentPayload::Image { .. }))
+        {
+            self.notice = Some(Notice {
+                kind: NoticeKind::Warning,
+                text: text(
+                    language,
+                    "このモデルは画像入力に対応していません。画像は送信されませんでした。",
+                    "This model does not support image input. Nothing was sent.",
+                )
+                .to_owned(),
+            });
+            return;
+        }
         let effort = match self.selected_thinking_mode() {
             ThinkingMode::Effort(effort) => Some(effort.as_str().to_owned()),
             _ => None,
@@ -285,6 +319,8 @@ impl TacetaApp {
             return;
         };
         let prompt = std::mem::take(&mut self.state.draft);
+        let attachments = if accepts_attachments { std::mem::take(&mut self.state.pending_attachments) } else { Vec::new() };
+        let title_fallback = attachments.first().map_or_else(|| "Taceta".to_owned(), |attachment| attachment.name.clone());
         let session_prompt = match &earlier {
             Some(earlier) => with_prior_context(earlier, &prompt),
             None => prompt.clone(),
@@ -292,9 +328,11 @@ impl TacetaApp {
         let conversation_id = self.state.active_conversation_id;
         let conversation = self.state.active_conversation_mut();
         if conversation.should_generate_title() {
-            conversation.title = conversation_title(&prompt, "Taceta");
+            conversation.title = conversation_title(&prompt, &title_fallback);
         }
-        conversation.messages.push(ChatMessage::new_user(prompt));
+        let mut user_message = ChatMessage::new_user(prompt);
+        user_message.attachments = attachments.clone();
+        conversation.messages.push(user_message);
         let assistant = ChatMessage::new_assistant("");
         let assistant_id = assistant.id;
         conversation.messages.push(assistant);
@@ -305,6 +343,7 @@ impl TacetaApp {
             model: model.map(|model| model.name),
             effort,
             prompt: session_prompt,
+            attachments,
             approval: if chat {
                 ApprovalPolicy::NoTools
             } else if self.state.cli_ask_every_time {
@@ -334,6 +373,7 @@ impl TacetaApp {
             result,
             tools: Vec::new(),
             approvals: VecDeque::new(),
+            questions: VecDeque::new(),
             session_id,
             no_tools: chat,
         });
@@ -419,14 +459,19 @@ impl TacetaApp {
             Event::Approval(request) => {
                 active.approvals.push_back((request, std::time::Instant::now()));
             }
+            Event::Questions { id, questions } => {
+                let answers = vec![String::new(); questions.len()];
+                active.questions.push_back(PendingQuestions { id, questions, answers });
+            }
             Event::ApprovalResolved { id } => {
                 active.approvals.retain(|(request, _)| request.id != id);
+                active.questions.retain(|request| request.id != id);
             }
             Event::Usage(usage) => {
                 if let Some(conversation) =
                     self.state.conversations.iter_mut().find(|conversation| conversation.id == conversation_id)
                 {
-                    conversation.cli_usage = Some(crate::persistence::GptUsage {
+                    conversation.cli_usage = Some(crate::persistence::TokenUsage {
                         input_tokens: usage.input_tokens,
                         output_tokens: usage.output_tokens,
                         context_window: usage.context_window,
@@ -577,6 +622,7 @@ impl TacetaApp {
             return;
         };
         let Some((request, shown_at)) = active.approvals.front() else {
+            self.show_cli_questions(ctx);
             return;
         };
         let settled = shown_at.elapsed() >= APPROVAL_SETTLE;
@@ -617,6 +663,68 @@ impl TacetaApp {
             });
         if let Some(approved) = decision {
             self.decide_cli_approval(approved);
+        }
+    }
+
+    /// The questions the CLI is waiting on, answered together.
+    fn show_cli_questions(&mut self, ctx: &Context) {
+        let language = self.language();
+        let Some(active) = self.cli_ui.active.as_mut() else {
+            return;
+        };
+        let Some(request) = active.questions.front_mut() else {
+            return;
+        };
+        let mut send = false;
+        let mut stop = false;
+        egui::Window::new(text(language, "質問への回答", "Answer the questions"))
+            .id(egui::Id::new("taceta-cli-questions"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(680.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ScrollArea::vertical().max_height(500.0).show(ui, |ui| {
+                    for (index, question) in request.questions.iter().enumerate() {
+                        ui.push_id(&question.id, |ui| {
+                            ui.strong(&question.header);
+                            ui.label(&question.question);
+                            for option in &question.options {
+                                if ui
+                                    .selectable_label(request.answers[index] == option.label, &option.label)
+                                    .on_hover_text(&option.description)
+                                    .clicked()
+                                {
+                                    request.answers[index] = option.label.clone();
+                                }
+                            }
+                            ui.add(
+                                TextEdit::singleline(&mut request.answers[index])
+                                    .password(question.is_secret)
+                                    .hint_text(text(language, "回答を入力", "Type an answer")),
+                            );
+                            ui.add_space(12.0);
+                        });
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let answered = request.answers.iter().all(|answer| !answer.trim().is_empty());
+                    if ui.add_enabled(answered, Button::new(text(language, "回答を送る", "Send answers"))).clicked() {
+                        send = true;
+                    }
+                    if ui.button(text(language, "実行を停止", "Stop run")).clicked() {
+                        stop = true;
+                    }
+                });
+            });
+        if send {
+            if let Some(request) = active.questions.pop_front() {
+                let answers = request.questions.into_iter().zip(request.answers).map(|(question, answer)| (question.id, answer)).collect();
+                let _ = active.controls.send(Control::Answers { id: request.id, answers });
+            }
+        }
+        if stop {
+            self.stop_cli_run();
         }
     }
 
@@ -691,6 +799,7 @@ mod tests {
             result,
             tools: Vec::new(),
             approvals: VecDeque::new(),
+            questions: VecDeque::new(),
             session_id: None,
             no_tools: false,
         });
@@ -792,6 +901,7 @@ mod tests {
             context_window: Some(256_000),
             efforts: vec!["low".into(), "high".into(), "not-an-effort".into()],
             default_effort: Some("high".into()),
+            images: false,
         });
         assert_eq!(descriptor.name, "opus");
         assert_eq!(descriptor.context_length, Some(256_000));
@@ -808,6 +918,7 @@ mod tests {
             context_window: None,
             efforts: ["low", "medium", "high", "xhigh", "max"].map(str::to_owned).to_vec(),
             default_effort: None,
+            images: false,
         });
         assert!(matches!(
             unnamed_default.thinking,

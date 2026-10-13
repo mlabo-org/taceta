@@ -80,6 +80,7 @@ impl CliAgent for ClaudeCode {
                     context_window: None,
                     efforts: EFFORTS.iter().map(|effort| (*effort).to_owned()).collect(),
                     default_effort: None,
+                    images: false,
                 })
                 .collect())
         })
@@ -505,7 +506,10 @@ impl Turn {
     /// The user's answer to a pending approval. An id that is not pending
     /// (already answered, withdrawn, or never asked) is ignored.
     async fn answer(&mut self, control: Control) -> Result<(), String> {
-        let Control::Approval { id, approved } = control;
+        // This CLI asks no questions through this protocol.
+        let Control::Approval { id, approved } = control else {
+            return Ok(());
+        };
         let Some(pending) = self.pending.remove(&id) else {
             return Ok(());
         };
@@ -708,6 +712,7 @@ mod tests {
             model: None,
             effort: None,
             prompt: PROMPT.to_owned(),
+            attachments: Vec::new(),
             approval,
             max_duration_secs: 30,
         }
