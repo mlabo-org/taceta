@@ -351,8 +351,18 @@ mod tests {
         assert!(!app.code_mode());
         assert_eq!(app.state.active_conversation().workspace, None);
 
+        // Changing the engine keeps Chat as Chat and Code as Code.
+        app.select_provider(InferenceProvider::Claude);
+        assert!(!app.code_mode());
+        app.select_provider(InferenceProvider::Gpt);
+        assert!(!app.code_mode());
+        app.select_provider(InferenceProvider::Ollama);
+        assert!(!app.code_mode());
+        app.set_code_mode(true);
+        app.select_provider(InferenceProvider::Gpt);
+        assert!(app.code_mode());
         // The coding CLIs keep the choice in a field of their own.
-        app.state.switch_provider(InferenceProvider::Claude);
+        app.select_provider(InferenceProvider::Claude);
         assert!(app.code_mode());
         app.set_code_mode(false);
         assert!(app.state.active_conversation().cli_chat && !app.code_mode());

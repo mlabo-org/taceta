@@ -17,7 +17,14 @@ impl TacetaApp {
         if provider == self.state.inference_provider || !self.can_change_provider() {
             return;
         }
+        // Each engine keeps Chat or Code in a field of its own, so the
+        // choice is carried over. A conversation with a task record stays Code.
+        let code = self.code_mode();
         self.state.switch_provider(provider);
+        let fixed = provider == InferenceProvider::Ollama && self.agent_ui.has_record(self.state.active_conversation_id);
+        if !fixed {
+            self.set_code_mode(code);
+        }
         self.bind_selected_provider();
     }
 
