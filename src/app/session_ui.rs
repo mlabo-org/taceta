@@ -144,12 +144,12 @@ impl TacetaApp {
                 let mut selected = workspace.clone();
                 for path in &known {
                     let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-                    if show_app_shell_menu_row(ui, &mut selected, Some(path.clone()), name)
-                        .on_hover_text(path.display().to_string())
-                        .clicked()
-                    {
-                        chosen = Some(path.clone());
-                    }
+                    show_app_shell_menu_row(ui, &mut selected, Some(path.clone()), name)
+                        .on_hover_text(path.display().to_string());
+                }
+                if selected != workspace {
+                    chosen = selected;
+                    ui.close();
                 }
                 if !known.is_empty() {
                     ui.separator();
