@@ -15,7 +15,7 @@ impl InferenceProvider {
         match self {
             Self::Ollama => "Ollama",
             Self::Grok => "Grok",
-            Self::Gpt => "GPT (OAuth)",
+            Self::Gpt => "GPT",
             Self::Claude => "Claude",
         }
     }

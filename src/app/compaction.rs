@@ -5,7 +5,6 @@
 use super::*;
 use taceta::{
     cli_agent::{ApprovalPolicy, CliAgent, Control, Event, RunRequest, RunStatus},
-    gpt::{GptAction, GptControl, GptEvent, GptMode, GptRunRequest, GptRunStatus},
     prior_context::{CompactionJob, Plan, Summary, plan, summarize_request},
 };
 use tokio::sync::watch;
@@ -25,7 +24,6 @@ pub(super) fn handover_budget(context_tokens: Option<u32>) -> usize {
 pub(super) enum Summarizer {
     Local { backend: Arc<dyn InferenceBackend>, model: String, context_length: u32 },
     Cli { agent: Arc<dyn CliAgent>, model: Option<String>, workspace: PathBuf },
-    Gpt { client: taceta::gpt::GptClient, model: String },
 }
 
 impl Summarizer {
@@ -75,6 +73,7 @@ impl Summarizer {
                         model: model.clone(),
                         effort: None,
                         prompt: request,
+                        attachments: Vec::new(),
                         // Writing a summary needs no tools at all.
                         approval: ApprovalPolicy::NoTools,
                         max_duration_secs: SUMMARY_TIME_LIMIT_SECS,
@@ -107,59 +106,6 @@ impl Summarizer {
                     return Err(outcome.error.unwrap_or_else(|| "The engine did not finish the summary.".into()));
                 }
                 text
-            }
-            Self::Gpt { client, model } => {
-                let (events, mut received) = mpsc::unbounded_channel();
-                let (controls, control_rx) = mpsc::unbounded_channel();
-                let (_cancel, cancel_rx) = watch::channel(false);
-                let run = client.run(
-                    GptRunRequest {
-                        thread_id: None,
-                        workspace: None,
-                        mode: GptMode::Chat,
-                        model: model.clone(),
-                        thinking: ThinkingMode::Default,
-                        action: GptAction::Send { text: request, attachments: Vec::new() },
-                        handoff: None,
-                        max_duration_secs: SUMMARY_TIME_LIMIT_SECS,
-                        max_tool_actions: 1,
-                    },
-                    events,
-                    control_rx,
-                    cancel_rx,
-                );
-                tokio::pin!(run);
-                let mut messages: Vec<(String, String)> = Vec::new();
-                let note = |messages: &mut Vec<(String, String)>, event: GptEvent| match event {
-                    GptEvent::ThreadReady { thread_id } => {
-                        let _ = controls.send(GptControl::ThreadSaved { thread_id });
-                    }
-                    GptEvent::ContentDelta { id, text } => match messages.iter_mut().find(|(known, _)| *known == id) {
-                        Some((_, existing)) => existing.push_str(&text),
-                        None => messages.push((id, text)),
-                    },
-                    GptEvent::MessageCompleted { id, text } => match messages.iter_mut().find(|(known, _)| *known == id) {
-                        Some((_, existing)) => *existing = text,
-                        None => messages.push((id, text)),
-                    },
-                    GptEvent::Approval(approval) => {
-                        let _ = controls.send(GptControl::Approval { id: approval.id, approved: false });
-                    }
-                    _ => {}
-                };
-                let outcome = loop {
-                    tokio::select! {
-                        outcome = &mut run => break outcome?,
-                        Some(event) = received.recv() => note(&mut messages, event),
-                    }
-                };
-                while let Ok(event) = received.try_recv() {
-                    note(&mut messages, event);
-                }
-                if outcome.status != GptRunStatus::Completed {
-                    return Err(outcome.error.unwrap_or_else(|| "GPT did not finish the summary.".into()));
-                }
-                messages.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n\n")
             }
         };
         let summary = summary.trim().to_owned();

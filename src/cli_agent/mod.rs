@@ -6,9 +6,11 @@
 //! nothing outside a driver sees that protocol.
 
 pub mod claude;
+pub mod codex;
 pub mod grok;
 pub mod process;
 
+use crate::domain::Attachment;
 use std::{future::Future, path::PathBuf, pin::Pin};
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -38,6 +40,9 @@ pub struct RunRequest {
     /// A reasoning effort offered by the chosen model.
     pub effort: Option<String>,
     pub prompt: String,
+    /// Files that go with the prompt. Empty for a CLI that does not
+    /// [`CliAgent::accepts_attachments`].
+    pub attachments: Vec<Attachment>,
     pub approval: ApprovalPolicy,
     /// Includes time spent waiting for an approval.
     pub max_duration_secs: u64,
@@ -70,6 +75,25 @@ pub struct ApprovalRequest {
     pub detail: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// One question the CLI puts to the user before it goes on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Question {
+    /// The CLI's name for the question; the answer is sent back under it.
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    /// Suggested answers. Empty when the answer is free text.
+    pub options: Vec<QuestionOption>,
+    /// The answer must not be shown while it is typed.
+    pub is_secret: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -85,7 +109,10 @@ pub enum Event {
     ThinkingDelta(String),
     Tool(ToolItem),
     Approval(ApprovalRequest),
-    /// The request was answered or withdrawn and needs no decision any more.
+    /// Questions to answer together. `id` is Taceta's own identifier.
+    Questions { id: Uuid, questions: Vec<Question> },
+    /// The approval or the questions were answered or withdrawn and need no
+    /// decision any more.
     ApprovalResolved { id: Uuid },
     Usage(Usage),
 }
@@ -93,6 +120,8 @@ pub enum Event {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Control {
     Approval { id: Uuid, approved: bool },
+    /// One answer per question of an [`Event::Questions`], by question id.
+    Answers { id: Uuid, answers: Vec<(String, String)> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +154,8 @@ pub struct ModelOption {
     /// CLI offers no such control for it.
     pub efforts: Vec<String>,
     pub default_effort: Option<String>,
+    /// The model reads images.
+    pub images: bool,
 }
 
 /// Whether the CLI can be used right now, and what the user must do if not.
@@ -152,6 +183,11 @@ pub trait CliAgent: Send + Sync {
     /// there is no such list or it did not arrive.
     fn refreshed_models(&self) -> CliFuture<Option<Vec<ModelOption>>> {
         Box::pin(async { None })
+    }
+
+    /// Whether a prompt may carry [`RunRequest::attachments`].
+    fn accepts_attachments(&self) -> bool {
+        false
     }
 
     /// Runs one prompt to its end. Dropping the returned future, or setting

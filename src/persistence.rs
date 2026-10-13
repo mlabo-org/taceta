@@ -7,7 +7,6 @@ use taceta::domain::{
     normalize_chatgpt_web_request_limit,
 };
 use taceta::web_search::ProviderKind;
-use taceta::gpt::{GptRunStatus, GptToolItem};
 use uuid::Uuid;
 
 const APP_STATE_STORAGE_KEY: &str = "taceta.application-state.v1";
@@ -18,33 +17,10 @@ pub const CONTEXT_LENGTH_OPTIONS: [u32; 7] =
 pub const DEFAULT_CONTEXT_LENGTH: u32 = 32_768;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct GptUsage {
+pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub context_window: Option<u64>,
-}
-
-/// A display cache and reference to Codex's authoritative conversation history.
-/// These messages are never replayed as input to another execution service.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct GptConversation {
-    pub thread_id: Option<String>,
-    pub status: GptRunStatus,
-    pub item_messages: HashMap<String, Uuid>,
-    pub tools: Vec<GptToolItem>,
-    pub diff: String,
-    pub thinking: String,
-    pub usage: Option<GptUsage>,
-    pub error: Option<String>,
-    /// The original AgentSession remains intact; its portable state is sent once
-    /// when the user explicitly starts this new Codex thread.
-    pub handoff_from_taceta: bool,
-    pub pending_handoff: bool,
-    /// How many of the conversation's messages the Codex thread already
-    /// holds. Later ones came from another engine and are handed over with
-    /// the next request.
-    pub seen_messages: usize,
 }
 
 /// One coding CLI's own session for a conversation. The conversation's
@@ -74,12 +50,8 @@ pub struct Conversation {
     pub workspace: Option<std::path::PathBuf>,
     /// Legacy conversations inherit their existing Taceta provider on load.
     pub provider: Option<InferenceProvider>,
-    pub gpt: Option<GptConversation>,
-    /// Historical Codex references never own the current execution route.
-    pub archived_gpt_thread_ids: Vec<String>,
-    pub gpt_ownership_revision: u64,
     pub cli_sessions: HashMap<InferenceProvider, CliSession>,
-    pub cli_usage: Option<GptUsage>,
+    pub cli_usage: Option<TokenUsage>,
     /// How many of the messages Taceta's own task record holds. `None` until
     /// the record has been written back once; messages after this count came
     /// from another engine and are imported into the record on the next run.
@@ -104,9 +76,6 @@ impl Default for Conversation {
             agent_enabled: false,
             workspace: None,
             provider: None,
-            gpt: None,
-            archived_gpt_thread_ids: Vec::new(),
-            gpt_ownership_revision: 0,
             cli_sessions: HashMap::new(),
             cli_usage: None,
             task_seen_messages: None,
@@ -121,34 +90,21 @@ impl Conversation {
     pub fn for_provider(provider: InferenceProvider) -> Self {
         Self {
             provider: Some(provider),
-            agent_enabled: provider == InferenceProvider::Gpt,
-            gpt: (provider == InferenceProvider::Gpt).then(GptConversation::default),
             ..Default::default()
         }
-    }
-
-    pub fn is_gpt(&self) -> bool {
-        self.provider == Some(InferenceProvider::Gpt)
-            || (self.provider.is_none() && self.gpt.is_some())
-    }
-
-    pub fn has_gpt_history(&self) -> bool {
-        self.is_gpt() || !self.archived_gpt_thread_ids.is_empty() || self.gpt_ownership_revision > 0
     }
 
     /// Whether this conversation works in a folder (Code) rather than only
     /// talking (Chat). Each engine keeps the choice in its own field.
     pub fn is_code(&self) -> bool {
         match self.provider {
-            Some(InferenceProvider::Grok | InferenceProvider::Claude) => !self.cli_chat,
+            Some(InferenceProvider::Grok | InferenceProvider::Claude | InferenceProvider::Gpt) => !self.cli_chat,
             _ => self.agent_enabled,
         }
     }
 
     pub fn has_history(&self) -> bool {
         !self.messages.is_empty()
-            || self.gpt.as_ref().is_some_and(|gpt| gpt.thread_id.is_some())
-            || !self.archived_gpt_thread_ids.is_empty()
     }
 
     pub fn is_untitled(&self) -> bool {
@@ -169,7 +125,6 @@ pub struct PersistedAppState {
     pub inference_provider: InferenceProvider,
     pub provider_models: HashMap<InferenceProvider, String>,
     pub agent_max_steps: u32,
-    pub gpt_max_tool_actions: u32,
     pub agent_max_duration_secs: u64,
     pub thinking_modes: HashMap<String, ThinkingMode>,
     pub show_thinking_trace: bool,
@@ -215,7 +170,6 @@ impl Default for PersistedAppState {
             inference_provider: InferenceProvider::Ollama,
             provider_models: HashMap::new(),
             agent_max_steps: 100,
-            gpt_max_tool_actions: 100,
             agent_max_duration_secs: 3_600,
             thinking_modes: HashMap::new(),
             show_thinking_trace: false,
@@ -248,7 +202,6 @@ impl PersistedAppState {
         }
         self.context_length = normalize_context_length(self.context_length);
         self.agent_max_steps = self.agent_max_steps.clamp(1, 1_000);
-        self.gpt_max_tool_actions = self.gpt_max_tool_actions.clamp(1, 1_000);
         self.agent_max_duration_secs = self.agent_max_duration_secs.clamp(60, 43_200);
         self.max_search_results = self.max_search_results.clamp(1, 5);
         self.chatgpt_web_request_limit =
@@ -270,13 +223,7 @@ impl PersistedAppState {
                     message.interrupted = true;
                 }
             }
-            if conversation.is_gpt() {
-                conversation.provider = Some(InferenceProvider::Gpt);
-                let gpt = conversation.gpt.get_or_insert_with(Default::default);
-                if matches!(gpt.status, GptRunStatus::Running | GptRunStatus::AwaitingApproval) {
-                    gpt.status = GptRunStatus::Interrupted;
-                }
-            } else if conversation.provider.is_none() {
+            if conversation.provider.is_none() {
                 conversation.provider = Some(legacy_provider);
             }
         }
@@ -324,38 +271,11 @@ impl PersistedAppState {
         if self.active_conversation().provider.is_none() {
             self.active_conversation_mut().provider = Some(current_provider);
         }
-        // A task from Taceta's own runner carries richer state than its
-        // transcript, so it reaches GPT through the task handoff.
-        let transfer_work = provider == InferenceProvider::Gpt
-            && current_provider == InferenceProvider::Ollama
-            && !self.active_conversation().is_gpt()
-            && self.active_conversation().agent_enabled
-            && self.active_conversation().workspace.is_some()
-            && self.active_conversation().has_history()
-            && self.active_conversation().gpt.is_none();
         self.remember_provider_model(provider);
         let conversation = self.active_conversation_mut();
         conversation.provider = Some(provider);
         if provider != InferenceProvider::Ollama {
             conversation.web_search_enabled = false;
-        }
-        if transfer_work {
-            conversation.gpt = Some(GptConversation {
-                handoff_from_taceta: true,
-                pending_handoff: true,
-                seen_messages: conversation.messages.len(),
-                ..Default::default()
-            });
-            conversation.gpt_ownership_revision = conversation.gpt_ownership_revision.saturating_add(1);
-        } else if provider == InferenceProvider::Gpt {
-            // GPT starts in coding mode; a conversation that already has
-            // turns keeps the mode it was in.
-            if !conversation.has_history() {
-                conversation.agent_enabled = true;
-            }
-            // The conversation continues; its Codex thread, if it has one,
-            // is given the turns it missed with the next request.
-            conversation.gpt.get_or_insert_with(GptConversation::default);
         }
         self.pending_attachments.clear();
     }
@@ -374,27 +294,6 @@ impl PersistedAppState {
             self.pending_attachments.clear();
         }
         true
-    }
-
-    /// A Codex thread's execution environment is fixed for its lifetime, so
-    /// changing it retires the thread. The conversation continues: the next
-    /// request starts a new thread and hands it the conversation so far.
-    pub fn configure_gpt_environment(&mut self, coding: bool, workspace: Option<std::path::PathBuf>) {
-        let current = self.active_conversation();
-        if !current.is_gpt() || (current.agent_enabled == coding && current.workspace == workspace) {
-            return;
-        }
-        let conversation = self.active_conversation_mut();
-        if let Some(session) = conversation.gpt.as_mut() {
-            if let Some(thread_id) = session.thread_id.take() {
-                if !conversation.archived_gpt_thread_ids.contains(&thread_id) {
-                    conversation.archived_gpt_thread_ids.push(thread_id);
-                }
-            }
-            *session = GptConversation::default();
-        }
-        conversation.agent_enabled = coding;
-        conversation.workspace = workspace;
     }
 
     pub fn rename_conversation(&mut self, id: Uuid, title: &str) -> bool {
@@ -472,178 +371,6 @@ impl PersistedAppState {
     }
 }
 
-#[derive(Deserialize, Serialize)]
-struct GptBinding {
-    id: Uuid,
-    title: String,
-    title_is_custom: bool,
-    thread_id: Option<String>,
-    coding: bool,
-    workspace: Option<std::path::PathBuf>,
-    handoff_from_taceta: bool,
-    pending_handoff: bool,
-    #[serde(default = "default_gpt_binding_owner")]
-    owner: InferenceProvider,
-    #[serde(default)]
-    ownership_revision: u64,
-    #[serde(default)]
-    archived_gpt_thread_ids: Vec<String>,
-}
-
-fn default_gpt_binding_owner() -> InferenceProvider { InferenceProvider::Gpt }
-
-/// Unlike eframe's asynchronous flush, this checkpoint reaches disk before the
-/// service receives ThreadSaved and is allowed to begin a mutating turn.
-pub fn save_gpt_binding(root: &std::path::Path, conversation: &Conversation) -> Result<(), String> {
-    let session = conversation.gpt.as_ref().ok_or("GPT conversation metadata is missing")?;
-    let thread_id = session.thread_id.as_ref().filter(|id| !id.is_empty());
-    if thread_id.is_none() && !(session.handoff_from_taceta && session.pending_handoff) {
-        return Err("GPT conversation ID is missing".into());
-    }
-    let binding = GptBinding {
-        id: conversation.id, title: conversation.title.clone(), title_is_custom: conversation.title_is_custom,
-        thread_id: thread_id.cloned(), coding: conversation.agent_enabled,
-        workspace: conversation.workspace.clone(), handoff_from_taceta: session.handoff_from_taceta,
-        pending_handoff: session.pending_handoff,
-        owner: InferenceProvider::Gpt,
-        ownership_revision: conversation.gpt_ownership_revision,
-        archived_gpt_thread_ids: conversation.archived_gpt_thread_ids.clone(),
-    };
-    write_gpt_binding(root, &binding)
-}
-
-fn write_gpt_binding(root: &std::path::Path, binding: &GptBinding) -> Result<(), String> {
-    use std::io::Write;
-    let bytes = serde_json::to_vec(&binding).map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(root).map_err(|error| format!("Could not create GPT history storage: {error}"))?;
-    let destination = root.join(format!("{}.json", binding.id));
-    let temporary = root.join(format!(".{}.tmp", Uuid::new_v4()));
-    let result = (|| -> std::io::Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)] {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, &destination)?;
-        std::fs::File::open(root)?.sync_all()?;
-        if let Some(parent) = root.parent() { std::fs::File::open(parent)?.sync_all()?; }
-        Ok(())
-    })();
-    if result.is_err() { let _ = std::fs::remove_file(&temporary); }
-    result.map_err(|error| format!("Could not save GPT conversation before execution: {error}"))
-}
-
-pub fn recover_gpt_bindings(state: &mut PersistedAppState, root: &std::path::Path) -> Result<usize, String> {
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(format!("Could not read GPT history bindings: {error}")),
-    };
-    let mut count = 0;
-    for entry in entries {
-        let path = entry.map_err(|error| error.to_string())?.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") { continue; }
-        let binding: GptBinding = serde_json::from_slice(&std::fs::read(&path).map_err(|error| error.to_string())?)
-            .map_err(|error| format!("Could not restore a saved GPT conversation binding: {error}"))?;
-        if binding.owner == InferenceProvider::Gpt && binding.thread_id.as_ref().is_none_or(|id| id.is_empty())
-            && !(binding.handoff_from_taceta && binding.pending_handoff) {
-            return Err("A saved GPT conversation binding has no thread ID".into());
-        }
-        let known = state.conversations.iter().position(|conversation| conversation.id == binding.id);
-        if let Some(index) = known.filter(|_| binding.owner == InferenceProvider::Gpt) {
-            // The saved conversation is the record of which provider, mode
-            // and workspace it was left with. The binding only adds what a
-            // crash between its write and the next save would have lost: the
-            // thread of a turn that had already been sent.
-            let conversation = &mut state.conversations[index];
-            if binding.ownership_revision < conversation.gpt_ownership_revision { continue; }
-            for thread_id in binding.archived_gpt_thread_ids {
-                if !conversation.archived_gpt_thread_ids.contains(&thread_id) {
-                    conversation.archived_gpt_thread_ids.push(thread_id);
-                }
-            }
-            let retired = binding.thread_id.as_ref().is_some_and(|id| conversation.archived_gpt_thread_ids.contains(id));
-            let same_environment = conversation.agent_enabled == binding.coding && conversation.workspace == binding.workspace;
-            if let Some(session) = conversation.gpt.as_mut() {
-                if session.thread_id.is_none() && !retired && same_environment {
-                    session.thread_id = binding.thread_id;
-                    session.handoff_from_taceta = binding.handoff_from_taceta;
-                    session.pending_handoff = binding.pending_handoff;
-                }
-                if matches!(session.status, GptRunStatus::Running | GptRunStatus::AwaitingApproval) {
-                    session.status = GptRunStatus::Interrupted;
-                }
-            } else if !retired && same_environment && conversation.provider == Some(InferenceProvider::Gpt) {
-                conversation.gpt = Some(GptConversation {
-                    thread_id: binding.thread_id,
-                    handoff_from_taceta: binding.handoff_from_taceta,
-                    pending_handoff: binding.pending_handoff,
-                    status: GptRunStatus::Interrupted,
-                    ..Default::default()
-                });
-            }
-            continue;
-        }
-        let conversation = if let Some(index) = known {
-            &mut state.conversations[index]
-        } else {
-            state.conversations.push(Conversation {
-                id: binding.id, title: binding.title, title_is_custom: binding.title_is_custom,
-                ..Conversation::for_provider(binding.owner)
-            });
-            count += 1;
-            state.conversations.last_mut().unwrap()
-        };
-        if binding.ownership_revision < conversation.gpt_ownership_revision { continue; }
-        let owner = if binding.owner != InferenceProvider::Gpt
-            && matches!(conversation.provider, Some(InferenceProvider::Ollama | InferenceProvider::Grok)) {
-            conversation.provider.unwrap()
-        } else { binding.owner };
-        conversation.provider = Some(owner);
-        conversation.agent_enabled = binding.coding;
-        conversation.workspace = binding.workspace;
-        conversation.gpt_ownership_revision = binding.ownership_revision;
-        conversation.archived_gpt_thread_ids = binding.archived_gpt_thread_ids;
-        if owner != InferenceProvider::Gpt {
-            conversation.gpt = None;
-            if let Some(thread_id) = binding.thread_id {
-                if !conversation.archived_gpt_thread_ids.contains(&thread_id) {
-                    conversation.archived_gpt_thread_ids.push(thread_id);
-                }
-            }
-            continue;
-        }
-        let session = conversation.gpt.get_or_insert_with(Default::default);
-        session.thread_id = binding.thread_id;
-        session.handoff_from_taceta = binding.handoff_from_taceta;
-        session.pending_handoff = binding.pending_handoff;
-        if matches!(session.status, GptRunStatus::Idle | GptRunStatus::Running | GptRunStatus::AwaitingApproval) {
-            session.status = GptRunStatus::Interrupted;
-        }
-    }
-    let provider = state.active_conversation().provider.unwrap_or(state.inference_provider);
-    state.remember_provider_model(provider);
-    Ok(count)
-}
-
-/// Explicit local deletion keeps both this binding and Codex's raw history
-/// recoverable, while excluding the archived binding from startup recovery.
-pub fn archive_gpt_binding(root: &std::path::Path, id: Uuid) -> Result<(), String> {
-    let source = root.join(format!("{id}.json"));
-    if !source.exists() { return Ok(()); }
-    let archive = root.join("archived");
-    std::fs::create_dir_all(&archive).map_err(|error| error.to_string())?;
-    std::fs::rename(source, archive.join(format!("{id}-{}.json", Uuid::new_v4())))
-        .map_err(|error| format!("Could not archive GPT conversation binding: {error}"))?;
-    std::fs::File::open(&archive).and_then(|file| file.sync_all()).map_err(|error| error.to_string())?;
-    std::fs::File::open(root).and_then(|file| file.sync_all()).map_err(|error| error.to_string())?;
-    Ok(())
-}
-
 fn default_max_search_results() -> u8 {
     5
 }
@@ -710,35 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn gpt_saved_owner_thread_and_controls_round_trip_without_changing_old_defaults() {
-        let legacy: PersistedAppState = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert_eq!(legacy.inference_provider, InferenceProvider::Ollama);
-        assert_eq!(legacy.agent_max_steps, 100);
-        assert_eq!(legacy.gpt_max_tool_actions, 100);
-        assert!(!legacy.active_conversation().agent_enabled);
-        let mut state = legacy;
-        state.switch_provider(InferenceProvider::Gpt);
-        state.selected_model = Some("account-model".into());
-        state.gpt_max_tool_actions = 45;
-        state.agent_max_duration_secs = 2_400;
-        state.show_thinking_trace = true;
-        state.active_conversation_mut().workspace = Some("/fixture/workspace".into());
-        let session = state.active_conversation_mut().gpt.as_mut().unwrap();
-        session.thread_id = Some("codex-thread".into());
-        session.status = GptRunStatus::Running;
-        let restored: PersistedAppState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
-        let restored = restored.normalized();
-        assert_eq!(restored.inference_provider, InferenceProvider::Gpt);
-        assert!(restored.active_conversation().agent_enabled);
-        assert_eq!(restored.active_conversation().gpt.as_ref().unwrap().thread_id.as_deref(), Some("codex-thread"));
-        assert_eq!(restored.active_conversation().gpt.as_ref().unwrap().status, GptRunStatus::Interrupted);
-        assert_eq!(restored.gpt_max_tool_actions, 45);
-        assert_eq!(restored.agent_max_duration_secs, 2_400);
-        assert_eq!(restored.selected_model.as_deref(), Some("account-model"));
-        assert!(restored.show_thinking_trace);
-    }
-
-    #[test]
     fn switching_providers_keeps_the_conversation_and_each_engines_own_session() {
         let mut state = PersistedAppState::default();
         state.active_conversation_mut().messages.push(ChatMessage::new_user("local conversation"));
@@ -750,124 +448,32 @@ mod tests {
             assert_eq!(state.active_conversation().messages[0].content, "local conversation");
         }
         assert_eq!(state.conversations.len(), 1);
-        // A chat that moves to GPT stays a chat there.
-        assert!(!state.active_conversation().agent_enabled);
-        let session = state.active_conversation_mut().gpt.as_mut().unwrap();
-        session.thread_id = Some("thread-1".into());
-        session.seen_messages = 1;
+        state.active_conversation_mut().cli_sessions.insert(
+            InferenceProvider::Gpt,
+            CliSession { session_id: "thread-1".into(), seen_messages: 1 },
+        );
 
-        // Leaving GPT and coming back finds the same thread.
+        // Leaving GPT and coming back finds the same session.
         state.switch_provider(InferenceProvider::Ollama);
         state.switch_provider(InferenceProvider::Claude);
         state.switch_provider(InferenceProvider::Gpt);
         assert_eq!(state.active_conversation_id, id);
-        let session = state.active_conversation().gpt.as_ref().unwrap();
-        assert_eq!((session.thread_id.as_deref(), session.seen_messages), (Some("thread-1"), 1));
-
-        // A different mode or workspace retires the thread, not the conversation.
-        state.configure_gpt_environment(true, Some("/fixture/other".into()));
-        assert_eq!(state.active_conversation_id, id);
-        let conversation = state.active_conversation();
-        assert_eq!(conversation.archived_gpt_thread_ids, ["thread-1"]);
-        let session = conversation.gpt.as_ref().unwrap();
-        assert_eq!((session.thread_id.as_deref(), session.seen_messages), (None, 0));
-        assert_eq!(conversation.messages.len(), 1);
+        let session = &state.active_conversation().cli_sessions[&InferenceProvider::Gpt];
+        assert_eq!((session.session_id.as_str(), session.seen_messages), ("thread-1", 1));
     }
 
     #[test]
-    fn a_local_task_reaches_gpt_through_the_task_handoff_and_other_engines_do_not() {
-        let task = |state: &mut PersistedAppState| {
-            let conversation = state.active_conversation_mut();
-            conversation.agent_enabled = true;
-            conversation.workspace = Some("/fixture/workspace".into());
-            conversation.messages = vec![ChatMessage::new_user("Implement the feature"), ChatMessage::new_assistant("Saved progress")];
-        };
-        let mut state = PersistedAppState::default();
-        let original_id = state.active_conversation_id;
-        task(&mut state);
-        state.switch_provider(InferenceProvider::Gpt);
-        assert_eq!(state.active_conversation_id, original_id);
-        assert_eq!(state.active_conversation().workspace.as_deref(), Some(std::path::Path::new("/fixture/workspace")));
-        let session = state.active_conversation().gpt.as_ref().unwrap();
-        assert!(session.handoff_from_taceta && session.pending_handoff);
-        // The handoff carries the task's turns, so they are not sent twice.
-        assert_eq!(session.seen_messages, 2);
-        state.switch_provider(InferenceProvider::Grok);
-        assert_eq!(state.active_conversation_id, original_id);
-        assert_eq!(state.active_conversation().messages.len(), 2);
-
-        // A CLI's work has no local task record to hand off.
-        let mut state = PersistedAppState::default();
-        state.switch_provider(InferenceProvider::Grok);
-        task(&mut state);
-        state.switch_provider(InferenceProvider::Gpt);
-        let session = state.active_conversation().gpt.as_ref().unwrap();
-        assert!(!session.pending_handoff);
-        assert_eq!(session.seen_messages, 0);
-    }
-
-    #[test]
-    fn gpt_durable_binding_recovers_a_thread_without_eframe_state_and_archives_locally() {
-        let root = std::env::temp_dir().join(format!("taceta-binding-test-{}", Uuid::new_v4()));
-        let mut conversation = Conversation::for_provider(InferenceProvider::Gpt);
-        conversation.title = "Saved coding work".into();
-        conversation.workspace = Some("/fixture/project".into());
-        conversation.gpt.as_mut().unwrap().thread_id = Some("durable-codex-thread".into());
-        save_gpt_binding(&root, &conversation).unwrap();
-        let mut state = PersistedAppState::default();
-        assert_eq!(recover_gpt_bindings(&mut state, &root).unwrap(), 1);
-        assert!(state.select_conversation(conversation.id));
-        assert_eq!(state.inference_provider, InferenceProvider::Gpt);
-        assert_eq!(state.active_conversation().workspace, conversation.workspace);
-        assert_eq!(state.active_conversation().gpt.as_ref().unwrap().thread_id.as_deref(), Some("durable-codex-thread"));
-        archive_gpt_binding(&root, conversation.id).unwrap();
-        let mut fresh = PersistedAppState::default();
-        assert_eq!(recover_gpt_bindings(&mut fresh, &root).unwrap(), 0);
-        let archived = std::fs::read_dir(root.join("archived")).unwrap().next().unwrap().unwrap().path();
-        assert!(!std::fs::read(&archived).unwrap().is_empty());
-        std::fs::remove_file(archived).unwrap();
-        std::fs::remove_dir(root.join("archived")).unwrap();
-        std::fs::remove_dir(root).unwrap();
-    }
-
-    #[test]
-    fn a_restart_leaves_a_conversation_with_the_provider_mode_and_workspace_it_was_saved_with() {
-        let root = tempfile::tempdir().unwrap();
-        // A GPT chat turn leaves its thread binding on disk.
-        let mut conversation = Conversation::for_provider(InferenceProvider::Gpt);
-        conversation.agent_enabled = false;
-        conversation.gpt.as_mut().unwrap().thread_id = Some("chat-thread".into());
-        save_gpt_binding(root.path(), &conversation).unwrap();
-        // The conversation then continued with Grok as a task in a workspace.
-        conversation.provider = Some(InferenceProvider::Grok);
-        conversation.workspace = Some("/fixture/project".into());
-        let id = conversation.id;
-        let mut state = PersistedAppState { active_conversation_id: id, conversations: vec![conversation], ..Default::default() };
-        state.inference_provider = InferenceProvider::Grok;
-
-        assert_eq!(recover_gpt_bindings(&mut state, root.path()).unwrap(), 0);
-        let restored = state.active_conversation();
-        assert_eq!(restored.provider, Some(InferenceProvider::Grok));
-        assert_eq!(restored.workspace.as_deref(), Some(std::path::Path::new("/fixture/project")));
-        assert!(!restored.agent_enabled);
-        assert_eq!(state.inference_provider, InferenceProvider::Grok);
-        // Its GPT thread is still there for when GPT is chosen again.
-        assert_eq!(restored.gpt.as_ref().unwrap().thread_id.as_deref(), Some("chat-thread"));
-    }
-
-    #[test]
-    fn a_thread_that_was_retired_is_not_brought_back_by_its_binding() {
-        let root = tempfile::tempdir().unwrap();
-        let mut conversation = Conversation::for_provider(InferenceProvider::Gpt);
-        conversation.gpt.as_mut().unwrap().thread_id = Some("old-thread".into());
-        save_gpt_binding(root.path(), &conversation).unwrap();
-        let id = conversation.id;
-        let mut state = PersistedAppState { active_conversation_id: id, conversations: vec![conversation], ..Default::default() };
-        state.inference_provider = InferenceProvider::Gpt;
-        // Changing the mode retires the thread; the binding on disk still names it.
-        state.configure_gpt_environment(false, None);
-        recover_gpt_bindings(&mut state, root.path()).unwrap();
-        assert_eq!(state.active_conversation().gpt.as_ref().unwrap().thread_id, None);
+    fn a_state_saved_with_the_fields_of_an_earlier_gpt_connection_still_loads() {
+        let saved = serde_json::json!({"conversations":[{
+            "id":"4635145f-4448-499e-a8a8-49adb02580f6","title":"Earlier GPT work","provider":"Gpt","agent_enabled":true,
+            "gpt":{"thread_id":"old-thread","status":"Completed"},"archived_gpt_thread_ids":["older"],"gpt_ownership_revision":2
+        }],"gpt_max_tool_actions":45});
+        let state: PersistedAppState = serde_json::from_value(saved).unwrap();
+        let state = state.normalized();
+        assert_eq!(state.conversations[0].title, "Earlier GPT work");
+        assert_eq!(state.conversations[0].provider, Some(InferenceProvider::Gpt));
+        // Its session starts anew; the conversation itself is handed over.
+        assert!(state.conversations[0].cli_sessions.is_empty());
     }
 
     #[test]

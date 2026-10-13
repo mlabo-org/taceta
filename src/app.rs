@@ -10,7 +10,6 @@ use std::{
 mod agent_ui;
 mod cli_ui;
 mod compaction;
-mod gpt_ui;
 mod provider_ui;
 mod session_ui;
 
@@ -144,7 +143,6 @@ pub struct TacetaApp {
     model_result_rx: std_mpsc::Receiver<(u64, Result<Vec<ModelDescriptor>, String>)>,
     model_list_epoch: u64,
     agent_ui: agent_ui::AgentUiState,
-    gpt_ui: gpt_ui::GptUiState,
     cli_ui: cli_ui::CliUiState,
     compaction: Option<compaction::ActiveCompaction>,
     model_refresh_pending: bool,
@@ -214,7 +212,7 @@ impl TacetaApp {
         let link_service = Arc::new(TacetaLinkService::default());
         let loaded = load_app_state(creation_context.storage);
         let unreadable_state = loaded.unreadable;
-        let mut state = loaded.state;
+        let state = loaded.state;
         // Everything Taceta stores per user hangs off the home directory, so
         // its absence is decided once, here.
         let home = std::env::var_os("HOME")
@@ -222,8 +220,6 @@ impl TacetaApp {
             .filter(|home| home.is_absolute())
             .expect("Taceta needs the current user's home directory (HOME)");
         let data_roots = DataRoots::for_user(&home);
-        let gpt_recovery =
-            crate::persistence::recover_gpt_bindings(&mut state, &data_roots.gpt_bindings);
         let endpoint_result =
             OllamaEndpoint::resolve(state.ollama_endpoint_mode, &state.ollama_custom_endpoint);
         let (ollama_endpoint, initial_endpoint_error) = match endpoint_result {
@@ -295,9 +291,6 @@ impl TacetaApp {
         } else {
             app.refresh_models();
         }
-        if let Err(error) = gpt_recovery {
-            app.notice = Some(Notice { kind: NoticeKind::Error, text: error });
-        }
         app.link_socket_error = link_socket_error;
         app.unreadable_state_dialog = unreadable_state.is_some();
         app.unreadable_state = unreadable_state;
@@ -338,7 +331,6 @@ impl TacetaApp {
             model_result_rx,
             model_list_epoch: 0,
             agent_ui: agent_ui::AgentUiState::new(data_roots.agent_sessions),
-            gpt_ui: gpt_ui::GptUiState::new(data_roots.gpt_bindings),
             cli_ui: cli_ui::CliUiState::new(data_roots.grok_approval_plugin),
             compaction: None,
             model_refresh_pending: false,
@@ -484,14 +476,6 @@ impl TacetaApp {
         let epoch = self.model_list_epoch;
         self.connection = ConnectionState::Connecting;
         let result_tx = self.model_result_tx.clone();
-        if self.state.inference_provider == InferenceProvider::Gpt {
-            let client = self.gpt_ui.client.clone();
-            self.runtime.spawn(async move {
-                let result = client.list_models().await;
-                let _ = result_tx.send((epoch, result));
-            });
-            return;
-        }
         if let Some(agent) = self.cli_ui.agent(self.state.inference_provider) {
             self.refresh_cli_models(agent, epoch);
             return;
@@ -701,7 +685,6 @@ impl TacetaApp {
 
     fn drain_background_work(&mut self) {
         self.drain_agent_work();
-        self.drain_gpt_work();
         self.drain_cli_work();
         self.drain_compaction();
         if let Some(receiver) = &self.model_unload_result {
@@ -1251,10 +1234,6 @@ impl TacetaApp {
         // Sending from the keyboard leaves the line break it was sent with.
         let kept = self.state.draft.trim_end().len();
         self.state.draft.truncate(kept);
-        if self.state.inference_provider == InferenceProvider::Gpt {
-            self.start_gpt_send();
-            return;
-        }
         if self.is_cli_provider() {
             self.start_cli_send();
             return;
@@ -1419,10 +1398,6 @@ impl TacetaApp {
     fn stop_generation(&mut self) {
         if self.compaction.is_some() {
             self.stop_compaction();
-            return;
-        }
-        if self.gpt_ui.active.is_some() {
-            self.stop_gpt_run();
             return;
         }
         if self.cli_ui.active.is_some() {
@@ -1946,11 +1921,6 @@ impl TacetaApp {
                         "Delete this chat. Agent event records, if any, are moved to a recovery folder on this Mac.",
                     )
                 ));
-                if self.state.conversations.iter().any(|conversation| conversation.id == confirmation.conversation_id && conversation.has_gpt_history()) {
-                    ui.label(text(language,
-                        "Codexの原文履歴は削除せず、会話IDの控えをこのMacのTaceta/GptBindings/archivedへ退避します。",
-                        "Codex's original history remains, and the conversation binding is kept in this Mac's Taceta/GptBindings/archived folder."));
-                }
                 if self.is_generating() {
                     ui.label(
                         RichText::new(text(
@@ -1984,8 +1954,7 @@ impl TacetaApp {
 
         if delete_requested {
             let previous_provider = self.state.inference_provider;
-            if self.archive_gpt_chats(&[confirmation.conversation_id])
-                && self.archive_agent_chats(&[confirmation.conversation_id])
+            if self.archive_agent_chats(&[confirmation.conversation_id])
                 && self.state.delete_conversation(confirmation.conversation_id) {
                 if previous_provider != self.state.inference_provider { self.bind_selected_provider(); }
                 self.screen = Screen::Chat;
@@ -2024,11 +1993,6 @@ impl TacetaApp {
                     "Delete the selected {selected_count} chats. Agent event records are moved to a recovery folder on this Mac."
                 ),
             });
-            if self.state.conversations.iter().any(|conversation| confirmation.conversation_ids.contains(&conversation.id) && conversation.has_gpt_history()) {
-                ui.label(text(language,
-                    "GPTは一覧からのみ削除し、Codexの原文履歴と復元用の会話IDはこのMacに残します。",
-                    "GPT chats are removed from this list; Codex's original history and recovery bindings remain on this Mac."));
-            }
             if self.is_generating() {
                 ui.label(
                     RichText::new(text(
@@ -2062,8 +2026,7 @@ impl TacetaApp {
 
         if delete_requested {
             let previous_provider = self.state.inference_provider;
-            if self.archive_gpt_chats(&confirmation.conversation_ids)
-                && self.archive_agent_chats(&confirmation.conversation_ids) && self
+            if self.archive_agent_chats(&confirmation.conversation_ids) && self
                 .state
                 .delete_conversations(&confirmation.conversation_ids)
                 > 0
@@ -2654,11 +2617,6 @@ impl TacetaApp {
                         )
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            if self.state.inference_provider == InferenceProvider::Gpt {
-                                ui.strong(text(language, "GPTのコンテキスト", "GPT context"));
-                                self.show_gpt_usage(ui);
-                                return;
-                            }
                             ui.strong(text(language, "モデル格納先", "Model location"));
                             ui.add_space(4.0);
                             ui.label(
@@ -3166,10 +3124,6 @@ impl TacetaApp {
     }
 
     fn show_chat(&mut self, root_ui: &mut Ui) {
-        if self.state.inference_provider == InferenceProvider::Gpt {
-            self.show_gpt_chat(root_ui);
-            return;
-        }
         if self.is_cli_provider() {
             self.show_cli_chat(root_ui);
             return;
@@ -3523,7 +3477,10 @@ impl TacetaApp {
                             ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
                             let file_clicked = ui
                                 .add_enabled(
-                                    !self.is_generating() && !self.is_cli_provider() && (!self.state.active_conversation().agent_enabled || self.state.inference_provider == InferenceProvider::Gpt),
+                                    !self.is_generating() && match self.cli_ui.agent(self.state.inference_provider) {
+                                        Some(agent) => agent.accepts_attachments(),
+                                        None => !self.state.active_conversation().agent_enabled,
+                                    },
                                     Button::new("＋")
                                         .min_size(Vec2::splat(control.row_height))
                                         .corner_radius(control.row_height / 2.0),
@@ -3854,10 +3811,6 @@ pub(super) enum ActionMark {
     Running,
     Done,
     Failed,
-    /// Started, and its turn ended before it reported a result.
-    Stopped,
-    /// A section that is not an action, such as a thinking trace or a diff.
-    Section,
 }
 
 /// One action or section in a conversation: a quiet one-line row that opens
@@ -3875,8 +3828,6 @@ pub(super) fn show_action_row(
         ActionMark::Running => ("…", palette.weak_text),
         ActionMark::Done => ("✓", palette.success),
         ActionMark::Failed => ("✗", palette.error),
-        ActionMark::Stopped => ("■", palette.weak_text),
-        ActionMark::Section => ("", palette.weak_text),
     };
     let title = title.lines().find(|line| !line.trim().is_empty()).unwrap_or_default().trim();
     theme::card(palette.thinking, palette.thinking, 8, 6).show(ui, |ui| {
@@ -4027,15 +3978,14 @@ fn composer_editor_content_height(ui: &Ui, draft: &str, wrap_width: f32) -> f32 
 }
 
 impl eframe::App for TacetaApp {
-    fn logic(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         let busy = |app: &Self| {
-            app.is_generating() || app.gpt_ui.auth_busy() || app.agent_ui.is_recovering()
+            app.is_generating() || app.agent_ui.is_recovering()
                 || app.model_refresh_pending || app.model_pull.is_some()
                 || app.model_unload_result.is_some()
         };
         let was_busy = busy(self);
         self.drain_background_work();
-        self.persist_gpt_thread(frame.storage_mut());
 
         // Work that ended in this pass still needs one more frame: without
         // it the window keeps showing the running state until the next input.
@@ -4060,7 +4010,6 @@ impl eframe::App for TacetaApp {
         self.show_conversation_history_dialogs(ui.ctx());
         self.show_unreadable_state_dialog(ui.ctx());
         self.show_agent_approval(ui.ctx());
-        self.show_gpt_requests(ui.ctx());
         self.show_cli_approval(ui.ctx());
     }
 
@@ -4077,7 +4026,6 @@ impl eframe::App for TacetaApp {
 impl Drop for TacetaApp {
     fn drop(&mut self) {
         self.abort_agent_on_exit();
-        self.abort_gpt_on_exit();
         self.abort_cli_on_exit();
         if let Some(generation) = self.generation.take() {
             generation.task.abort();
@@ -4151,7 +4099,6 @@ struct DataRoots {
     home: PathBuf,
     agent_sessions: PathBuf,
     grok_approval_plugin: PathBuf,
-    gpt_bindings: PathBuf,
     model_storage: PathBuf,
 }
 
@@ -4162,7 +4109,6 @@ impl DataRoots {
             home: home.to_path_buf(),
             agent_sessions: taceta.join("AgentSessions"),
             grok_approval_plugin: taceta.join("GrokApprovalPlugin"),
-            gpt_bindings: taceta.join("GptBindings"),
             model_storage: resolve_model_storage_path(home),
         }
     }
@@ -4807,7 +4753,6 @@ mod model_manager_tests {
                 home: PathBuf::from("/tmp/taceta-test-unused-home"),
                 agent_sessions: std::env::temp_dir().join(format!("taceta-ui-{}", Uuid::new_v4())),
                 grok_approval_plugin: std::env::temp_dir().join(format!("taceta-grok-plugin-{}", Uuid::new_v4())),
-                gpt_bindings: std::env::temp_dir().join(format!("taceta-gpt-ui-{}", Uuid::new_v4())),
                 model_storage: PathBuf::from("/tmp/taceta-test-unused-home/.ollama/models"),
             },
         )

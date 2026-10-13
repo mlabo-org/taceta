@@ -15,7 +15,6 @@ impl TacetaApp {
             .as_ref()
             .map(|generation| generation.conversation_id)
             .or_else(|| self.agent_ui.running())
-            .or_else(|| self.gpt_ui.active.as_ref().map(gpt_ui::ActiveGpt::conversation))
             .or_else(|| self.cli_ui.active.as_ref().map(cli_ui::ActiveCli::conversation))
     }
 
@@ -32,11 +31,7 @@ impl TacetaApp {
         }
         let id = self.state.active_conversation_id;
         match self.state.inference_provider {
-            InferenceProvider::Gpt => {
-                let workspace = code.then(|| self.state.active_conversation().workspace.clone()).flatten();
-                self.state.configure_gpt_environment(code, workspace);
-            }
-            InferenceProvider::Grok | InferenceProvider::Claude => {
+            InferenceProvider::Grok | InferenceProvider::Claude | InferenceProvider::Gpt => {
                 let conversation = self.state.active_conversation_mut();
                 conversation.cli_chat = !code;
                 // A CLI session belongs to the folder and tools it was started with.
@@ -68,8 +63,7 @@ impl TacetaApp {
         self.screen = Screen::Chat;
         let workspace = workspace.filter(|_| code);
         match self.state.inference_provider {
-            InferenceProvider::Gpt => self.state.configure_gpt_environment(code, workspace),
-            InferenceProvider::Grok | InferenceProvider::Claude => {
+            InferenceProvider::Grok | InferenceProvider::Claude | InferenceProvider::Gpt => {
                 let conversation = self.state.active_conversation_mut();
                 conversation.cli_chat = !code;
                 conversation.workspace = workspace;
@@ -93,8 +87,7 @@ impl TacetaApp {
             return;
         }
         match self.state.inference_provider {
-            InferenceProvider::Gpt => self.state.configure_gpt_environment(true, Some(path)),
-            InferenceProvider::Grok | InferenceProvider::Claude => {
+            InferenceProvider::Grok | InferenceProvider::Claude | InferenceProvider::Gpt => {
                 let conversation = self.state.active_conversation_mut();
                 // A CLI session belongs to the folder it was started in.
                 conversation.cli_sessions.clear();
@@ -160,10 +153,7 @@ impl TacetaApp {
                 InferenceProvider::Ollama => text(language,
                     "このフォルダーを読み取り、編集とコマンドは内容を確認してから実行します。コマンドの通信は無効です。",
                     "Reads this folder. Edits and commands require approval of their exact contents. Commands have no network access."),
-                InferenceProvider::Gpt => text(language,
-                    "Codexのworkspace-writeで書き込みを制限し、コマンドの通信を無効にします。フォルダーを変えると新しいスレッドを始めます。",
-                    "Codex workspace-write limits writes and disables command network access. Changing the folder starts a new thread."),
-                InferenceProvider::Grok | InferenceProvider::Claude => text(language,
+                InferenceProvider::Grok | InferenceProvider::Claude | InferenceProvider::Gpt => text(language,
                     "CLIはこのフォルダーで動きます。フォルダーを変えるとCLIのセッションを新しく始めます。",
                     "The CLI runs in this folder. Changing the folder starts a new CLI session."),
             };
@@ -210,16 +200,14 @@ impl TacetaApp {
     /// a run that can be resumed, or a sign-in that is missing.
     pub(super) fn session_status_visible(&self) -> bool {
         match self.state.inference_provider {
-            InferenceProvider::Gpt => self.gpt_status_visible(),
-            InferenceProvider::Grok | InferenceProvider::Claude => self.cli_status_visible(),
+            InferenceProvider::Grok | InferenceProvider::Claude | InferenceProvider::Gpt => self.cli_status_visible(),
             InferenceProvider::Ollama => self.agent_status_visible(),
         }
     }
 
     pub(super) fn show_session_status(&mut self, ui: &mut Ui) {
         match self.state.inference_provider {
-            InferenceProvider::Gpt => self.show_gpt_status(ui),
-            InferenceProvider::Grok | InferenceProvider::Claude => self.show_cli_status(ui),
+            InferenceProvider::Grok | InferenceProvider::Claude | InferenceProvider::Gpt => self.show_cli_status(ui),
             InferenceProvider::Ollama => self.show_agent_status(ui),
         }
     }
@@ -241,8 +229,7 @@ impl TacetaApp {
                     "Show or hide the trace without stopping inference"));
             ui.separator();
             match self.state.inference_provider {
-                InferenceProvider::Gpt => self.show_gpt_menu_items(ui),
-                InferenceProvider::Grok | InferenceProvider::Claude => self.show_cli_menu_items(ui),
+                InferenceProvider::Grok | InferenceProvider::Claude | InferenceProvider::Gpt => self.show_cli_menu_items(ui),
                 InferenceProvider::Ollama => {
                     self.show_agent_menu_items(ui);
                     let label = if self.model_unload_result.is_some() {

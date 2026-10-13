@@ -2,7 +2,7 @@ use super::*;
 
 impl TacetaApp {
     pub(super) fn is_generating(&self) -> bool {
-        self.generation.is_some() || self.agent_ui.active.is_some() || self.gpt_ui.active.is_some()
+        self.generation.is_some() || self.agent_ui.active.is_some()
             || self.cli_ui.active.is_some() || self.compaction.is_some()
     }
 
@@ -10,7 +10,6 @@ impl TacetaApp {
         !self.is_generating()
             && self.model_pull.is_none()
             && self.model_unload_result.is_none()
-            && !self.gpt_ui.auth_busy()
     }
 
     pub(super) fn select_provider(&mut self, provider: InferenceProvider) {
@@ -71,12 +70,8 @@ impl TacetaApp {
         ui.heading(text(language, "推論の接続先", "Inference provider"));
         self.show_provider_selector(ui);
         ui.label(text(language,
-            "Ollamaは設定したサーバーを使います。GPTはOpenAI、GrokはxAI、ClaudeはAnthropicへ、会話と作業に必要な内容を送ります。GrokとClaudeは、このMacに入っている各社の公式CLIを、あなた自身のログインと設定のまま使います。サインインは各CLIで行ってください。",
-            "Ollama uses your configured server. GPT sends task context to OpenAI, Grok to xAI and Claude to Anthropic. Grok and Claude run each vendor's official CLI installed on this Mac with your own login and settings. Sign in with each CLI itself."));
-        ui.add_space(8.0);
-        if self.state.inference_provider == InferenceProvider::Gpt {
-            self.show_gpt_settings(ui);
-        }
+            "Ollamaは設定したサーバーを使います。GPTはOpenAI、GrokはxAI、ClaudeはAnthropicへ、会話と作業に必要な内容を送ります。GPT・Grok・Claudeは、このMacに入っている各社の公式CLI（Codex・Grok・Claude Code）を、あなた自身のログインと設定のまま使います。サインインは各CLIで行ってください。",
+            "Ollama uses your configured server. GPT sends task context to OpenAI, Grok to xAI and Claude to Anthropic. GPT, Grok and Claude run each vendor's official CLI (Codex, Grok, Claude Code) installed on this Mac with your own login and settings. Sign in with each CLI itself."));
         ui.add_space(20.0);
     }
 }

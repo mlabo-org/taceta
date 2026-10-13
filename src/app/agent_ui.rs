@@ -201,10 +201,6 @@ impl AgentUiState {
 
 impl TacetaApp {
     pub(super) fn show_agent_settings(&mut self, ui: &mut Ui) {
-        if self.state.inference_provider == InferenceProvider::Gpt {
-            self.show_gpt_run_settings(ui);
-            return;
-        }
         let language = self.language();
         ui.heading(text(
             language,
@@ -628,13 +624,6 @@ impl TacetaApp {
     /// the messages a run has just imported into that record.
     pub(super) fn remember_agent_snapshot(&mut self, snapshot: SessionSnapshot, imported: &[Uuid]) {
         let id = snapshot.id;
-        if self.state.conversations.iter().any(|conversation| conversation.id == id && conversation.is_gpt()) {
-            return;
-        }
-        if self.state.conversations.iter().any(|conversation| conversation.id == id && conversation.has_gpt_history())
-            && self.agent_ui.snapshots.get(&id).is_some_and(|current| current.event_count > snapshot.event_count) {
-            return;
-        }
         if !self
             .state
             .conversations
@@ -688,9 +677,6 @@ impl TacetaApp {
                 // handed over twice, never skipped.
                 if !not_in_record.is_empty() && conversation.messages.len() != in_record {
                     for session in conversation.cli_sessions.values_mut() {
-                        session.seen_messages = session.seen_messages.min(in_record);
-                    }
-                    if let Some(session) = conversation.gpt.as_mut() {
                         session.seen_messages = session.seen_messages.min(in_record);
                     }
                     if let Some(summary) = conversation.summary.as_mut() {
@@ -862,12 +848,8 @@ impl TacetaApp {
     }
 
     pub(super) fn archive_agent_chats(&mut self, ids: &[Uuid]) -> bool {
-        let ids = ids.iter().copied().filter(|id| {
-            !self.state.conversations.iter().any(|conversation| conversation.id == *id && conversation.is_gpt()
-                && !conversation.gpt.as_ref().is_some_and(|session| session.handoff_from_taceta))
-        }).collect::<Vec<_>>();
         let root = self.agent_ui.data_root.clone();
-        for id in &ids {
+        for id in ids {
             if let Err(error) = AgentSession::archive(&root, *id) {
                 self.notice = Some(Notice {
                     kind: NoticeKind::Error,
@@ -988,7 +970,7 @@ mod tests {
     use crate::app::model_manager_tests::{RecordingServices, test_app};
 
     #[test]
-    fn gpt_owned_conversation_is_never_overwritten_by_an_old_agent_snapshot() {
+    fn a_conversation_now_answered_by_another_engine_is_not_overwritten_by_its_old_task_record() {
         let mut app = test_app(Arc::new(RecordingServices::default()));
         app.state.switch_provider(InferenceProvider::Gpt);
         let id = app.state.active_conversation_id;
@@ -1003,7 +985,6 @@ mod tests {
         }, &[]);
         assert_eq!(app.state.active_conversation().messages[0].content, "Current GPT result");
         assert!(app.state.active_conversation().workspace.is_none());
-        assert!(!app.agent_ui.snapshots.contains_key(&id));
     }
 
     #[test]

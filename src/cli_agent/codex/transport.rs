@@ -42,8 +42,8 @@ fn decode(line: &str) -> Result<WireMessage, String> {
     Ok(WireMessage::Response { id, result })
 }
 
-/// Owns one process group. Dropping an abandoned login/run never leaves its
-/// callback server or tool processes behind, and never targets another Codex.
+/// Owns one process group. Dropping an abandoned run never leaves its tool
+/// processes behind, and never targets another Codex.
 struct OwnedProcess {
     child: Child,
     group: Option<i32>,
@@ -73,31 +73,24 @@ pub(super) struct Connection {
 }
 
 impl Connection {
-    pub async fn spawn(executable: &Path, home: &Path, cwd: &Path, chat: bool) -> Result<Self, String> {
+    /// Starts the App Server with the user's own environment, so the CLI
+    /// finds its normal login and settings. `no_tools` starts it for a
+    /// conversation only: nothing that acts or reaches out is available.
+    pub async fn spawn(executable: &Path, cwd: &Path, no_tools: bool) -> Result<Self, String> {
         let mut command = Command::new(executable);
-        // Do not inherit API credentials, proxy/provider routing, remote host
-        // settings, or another Codex client's private execution environment.
-        command.env_clear();
-        for name in ["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE"] {
-            if let Some(value) = std::env::var_os(name) { command.env(name, value); }
-        }
         command.arg("app-server").arg("--listen").arg("stdio://")
-            .env("CODEX_HOME", home)
             .current_dir(cwd)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
             .kill_on_drop(true);
-        // These are process-local overrides, never writes to the user's Codex config.
-        for setting in [
-            "cli_auth_credentials_store=\"keyring\"", "forced_login_method=\"chatgpt\"",
-            "model_provider=\"openai\"", "web_search=\"disabled\"", "allow_login_shell=false",
-            "features.hooks=false", "features.plugin_hooks=false", "features.apps=false",
-            "features.plugins=false", "features.remote_plugin=false",
-            "features.shell_snapshot=false", "features.shell_snapshot_v2=false",
-        ] { command.arg("-c").arg(setting); }
-        if chat {
-            for setting in ["features.shell_tool=false", "features.multi_agent=false", "features.multi_agent_v2=false"] {
-                command.arg("-c").arg(setting);
-            }
+        if no_tools {
+            // Process-local overrides, never writes to the user's Codex config.
+            for setting in [
+                "web_search=\"disabled\"", "allow_login_shell=false",
+                "features.hooks=false", "features.plugin_hooks=false", "features.apps=false",
+                "features.plugins=false", "features.remote_plugin=false",
+                "features.shell_snapshot=false", "features.shell_snapshot_v2=false",
+                "features.shell_tool=false", "features.multi_agent=false", "features.multi_agent_v2=false",
+            ] { command.arg("-c").arg(setting); }
         }
         #[cfg(unix)]
         {
@@ -232,7 +225,7 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
 
     #[tokio::test]
-    async fn gpt_jsonl_correlates_rpc_and_retains_early_notifications() {
+    async fn rpc_answers_are_matched_and_earlier_notifications_kept_in_order() {
         let (client, server) = duplex(4096);
         let (read, write) = split(client);
         let mut connection = Connection::from_io(read, write);
@@ -252,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt_wire_ids_and_protocol_errors_are_not_silently_coerced() {
+    fn request_ids_and_protocol_errors_are_not_silently_coerced() {
         assert!(matches!(decode(r#"{"id":"server-1","method":"approve","params":{}}"#).unwrap(), WireMessage::Request { id, .. } if id == "server-1"));
         assert!(matches!(decode(r#"{"id":7,"error":{"message":"denied"}}"#).unwrap(), WireMessage::Response { result: Err(message), .. } if message == "denied"));
         assert!(decode(r#"{"id":{},"result":{}}"#).is_err());
