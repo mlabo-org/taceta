@@ -36,7 +36,28 @@ const NOT_FOUND: &str = "The Codex CLI (`codex`) was not found on PATH or in the
 #[derive(Clone, Default)]
 pub struct CodexCli { coordination: Arc<Mutex<Option<Kept>>> }
 
-struct Kept { connection: Connection, no_tools: bool }
+struct Kept { connection: Connection, served: Served }
+
+/// What the kept App Server last ran. A thread it still holds is rejoined
+/// as it stands: a model or permissions asked for on resuming it are not
+/// applied, so only an identical request may use the same server again.
+#[derive(Clone, PartialEq, Eq)]
+struct Served { thread_id: String, cwd: PathBuf, model: Option<String>, approval: ApprovalPolicy }
+
+impl Served {
+    fn serves(&self, request: &RunRequest, cwd: &Path) -> bool {
+        let no_tools = |approval| approval == ApprovalPolicy::NoTools;
+        // The server itself is started differently for a conversation without tools.
+        no_tools(self.approval) == no_tools(request.approval)
+            && match &request.session_id {
+                // A new thread takes what it is started with.
+                None => true,
+                Some(thread_id) => {
+                    *thread_id == self.thread_id && cwd == self.cwd && request.model == self.model && request.approval == self.approval
+                }
+            }
+    }
+}
 
 /// Ends the kept App Server. Everything except a turn starts from a new one.
 async fn release(kept: &mut Option<Kept>) {
@@ -107,12 +128,12 @@ impl CliAgent for CodexCli {
             let setup = async {
                 let cwd = tokio::fs::canonicalize(&request.workspace).await.map_err(|error| format!("Could not open the workspace: {error}"))?;
                 if !tokio::fs::metadata(&cwd).await.map_err(|error| error.to_string())?.is_dir() { return Err("The workspace must be a directory.".to_owned()); }
-                // The kept App Server is used again when it was started the
-                // same way, nothing unexpected arrived while it was idle, and
+                // The kept App Server is used again when it can serve this
+                // request, nothing unexpected arrived while it was idle, and
                 // it still answers. Otherwise it is ended and a new one starts.
                 let mut reused = None;
                 if let Some(mut kept) = kept {
-                    if kept.no_tools == no_tools && kept.connection.discard_idle() && require_account(&mut kept.connection).await.is_ok() {
+                    if kept.served.serves(&request, &cwd) && kept.connection.discard_idle() && require_account(&mut kept.connection).await.is_ok() {
                         kept.connection.discard_idle();
                         reused = Some(kept.connection);
                     } else {
@@ -140,6 +161,7 @@ impl CliAgent for CodexCli {
                 },
             };
             let session_id = Some(prepared.thread_id.clone());
+            let served = Served { thread_id: prepared.thread_id.clone(), cwd: cwd.clone(), model: request.model.clone(), approval: request.approval };
             let _ = events.send(Event::SessionReady { session_id: prepared.thread_id.clone() });
             let mut state = RunState::new(prepared.thread_id, &request, events.clone());
             let result = match cwd.to_str() {
@@ -149,7 +171,7 @@ impl CliAgent for CodexCli {
             state.resolve_all();
             // Only a turn that ran to its end leaves the App Server in a known
             // state worth keeping for the next one.
-            if matches!(result, Ok((RunStatus::Completed, None))) { *guard = Some(Kept { connection, no_tools }); }
+            if matches!(result, Ok((RunStatus::Completed, None))) { *guard = Some(Kept { connection, served }); }
             else { connection.shutdown().await; }
             match result {
                 Ok((status, error)) => RunOutcome { session_id, status, error },
@@ -312,6 +334,23 @@ mod tests {
     use protocol::tests::request;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn a_kept_server_is_used_again_only_for_a_request_it_would_answer_the_same_way() {
+        let served = Served { thread_id: "thread".into(), cwd: "/workspace".into(), model: Some("model".into()), approval: ApprovalPolicy::AskEveryTime };
+        let cwd = Path::new("/workspace");
+        let again = || RunRequest { session_id: Some("thread".into()), ..request(ApprovalPolicy::AskEveryTime) };
+        assert!(served.serves(&again(), cwd));
+        // A thread the server holds keeps its model and permissions on resume.
+        assert!(!served.serves(&RunRequest { model: Some("other-model".into()), ..again() }, cwd));
+        assert!(!served.serves(&RunRequest { approval: ApprovalPolicy::FollowCli, ..again() }, cwd));
+        assert!(!served.serves(&again(), Path::new("/elsewhere")));
+        assert!(!served.serves(&RunRequest { session_id: Some("another".into()), ..again() }, cwd));
+        // A new thread takes what it is started with, unless the server was
+        // started for the other kind of conversation.
+        assert!(served.serves(&RunRequest { model: Some("other-model".into()), ..request(ApprovalPolicy::FollowCli) }, cwd));
+        assert!(!served.serves(&request(ApprovalPolicy::NoTools), cwd));
+    }
 
     #[tokio::test]
     async fn stopping_interrupts_the_running_turn_and_waits_for_its_end() {
