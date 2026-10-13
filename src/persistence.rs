@@ -136,6 +136,15 @@ impl Conversation {
         self.is_gpt() || !self.archived_gpt_thread_ids.is_empty() || self.gpt_ownership_revision > 0
     }
 
+    /// Whether this conversation works in a folder (Code) rather than only
+    /// talking (Chat). Each engine keeps the choice in its own field.
+    pub fn is_code(&self) -> bool {
+        match self.provider {
+            Some(InferenceProvider::Grok | InferenceProvider::Claude) => !self.cli_chat,
+            _ => self.agent_enabled,
+        }
+    }
+
     pub fn has_history(&self) -> bool {
         !self.messages.is_empty()
             || self.gpt.as_ref().is_some_and(|gpt| gpt.thread_id.is_some())

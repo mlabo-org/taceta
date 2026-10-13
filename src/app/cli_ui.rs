@@ -36,6 +36,12 @@ pub(super) struct ActiveCli {
     no_tools: bool,
 }
 
+impl ActiveCli {
+    pub(super) fn conversation(&self) -> Uuid {
+        self.conversation_id
+    }
+}
+
 pub(super) struct CliUiState {
     claude: Arc<dyn CliAgent>,
     grok: Arc<dyn CliAgent>,
@@ -116,139 +122,108 @@ impl TacetaApp {
         });
     }
 
-    pub(super) fn show_cli_controls(&mut self, root_ui: &mut Ui) {
+    /// The CLI could not be checked, or is not signed in.
+    fn cli_problem(&self) -> Option<String> {
+        match self.cli_ui.readiness.get(&self.state.inference_provider)? {
+            Ok(readiness) => (readiness.signed_in == Some(false)).then(|| text(
+                self.language(),
+                "CLIにサインインしていません。ターミナルでCLIを起動してサインインしてください。",
+                "The CLI is not signed in. Start it in a terminal and sign in there.",
+            ).to_owned()),
+            Err(error) => Some(error.clone()),
+        }
+    }
+
+    pub(super) fn cli_status_visible(&self) -> bool {
+        self.cli_problem().is_some()
+    }
+
+    pub(super) fn show_cli_status(&mut self, ui: &mut Ui) {
+        if let Some(problem) = self.cli_problem() {
+            ui.add(egui::Label::new(RichText::new(problem).small().color(theme::palette(ui).error)).truncate());
+        }
+    }
+
+    /// Who approves what a coding CLI does: Taceta each time, or the CLI's
+    /// own settings. Always in view, and marked when nothing is asked here.
+    pub(super) fn show_cli_approval_chip(&mut self, ui: &mut Ui) {
+        if self.state.active_conversation().cli_chat {
+            return;
+        }
         let language = self.language();
-        let provider = self.state.inference_provider;
-        super::controls_strip(root_ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                self.show_provider_selector(ui);
-                if self.state.inference_provider != provider {
-                    return;
-                }
-                let chat = self.state.active_conversation().cli_chat;
-                let mut selected = chat;
-                ui.add_enabled_ui(!self.is_generating(), |ui| {
-                    ui.selectable_value(&mut selected, true, text(language, "チャット", "Chat"));
-                    ui.selectable_value(&mut selected, false, text(language, "作業", "Task"));
-                });
-                if selected != chat {
-                    let conversation = self.state.active_conversation_mut();
-                    conversation.cli_chat = selected;
-                    // A CLI session belongs to the folder and tools it was started with.
-                    conversation.cli_sessions.clear();
-                }
-                if selected {
-                    return;
-                }
-                let workspace = self.state.active_conversation().workspace.clone();
-                let label = workspace
-                    .as_ref()
-                    .and_then(|path| path.file_name())
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| text(language, "作業フォルダーを選ぶ", "Choose workspace").into());
-                if ui
-                    .add_enabled(!self.is_generating(), Button::new(label))
-                    .on_hover_text(workspace.map(|path| path.display().to_string()).unwrap_or_default())
-                    .clicked()
-                {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        let conversation = self.state.active_conversation_mut();
-                        if conversation.workspace.as_ref() != Some(&path) {
-                            // A CLI session belongs to the folder it was started in.
-                            conversation.cli_sessions.clear();
-                            conversation.workspace = Some(path);
-                        }
-                    }
-                }
-                ui.separator();
-                ui.label(text(language, "操作の承認", "Approval"));
-                ui.add_enabled_ui(!self.is_generating(), |ui| {
-                    ui.selectable_value(
-                        &mut self.state.cli_ask_every_time,
-                        true,
-                        text(language, "毎回確認", "Ask every time"),
-                    );
-                    ui.selectable_value(
-                        &mut self.state.cli_ask_every_time,
-                        false,
-                        text(language, "自動承認", "Automatic"),
-                    );
-                });
+        let control = app_shell_control_metrics(ui.ctx());
+        let ask = self.state.cli_ask_every_time;
+        let label = if ask {
+            RichText::new(text(language, "毎回確認", "Ask every time"))
+        } else {
+            RichText::new(text(language, "自動承認", "Automatic")).color(theme::palette(ui).warning)
+        };
+        let mut selected = ask;
+        ui.add_enabled_ui(!self.is_generating(), |ui| {
+            let (response, _) = egui::containers::menu::MenuButton::from_button(
+                Button::new(label)
+                    .min_size(Vec2::new(0.0, control.row_height))
+                    .right_text("▼")
+                    .corner_radius(control.row_height / 2.0),
+            )
+            .ui(ui, |ui| {
+                ui.spacing_mut().button_padding.y = control.vertical_padding;
+                show_app_shell_menu_row(ui, &mut selected, true, text(language, "毎回確認", "Ask every time"));
+                show_app_shell_menu_row(ui, &mut selected, false, text(language, "自動承認", "Automatic"));
             });
-            if self.state.inference_provider != provider {
-                return;
-            }
-            ui.label(
-                RichText::new(if self.state.active_conversation().cli_chat {
-                    text(
-                        language,
-                        "会話だけを行います。ファイルの読み書きもコマンドの実行もしません。作業フォルダーは使いません。",
-                        "Conversation only. No file is read or changed and no command runs. No workspace is used.",
-                    )
-                } else if self.state.cli_ask_every_time {
-                    text(
-                        language,
-                        "ファイルの変更とコマンドの実行は、1件ずつこの画面で確認します。",
-                        "Each file change and command is confirmed here before it runs.",
-                    )
-                } else {
-                    text(
-                        language,
-                        "CLI自身の権限設定に従います。設定によっては確認なしでファイルの変更とコマンドの実行が行われます。",
-                        "The CLI's own permission settings decide. Depending on them, files change and commands run without confirmation.",
-                    )
-                })
-                .small()
-                .color(if self.state.cli_ask_every_time || self.state.active_conversation().cli_chat {
-                    ui.visuals().weak_text_color()
-                } else {
-                    theme::palette(ui).warning
-                }),
-            );
-            match self.cli_ui.readiness.get(&provider) {
-                Some(Ok(readiness)) => {
-                    let version = readiness.version.clone().unwrap_or_default();
-                    let line = match readiness.signed_in {
-                        Some(false) => text(
-                            language,
-                            "CLIにサインインしていません。ターミナルでCLIを起動してサインインしてください。",
-                            "The CLI is not signed in. Start it in a terminal and sign in there.",
-                        )
-                        .to_owned(),
-                        _ => format!(
-                            "{version} · {}",
-                            text(
-                                language,
-                                "普段のCLIのログインと設定を使います。会話の文脈はCLIが管理します。",
-                                "Uses your normal CLI login and settings. The CLI manages its own context.",
-                            )
-                        ),
-                    };
-                    ui.label(RichText::new(line).small().weak());
-                }
-                Some(Err(error)) => {
-                    ui.colored_label(theme::palette(ui).error, error);
-                }
-                None => {}
-            }
-            if let Some(usage) = &self.state.active_conversation().cli_usage {
-                ui.label(
-                    RichText::new(format!(
-                        "{}: {} / {} · {}: {}",
-                        text(language, "入力 / 出力トークン", "Input / output tokens"),
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        text(language, "コンテキスト上限", "Context capacity"),
-                        usage
-                            .context_window
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| text(language, "未取得", "Unavailable").into())
-                    ))
-                    .small()
-                    .weak(),
-                );
-            }
+            response.on_hover_text(if ask {
+                text(
+                    language,
+                    "操作の承認：ファイルの変更とコマンドの実行は、1件ずつこの画面で確認します。",
+                    "Approval: each file change and command is confirmed here before it runs.",
+                )
+            } else {
+                text(
+                    language,
+                    "操作の承認：CLI自身の権限設定に従います。設定によっては確認なしでファイルの変更とコマンドの実行が行われます。",
+                    "Approval: the CLI's own permission settings decide. Depending on them, files change and commands run without confirmation.",
+                )
+            });
         });
+        self.state.cli_ask_every_time = selected;
+    }
+
+    pub(super) fn show_cli_menu_items(&mut self, ui: &mut Ui) {
+        let language = self.language();
+        let version = match self.cli_ui.readiness.get(&self.state.inference_provider) {
+            Some(Ok(readiness)) => readiness.version.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        ui.label(RichText::new(format!("{version} · {}", if self.state.active_conversation().cli_chat {
+            text(
+                language,
+                "会話だけを行います。ファイルの読み書きもコマンドの実行もしません。フォルダーは使いません。",
+                "Conversation only. No file is read or changed and no command runs. No folder is used.",
+            )
+        } else {
+            text(
+                language,
+                "普段のCLIのログインと設定を使います。会話の文脈はCLIが管理します。",
+                "Uses your normal CLI login and settings. The CLI manages its own context.",
+            )
+        })).small().weak());
+        if let Some(usage) = &self.state.active_conversation().cli_usage {
+            ui.label(
+                RichText::new(format!(
+                    "{}: {} / {} · {}: {}",
+                    text(language, "入力 / 出力トークン", "Input / output tokens"),
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    text(language, "コンテキスト上限", "Context capacity"),
+                    usage
+                        .context_window
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| text(language, "未取得", "Unavailable").into())
+                ))
+                .small()
+                .weak(),
+            );
+        }
     }
 
     pub(super) fn start_cli_send(&mut self) {
@@ -279,7 +254,7 @@ impl TacetaApp {
         } else {
             self.notice = Some(Notice {
                 kind: NoticeKind::Warning,
-                text: text(language, "作業フォルダーを選ぶか、「チャット」に切り替えてください。", "Choose a workspace, or switch to Chat.").to_owned(),
+                text: text(language, "フォルダーを選ぶか、「Chat」に切り替えてください。", "Choose a folder, or switch to Chat.").to_owned(),
             });
             return;
         };
@@ -543,8 +518,8 @@ impl TacetaApp {
             if conversation.messages.is_empty() {
                 ui.label(text(
                     language,
-                    "作業フォルダーとモデルを選び、実行したいことを入力してください。",
-                    "Choose a workspace and model, then describe the work.",
+                    "フォルダーとモデルを選び、実行したいことを入力してください。",
+                    "Choose a folder and model, then describe the work.",
                 ));
             }
             for message in &conversation.messages {

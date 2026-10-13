@@ -22,6 +22,12 @@ pub(super) struct ActiveGpt {
     submitted_prompt: Option<(String, Vec<Attachment>)>,
 }
 
+impl ActiveGpt {
+    pub(super) fn conversation(&self) -> Uuid {
+        self.conversation_id
+    }
+}
+
 struct PendingQuestions {
     id: Uuid,
     questions: Vec<GptQuestion>,
@@ -152,69 +158,60 @@ impl TacetaApp {
         ui.add_space(20.0);
     }
 
-    pub(super) fn show_gpt_controls(&mut self, root_ui: &mut Ui) {
+    /// The Codex thread's status, whether it exists, and whether a handoff waits.
+    fn gpt_session(&self) -> Option<(GptRunStatus, bool, bool)> {
+        self.state.active_conversation().gpt.as_ref()
+            .map(|session| (session.status, session.thread_id.is_some(), session.pending_handoff))
+    }
+
+    fn gpt_needs_sign_in(&self) -> bool {
+        self.gpt_ui.login.is_some() || self.gpt_ui.logout.is_some() || !matches!(self.connection, ConnectionState::Ready)
+    }
+
+    pub(super) fn gpt_status_visible(&self) -> bool {
+        self.gpt_needs_sign_in()
+            || self.gpt_session().is_some_and(|(status, has_thread, pending_handoff)| {
+                pending_handoff
+                    || (has_thread && matches!(status, GptRunStatus::Interrupted | GptRunStatus::LimitReached | GptRunStatus::Failed))
+            })
+    }
+
+    /// Sign-in when it is missing; otherwise a run that stopped short or a
+    /// handoff that the next request carries.
+    pub(super) fn show_gpt_status(&mut self, ui: &mut Ui) {
         let language = self.language();
-        super::controls_strip(root_ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                self.show_provider_selector(ui);
-                if self.state.inference_provider != InferenceProvider::Gpt { return; }
-                let coding = self.state.active_conversation().agent_enabled;
-                let mut selected = coding;
-                ui.add_enabled_ui(!self.is_generating(), |ui| {
-                    ui.selectable_value(&mut selected, false, text(language, "チャット", "Chat"));
-                    ui.selectable_value(&mut selected, true, text(language, "作業", "Coding"));
-                });
-                if selected != coding {
-                    let workspace = selected.then(|| self.state.active_conversation().workspace.clone()).flatten();
-                    self.state.configure_gpt_environment(selected, workspace);
-                }
-                if selected {
-                    let workspace = self.state.active_conversation().workspace.clone();
-                    let label = workspace.as_ref().and_then(|path| path.file_name())
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| text(language, "作業フォルダーを選ぶ", "Choose workspace").into());
-                    if ui.add_enabled(!self.is_generating(), Button::new(label))
-                        .on_hover_text(workspace.map(|path| path.display().to_string()).unwrap_or_default()).clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.state.configure_gpt_environment(true, Some(path));
-                        }
-                    }
-                }
-                let session = self.state.active_conversation().gpt.as_ref()
-                    .map(|session| (session.status, session.thread_id.is_some(), session.pending_handoff));
-                if let Some((status, has_thread, pending_handoff)) = session {
-                    ui.label(gpt_status_label(language, status));
-                    if has_thread || pending_handoff {
-                        if ui.add_enabled(!self.is_generating(), Button::new(text(language, "続行", "Continue"))).clicked() {
-                            self.start_gpt_action(GptAction::Continue);
-                        }
-                        if ui.add_enabled(!self.is_generating() && !pending_handoff, Button::new(text(language, "コンテキストを整理", "Compact context"))).clicked() {
-                            self.start_gpt_action(GptAction::Compact);
-                        }
-                    }
-                }
-            });
-            if self.state.inference_provider != InferenceProvider::Gpt { return; }
+        if self.gpt_needs_sign_in() {
             self.show_gpt_login_controls(ui, false);
-            ui.label(RichText::new(text(language,
-                "GPTはCodexのスレッドで動きます。モードや作業フォルダーを変えると新しいスレッドを始め、これまでの会話を次の送信で渡します。",
-                "GPT runs in a Codex thread. Changing mode or workspace starts a new thread, and the conversation so far is handed over with the next request.")).small().weak());
-            if self.state.active_conversation().gpt.as_ref().is_some_and(|session| session.pending_handoff) {
-                ui.label(RichText::new(text(language,
-                    "次の送信・続行で、保存した目的・指示・作業状態をGPTへ引き継ぎます。元の作業記録も残します。",
-                    "The next Send or Continue hands the saved goal, instructions and work state to GPT. Original task records are preserved.")).small());
-            }
-            ui.label(RichText::new(if self.state.active_conversation().agent_enabled {
-                text(language,
-                    "Codexのworkspace-writeで書き込みを制限し、コマンドの通信を無効にします。承認の要否はCodexのポリシーに従います。",
-                    "Codex workspace-write limits writes and disables command network access. Codex's policy determines when approval is required.")
-            } else {
-                text(language,
-                    "チャットでは作業環境へのアクセスを無効にします。Taceta Linkは使いません。",
-                    "Chat disables access to the working environment. Taceta Link is not used.")
-            }).small().weak());
-            self.show_gpt_usage(ui);
-        });
+            return;
+        }
+        let Some((status, _, pending_handoff)) = self.gpt_session() else { return };
+        ui.label(RichText::new(if pending_handoff {
+            text(language,
+                "次の送信・続行で、保存した目的・指示・作業状態をGPTへ引き継ぎます。",
+                "The next Send or Continue hands the saved goal, instructions and work state to GPT.")
+        } else {
+            gpt_status_label(language, status)
+        }).small().weak());
+        if ui.add_enabled(!self.is_generating(), Button::new(text(language, "続行", "Continue"))).clicked() {
+            self.start_gpt_action(GptAction::Continue);
+        }
+    }
+
+    pub(super) fn show_gpt_menu_items(&mut self, ui: &mut Ui) {
+        let language = self.language();
+        let (has_thread, pending_handoff) = self.gpt_session()
+            .map_or((false, false), |(_, has_thread, pending_handoff)| (has_thread, pending_handoff));
+        if ui.add_enabled(!self.is_generating() && (has_thread || pending_handoff), Button::new(text(language, "続行", "Continue"))).clicked() {
+            self.start_gpt_action(GptAction::Continue);
+        }
+        if ui.add_enabled(!self.is_generating() && has_thread && !pending_handoff, Button::new(text(language, "コンテキストを整理", "Compact context"))).clicked() {
+            self.start_gpt_action(GptAction::Compact);
+        }
+        ui.separator();
+        ui.label(RichText::new(text(language,
+            "GPTはCodexのスレッドで動きます。モードやフォルダーを変えると新しいスレッドを始め、これまでの会話を次の送信で渡します。",
+            "GPT runs in a Codex thread. Changing mode or folder starts a new thread, and the conversation so far is handed over with the next request.")).small().weak());
+        self.show_gpt_usage(ui);
     }
 
     pub(super) fn show_gpt_usage(&self, ui: &mut Ui) {
@@ -259,7 +256,7 @@ impl TacetaApp {
         let mode = if conversation.agent_enabled { GptMode::Coding } else { GptMode::Chat };
         if mode == GptMode::Coding && conversation.workspace.is_none() {
             self.notice = Some(Notice { kind: NoticeKind::Warning,
-                text: text(language, "作業フォルダーを選んでください。", "Choose a workspace.").into() });
+                text: text(language, "フォルダーを選んでください。", "Choose a folder.").into() });
             return false;
         }
         if let GptAction::Send { attachments, .. } = &action {
@@ -583,8 +580,8 @@ impl TacetaApp {
             let conversation = app.state.active_conversation();
             if conversation.messages.is_empty() {
                 ui.label(text(language,
-                    "作業フォルダーとモデルを選び、実行したいことを入力してください。普通の会話には「チャット」を選べます。",
-                    "Choose a workspace and model, then describe the work. Select Chat for an ordinary conversation."));
+                    "フォルダーとモデルを選び、実行したいことを入力してください。普通の会話には「Chat」を選べます。",
+                    "Choose a folder and model, then describe the work. Select Chat for an ordinary conversation."));
             }
             for message in &conversation.messages { app.show_message(ui, message, false); }
             if let Some(session) = &conversation.gpt {

@@ -6,7 +6,7 @@ impl TacetaApp {
             || self.cli_ui.active.is_some() || self.compaction.is_some()
     }
 
-    fn can_change_provider(&self) -> bool {
+    pub(super) fn can_change_provider(&self) -> bool {
         !self.is_generating()
             && self.model_pull.is_none()
             && self.model_unload_result.is_none()

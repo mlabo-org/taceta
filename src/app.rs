@@ -12,6 +12,7 @@ mod cli_ui;
 mod compaction;
 mod gpt_ui;
 mod provider_ui;
+mod session_ui;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use eframe::egui::{
@@ -60,11 +61,15 @@ const COMPOSER_EDITOR_MIN_HEIGHT: f32 = 58.0;
 const COMPOSER_EDITOR_MAX_HEIGHT: f32 = 420.0;
 const COMPOSER_EDITOR_MAX_HEIGHT_FRACTION: f32 = 0.42;
 const COMPOSER_PANEL_BASE_HEIGHT: f32 = 154.0;
+/// Space between the lines of the composer: folder, status, editor, controls.
+const COMPOSER_LINE_GAP: f32 = 8.0;
 const COMPOSER_ATTACHMENT_EXTRA_HEIGHT: f32 = 30.0;
 const COMPOSER_CARD_INNER_MARGIN: f32 = 12.0;
 const SIDEBAR_WIDTH: f32 = 260.0;
 const SIDEBAR_FOOTER_HEIGHT: f32 = 50.0;
 const SIDEBAR_ROW_HEIGHT: f32 = 32.0;
+/// How many conversations without a folder the sidebar lists before "show more".
+const SIDEBAR_UNFOLDED_CONVERSATIONS: usize = 10;
 const READING_COLUMN_WIDTH: f32 = 780.0;
 const READING_COLUMN_MARGIN: f32 = 24.0;
 const MESSAGE_GAP: f32 = 18.0;
@@ -162,6 +167,10 @@ pub struct TacetaApp {
     conversation_title_editor: Option<ConversationTitleEditor>,
     conversation_delete_confirmation: Option<ConversationDeleteConfirmation>,
     conversation_bulk_delete_mode: bool,
+    /// What the sidebar's search field holds; the list shows matching titles.
+    conversation_search: String,
+    /// Whether the conversations that work in no folder are all listed, or only the newest.
+    conversations_expanded: bool,
     conversation_bulk_selection: HashSet<Uuid>,
     conversation_bulk_delete_confirmation: Option<ConversationBulkDeleteConfirmation>,
     scroll_to_bottom: bool,
@@ -349,6 +358,8 @@ impl TacetaApp {
             conversation_title_editor: None,
             conversation_delete_confirmation: None,
             conversation_bulk_delete_mode: false,
+            conversation_search: String::new(),
+            conversations_expanded: false,
             conversation_bulk_selection: HashSet::new(),
             conversation_bulk_delete_confirmation: None,
             scroll_to_bottom: true,
@@ -1478,10 +1489,22 @@ impl TacetaApp {
 
     fn show_sidebar(&mut self, root_ui: &mut Ui) {
         let language = self.language();
+        let active_id = self.state.active_conversation_id;
+        let generating = self.is_generating();
+        let busy = self.busy_conversation();
+        let search = self.conversation_search.trim().to_lowercase();
+        // A conversation nothing was sent in yet is listed only while it is
+        // open, or when conversations are being picked for deletion.
+        let select_for_deletion = self.conversation_bulk_delete_mode;
+        let listed = |conversation: &&crate::persistence::Conversation| {
+            (select_for_deletion || conversation.id == active_id || conversation.has_history() || !conversation.is_untitled())
+                && (search.is_empty() || conversation.title.to_lowercase().contains(&search))
+        };
         let history = self
             .state
             .conversations
             .iter()
+            .filter(listed)
             .map(|conversation| {
                 (
                     conversation.id,
@@ -1490,8 +1513,42 @@ impl TacetaApp {
                 )
             })
             .collect::<Vec<_>>();
-        let active_id = self.state.active_conversation_id;
-        let generating = self.is_generating();
+        // Code conversations are listed under the folder they work in, after
+        // the conversations that have none.
+        let folder_of = |id: Uuid| {
+            self.state
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == id)
+                .filter(|conversation| conversation.is_code())
+                .and_then(|conversation| conversation.workspace.clone())
+        };
+        let mut entries: Vec<SidebarEntry> = Vec::new();
+        let mut folders: Vec<PathBuf> = Vec::new();
+        for (index, (id, _, _)) in history.iter().enumerate() {
+            match folder_of(*id) {
+                None => entries.push(SidebarEntry::Conversation(index)),
+                Some(folder) if !folders.contains(&folder) => folders.push(folder),
+                Some(_) => {}
+            }
+        }
+        // The folders below stay in reach: only the newest conversations
+        // without one are listed until the rest are asked for or searched.
+        let hidden = entries.len().saturating_sub(SIDEBAR_UNFOLDED_CONVERSATIONS);
+        if hidden > 0 && search.is_empty() && !self.conversations_expanded && !self.conversation_bulk_delete_mode {
+            entries.truncate(SIDEBAR_UNFOLDED_CONVERSATIONS);
+            entries.push(SidebarEntry::More(hidden));
+        }
+        for folder in folders {
+            entries.push(SidebarEntry::Folder(folder.clone()));
+            entries.extend(
+                history
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (id, _, _))| folder_of(*id).as_ref() == Some(&folder))
+                    .map(|(index, _)| SidebarEntry::Conversation(index)),
+            );
+        }
         self.conversation_bulk_selection.retain(|id| {
             history
                 .iter()
@@ -1514,7 +1571,7 @@ impl TacetaApp {
                     .frame(egui::Frame::new().fill(palette.sidebar).inner_margin(egui::Margin::symmetric(0, 8)))
                     .show_inside(ui, |ui| {
                         let selected = matches!(self.screen, Screen::Settings | Screen::Models);
-                        if sidebar_row(ui, &format!("⚙  {}", text(language, "設定", "Settings")), selected).clicked() {
+                        if sidebar_row(ui, &format!("⚙  {}", text(language, "設定", "Settings")), selected, None).clicked() {
                             self.screen = Screen::Settings;
                         }
                     });
@@ -1526,10 +1583,26 @@ impl TacetaApp {
                 });
                 ui.add_space(12.0);
 
+                self.show_mode_switch(ui);
+                ui.add_space(6.0);
+                egui::Frame::new()
+                    .fill(palette.hover)
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(10, 5))
+                    .show(ui, |ui| {
+                        ui.add(
+                            TextEdit::singleline(&mut self.conversation_search)
+                                .hint_text(RichText::new(text(language, "検索", "Search")).color(palette.placeholder_text))
+                                .frame(egui::Frame::NONE)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                ui.add_space(6.0);
                 ui.add_enabled_ui(!generating && !self.conversation_bulk_delete_mode, |ui| {
-                    if sidebar_row(ui, &format!("＋  {}", text(language, "新しいチャット", "New chat")), false).clicked() {
-                        self.state.start_new_conversation();
-                        self.screen = Screen::Chat;
+                    if sidebar_row(ui, &format!("＋  {}", text(language, "新規", "New")), false, None).clicked() {
+                        let code = self.code_mode();
+                        let workspace = self.state.active_conversation().workspace.clone();
+                        self.start_conversation(code, workspace);
                     }
                 });
 
@@ -1608,9 +1681,9 @@ impl TacetaApp {
                     // and none lies under the footer below the list.
                     .show_viewport(ui, |ui, viewport| {
                         let pitch = SIDEBAR_ROW_HEIGHT + ui.spacing().item_spacing.y;
-                        ui.set_height((pitch * history.len() as f32 - ui.spacing().item_spacing.y).max(0.0));
-                        let first = ((viewport.min.y / pitch).floor().max(0.0) as usize).min(history.len());
-                        let last = ((viewport.max.y / pitch).ceil().max(0.0) as usize).clamp(first, history.len());
+                        ui.set_height((pitch * entries.len() as f32 - ui.spacing().item_spacing.y).max(0.0));
+                        let first = ((viewport.min.y / pitch).floor().max(0.0) as usize).min(entries.len());
+                        let last = ((viewport.max.y / pitch).ceil().max(0.0) as usize).clamp(first, entries.len());
                         let top = ui.max_rect().top() + first as f32 * pitch;
                         let rows = egui::Rect::from_min_max(
                             egui::pos2(ui.max_rect().left(), top),
@@ -1619,7 +1692,55 @@ impl TacetaApp {
                         let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rows));
                         let ui = &mut ui;
                         ui.skip_ahead_auto_ids(first);
-                        for (id, title, empty) in &history[first..last] {
+                        for entry in &entries[first..last] {
+                            let (id, title, empty) = match entry {
+                                SidebarEntry::Conversation(index) => &history[*index],
+                                SidebarEntry::More(hidden) => {
+                                    let label = match language {
+                                        AppShellLanguage::Japanese => format!("さらに{hidden}件を表示"),
+                                        AppShellLanguage::English => format!("Show {hidden} more"),
+                                    };
+                                    let more = ui.allocate_ui_with_layout(
+                                        Vec2::new(ui.available_width(), SIDEBAR_ROW_HEIGHT),
+                                        Layout::left_to_right(Align::Center),
+                                        |ui| {
+                                            ui.add_space(10.0);
+                                            ui.add(Button::new(RichText::new(label).weak()).frame(false)).clicked()
+                                        },
+                                    );
+                                    if more.inner {
+                                        self.conversations_expanded = true;
+                                    }
+                                    continue;
+                                }
+                                SidebarEntry::Folder(folder) => {
+                                    let name = folder.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                                    let add = ui
+                                        .allocate_ui_with_layout(
+                                            Vec2::new(ui.available_width(), SIDEBAR_ROW_HEIGHT),
+                                            Layout::left_to_right(Align::BOTTOM),
+                                            |ui| {
+                                                ui.add_space(10.0);
+                                                ui.add(egui::Label::new(RichText::new(name).small().weak()).truncate())
+                                                    .on_hover_text(folder.display().to_string());
+                                                ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
+                                                    ui.add_enabled(
+                                                        !generating && !self.conversation_bulk_delete_mode,
+                                                        Button::new(RichText::new("＋").weak()).frame(false),
+                                                    )
+                                                    .on_hover_text(text(language, "このフォルダーで新規", "New in this folder"))
+                                                    .clicked()
+                                                })
+                                                .inner
+                                            },
+                                        )
+                                        .inner;
+                                    if add {
+                                        self.start_conversation(true, Some(folder.clone()));
+                                    }
+                                    continue;
+                                }
+                            };
                             let (id, empty) = (*id, *empty);
                             let display_title = if empty {
                                 text(language, "新しいチャット", "New chat")
@@ -1630,7 +1751,7 @@ impl TacetaApp {
                                 ui.horizontal(|ui| {
                                     let mut checked = self.conversation_bulk_selection.contains(&id);
                                     let checkbox_changed = ui.checkbox(&mut checked, "").changed();
-                                    let row_clicked = sidebar_row(ui, display_title, checked).clicked();
+                                    let row_clicked = sidebar_row(ui, display_title, checked, None).clicked();
                                     if row_clicked {
                                         checked = !checked;
                                     }
@@ -1647,7 +1768,7 @@ impl TacetaApp {
                             let mut rename_requested = false;
                             let mut delete_requested = false;
                             let current = id == active_id && self.screen == Screen::Chat;
-                            let row = sidebar_row(ui, display_title, current);
+                            let row = sidebar_row(ui, display_title, current, Some(busy == Some(id)));
                             // The row's actions appear on the row the pointer
                             // is on, the current one, and the one whose menu is open.
                             if ui.rect_contains_pointer(row.rect) || current || open_menu == Some(id) {
@@ -1976,6 +2097,10 @@ impl TacetaApp {
                     }
                     ui.add_space(8.0);
                     ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
+                    if self.screen == Screen::Chat && self.code_mode() && self.session_started() {
+                        ui.add_space(4.0);
+                        self.show_workspace_chip(ui);
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(4.0);
                         if ui
@@ -2017,21 +2142,6 @@ impl TacetaApp {
                         });
                         if let Some(details) = details {
                             response.response.on_hover_text(details);
-                        }
-                        let label = if self.model_unload_result.is_some() {
-                            text(language, "解放中…", "Releasing…")
-                        } else {
-                            text(language, "全モデル解放", "Unload all models")
-                        };
-                        // Releasing memory only concerns the local server.
-                        if self.state.inference_provider == InferenceProvider::Ollama
-                            && ui.add_enabled(self.can_unload_model(), Button::new(RichText::new(label).small()).frame(false))
-                            .on_hover_text(text(language,
-                                "接続先で読み込み中の全モデルをメモリから解放します。モデルファイルと会話は残ります。他のアプリが使用するモデルも対象です。",
-                                "Unload every model currently loaded on the connected server, including models used by other apps. Files and conversations remain."))
-                            .clicked()
-                        {
-                            self.start_model_unload();
                         }
                     });
                 });
@@ -3308,9 +3418,17 @@ impl TacetaApp {
         } else {
             COMPOSER_ATTACHMENT_EXTRA_HEIGHT
         };
+        let control = app_shell_control_metrics(root_ui.ctx());
+        let line_height = control.row_height + COMPOSER_LINE_GAP;
+        // Before a Code conversation begins, its folder is chosen here;
+        // afterwards the title bar shows it.
+        let show_workspace = self.code_mode() && !self.session_started();
+        let show_status = self.session_status_visible();
         let panel_height = COMPOSER_PANEL_BASE_HEIGHT
             + (editor_viewport_height - COMPOSER_EDITOR_MIN_HEIGHT)
-            + attachment_height;
+            + attachment_height
+            + if show_workspace { line_height } else { 0.0 }
+            + if show_status { line_height } else { 0.0 };
         Panel::bottom("taceta-composer-panel")
             .exact_size(panel_height)
             .show_separator_line(false)
@@ -3320,8 +3438,27 @@ impl TacetaApp {
                     ui.add_space(((available - composer_width) / 2.0).max(0.0));
                     ui.vertical(|ui| {
                         ui.set_width(composer_width);
+                        ui.spacing_mut().item_spacing.y = COMPOSER_LINE_GAP;
                         let palette = theme::palette(ui);
-                        let card_response = theme::card(palette.composer, palette.border, 18, 12)
+                        let line = |ui: &mut Ui, add_contents: &mut dyn FnMut(&mut Ui)| {
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(composer_width, control.row_height),
+                                Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().button_padding.y = control.vertical_padding;
+                                    ui.style_mut().override_text_valign = Some(Align::Center);
+                                    add_contents(ui);
+                                },
+                            );
+                        };
+                        if show_workspace {
+                            line(ui, &mut |ui| self.show_workspace_chip(ui));
+                        }
+                        if show_status {
+                            line(ui, &mut |ui| self.show_session_status(ui));
+                        }
+                        let mut keyboard_send = false;
+                        let card_response = theme::card(palette.composer, palette.border, 14, 12)
                             .show(ui, |ui| {
                             let mut remove_attachment = None;
                             if !self.state.pending_attachments.is_empty() {
@@ -3356,193 +3493,17 @@ impl TacetaApp {
                                 editor_viewport_height,
                             )
                             .inner;
-                            let keyboard_send = editor.has_focus()
+                            keyboard_send = editor.has_focus()
                                 && ui.input(|input| {
                                     input.key_pressed(Key::Enter)
                                         && (input.modifiers.command || input.modifiers.ctrl)
                                 });
-
-                            let control = app_shell_control_metrics(ui.ctx());
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(ui.available_width(), control.row_height),
-                                Layout::left_to_right(Align::Center),
-                                |ui| {
-                                    ui.spacing_mut().button_padding.y = control.vertical_padding;
-                                    ui.style_mut().override_text_valign = Some(Align::Center);
-                                    ui.visuals_mut().widgets.inactive.bg_fill =
-                                        egui::Color32::TRANSPARENT;
-                                    ui.visuals_mut().widgets.inactive.bg_stroke =
-                                        egui::Stroke::NONE;
-                                    let file_clicked = ui
-                                        .add_enabled(
-                                            !self.is_generating() && !self.is_cli_provider() && (!self.state.active_conversation().agent_enabled || self.state.inference_provider == InferenceProvider::Gpt),
-                                            Button::new("＋")
-                                                .min_size(Vec2::splat(control.row_height))
-                                                .corner_radius(control.row_height / 2.0),
-                                        )
-                                        .on_hover_text(text(
-                                            language,
-                                            "ファイルを追加",
-                                            "Add files",
-                                        ))
-                                        .clicked();
-
-                                    self.show_model_selector(ui);
-                                    self.show_thinking_mode_selector(ui);
-
-                                    let trace_label = if self.state.show_thinking_trace {
-                                        text(language, "思考表示: ON", "Trace: Visible")
-                                    } else {
-                                        text(language, "思考表示: OFF", "Trace: Hidden")
-                                    };
-                                    if ui
-                                        .add(
-                                            Button::new(trace_label)
-                                                .min_size(Vec2::new(0.0, control.row_height))
-                                                .corner_radius(control.row_height / 2.0),
-                                        )
-                                        .on_hover_text(text(
-                                            language,
-                                            "推論を止めず、思考過程の表示だけを切り替えます",
-                                            "Show or hide the trace without stopping inference",
-                                        ))
-                                        .clicked()
-                                    {
-                                        self.state.show_thinking_trace =
-                                            !self.state.show_thinking_trace;
-                                    }
-
-                                    // Keep Web Search with the other composer
-                                    // controls. The action button below owns the
-                                    // right edge exclusively, so it can never be
-                                    // clipped by a late-added control.
-                                    let web_enabled = self
-                                        .state
-                                        .active_conversation()
-                                        .web_search_enabled
-                                        && self.state.inference_provider == InferenceProvider::Ollama
-                                        && !self.state.active_conversation().agent_enabled;
-                                    let web_available = self
-                                        .selected_model()
-                                        .is_some_and(|model| model.tools)
-                                        && self.state.inference_provider == InferenceProvider::Ollama
-                                        && !self.state.active_conversation().agent_enabled;
-                                    let web_label = if web_enabled {
-                                        text(language, "Web: ON", "Web: ON")
-                                    } else {
-                                        text(language, "Web: OFF", "Web: OFF")
-                                    };
-                                    if self.state.inference_provider == InferenceProvider::Ollama && ui
-                                        .add_enabled(
-                                            web_available && !self.is_generating(),
-                                            Button::new(web_label)
-                                                .min_size(Vec2::new(0.0, control.row_height))
-                                                .corner_radius(control.row_height / 2.0),
-                                        )
-                                        .on_hover_text(text(
-                                            language,
-                                            "現在入力だけをローカル判定し、必要なときだけ検索します。",
-                                            "Classify only the current input locally and search only when needed.",
-                                        ))
-                                        .clicked()
-                                    {
-                                        self.state.active_conversation_mut().web_search_enabled =
-                                            !web_enabled;
-                                        if self.state.active_conversation().web_search_enabled {
-                                            self.notice = Some(Notice {
-                                                kind: NoticeKind::Info,
-                                                text: text(
-                                                    language,
-                                                    "Web：自動判定ON",
-                                                    "Web: Auto routing ON",
-                                                )
-                                                .to_owned(),
-                                            });
-                                        }
-                                    }
-
-                                    let mut send_clicked = false;
-                                    let mut stop_clicked = false;
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if self.is_generating() {
-                                            let action_fill = if ui.visuals().dark_mode {
-                                                egui::Color32::WHITE
-                                            } else {
-                                                egui::Color32::BLACK
-                                            };
-                                            let action_text = if ui.visuals().dark_mode {
-                                                egui::Color32::BLACK
-                                            } else {
-                                                egui::Color32::WHITE
-                                            };
-                                            stop_clicked = ui
-                                                .add(
-                                                    Button::new(
-                                                        RichText::new("■").color(action_text),
-                                                    )
-                                                    .min_size(Vec2::splat(control.row_height))
-                                                    .corner_radius(control.row_height / 2.0)
-                                                    .fill(action_fill)
-                                                    .stroke(egui::Stroke::new(1.0, action_fill)),
-                                                )
-                                                .on_hover_text(text(language, "停止", "Stop"))
-                                                .clicked();
-                                        } else {
-                                            let ready = self.state.selected_model.is_some()
-                                                && self.model_unload_result.is_none()
-                                                && (!self.state.draft.trim().is_empty()
-                                                    || !self.state.pending_attachments.is_empty());
-                                            let dark = ui.visuals().dark_mode;
-                                            let action_fill = if ready {
-                                                if dark {
-                                                    egui::Color32::WHITE
-                                                } else {
-                                                    egui::Color32::BLACK
-                                                }
-                                            } else {
-                                                palette.border
-                                            };
-                                            let action_text = if ready {
-                                                if dark {
-                                                    egui::Color32::BLACK
-                                                } else {
-                                                    egui::Color32::WHITE
-                                                }
-                                            } else {
-                                                palette.contrast_text
-                                            };
-                                            send_clicked = ui
-                                                .add_enabled(
-                                                    ready,
-                                                    Button::new(
-                                                        RichText::new("↑").color(action_text),
-                                                    )
-                                                    .min_size(Vec2::splat(control.row_height))
-                                                    .corner_radius(control.row_height / 2.0)
-                                                    .fill(action_fill)
-                                                    .stroke(egui::Stroke::new(1.0, action_fill)),
-                                                )
-                                                .on_hover_text(text(language, "送信", "Send"))
-                                                .clicked();
-                                        }
-                                    });
-
-                                    if file_clicked {
-                                        self.attach_files();
-                                    }
-                                    if stop_clicked {
-                                        self.stop_generation();
-                                    } else if send_clicked || keyboard_send {
-                                        self.start_generation();
-                                    }
-                                },
-                            );
                             });
                         if files_hovered && !self.is_generating() {
                             let overlay = card_response.response.rect.shrink(1.0);
                             ui.painter().rect_filled(
                                 overlay,
-                                17.0,
+                                13.0,
                                 egui::Color32::from_rgba_unmultiplied(0, 122, 255, 72),
                             );
                             ui.painter().text(
@@ -3553,6 +3514,127 @@ impl TacetaApp {
                                 egui::Color32::WHITE,
                             );
                         }
+
+                        // Under the editor: what is added to the request on
+                        // the left, and who answers it on the right.
+                        line(ui, &mut |ui| {
+                            ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+                            ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                            ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                            let file_clicked = ui
+                                .add_enabled(
+                                    !self.is_generating() && !self.is_cli_provider() && (!self.state.active_conversation().agent_enabled || self.state.inference_provider == InferenceProvider::Gpt),
+                                    Button::new("＋")
+                                        .min_size(Vec2::splat(control.row_height))
+                                        .corner_radius(control.row_height / 2.0),
+                                )
+                                .on_hover_text(text(language, "ファイルを追加", "Add files"))
+                                .clicked();
+                            if self.is_cli_provider() {
+                                self.show_cli_approval_chip(ui);
+                            }
+
+                            let web_enabled = self
+                                .state
+                                .active_conversation()
+                                .web_search_enabled
+                                && self.state.inference_provider == InferenceProvider::Ollama
+                                && !self.state.active_conversation().agent_enabled;
+                            let web_available = self
+                                .selected_model()
+                                .is_some_and(|model| model.tools)
+                                && self.state.inference_provider == InferenceProvider::Ollama
+                                && !self.state.active_conversation().agent_enabled;
+                            let web_label = if web_enabled { "Web: ON" } else { "Web: OFF" };
+                            if self.state.inference_provider == InferenceProvider::Ollama
+                                && !self.state.active_conversation().agent_enabled
+                                && ui
+                                .add_enabled(
+                                    web_available && !self.is_generating(),
+                                    Button::new(web_label)
+                                        .min_size(Vec2::new(0.0, control.row_height))
+                                        .corner_radius(control.row_height / 2.0),
+                                )
+                                .on_hover_text(text(
+                                    language,
+                                    "現在入力だけをローカル判定し、必要なときだけ検索します。",
+                                    "Classify only the current input locally and search only when needed.",
+                                ))
+                                .clicked()
+                            {
+                                self.state.active_conversation_mut().web_search_enabled =
+                                    !web_enabled;
+                                if self.state.active_conversation().web_search_enabled {
+                                    self.notice = Some(Notice {
+                                        kind: NoticeKind::Info,
+                                        text: text(
+                                            language,
+                                            "Web：自動判定ON",
+                                            "Web: Auto routing ON",
+                                        )
+                                        .to_owned(),
+                                    });
+                                }
+                            }
+                            self.show_session_menu(ui);
+
+                            let mut send_clicked = false;
+                            let mut stop_clicked = false;
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let dark = ui.visuals().dark_mode;
+                                let (strong, on_strong) = if dark {
+                                    (egui::Color32::WHITE, egui::Color32::BLACK)
+                                } else {
+                                    (egui::Color32::BLACK, egui::Color32::WHITE)
+                                };
+                                if self.is_generating() {
+                                    stop_clicked = ui
+                                        .add(
+                                            Button::new(RichText::new("■").color(on_strong))
+                                                .min_size(Vec2::splat(control.row_height))
+                                                .corner_radius(control.row_height / 2.0)
+                                                .fill(strong)
+                                                .stroke(egui::Stroke::new(1.0, strong)),
+                                        )
+                                        .on_hover_text(text(language, "停止", "Stop"))
+                                        .clicked();
+                                } else {
+                                    let ready = self.state.selected_model.is_some()
+                                        && self.model_unload_result.is_none()
+                                        && (!self.state.draft.trim().is_empty()
+                                            || !self.state.pending_attachments.is_empty());
+                                    let (fill, mark) = if ready {
+                                        (strong, on_strong)
+                                    } else {
+                                        (palette.border, palette.contrast_text)
+                                    };
+                                    send_clicked = ui
+                                        .add_enabled(
+                                            ready,
+                                            Button::new(RichText::new("↑").color(mark))
+                                                .min_size(Vec2::splat(control.row_height))
+                                                .corner_radius(control.row_height / 2.0)
+                                                .fill(fill)
+                                                .stroke(egui::Stroke::new(1.0, fill)),
+                                        )
+                                        .on_hover_text(text(language, "送信", "Send"))
+                                        .clicked();
+                                }
+                                // Right to left: thinking, model, engine.
+                                self.show_thinking_mode_selector(ui);
+                                self.show_model_selector(ui);
+                                self.show_provider_chip(ui);
+                            });
+
+                            if file_clicked {
+                                self.attach_files();
+                            }
+                            if stop_clicked {
+                                self.stop_generation();
+                            } else if send_clicked || keyboard_send {
+                                self.start_generation();
+                            }
+                        });
                     });
                 });
             });
@@ -3731,9 +3813,20 @@ impl TacetaApp {
     }
 }
 
+/// What one line of the sidebar's list shows.
+enum SidebarEntry {
+    /// The heading of the conversations working in this folder.
+    Folder(PathBuf),
+    /// A conversation, by its index among the listed ones.
+    Conversation(usize),
+    /// This many more conversations without a folder can be listed.
+    More(usize),
+}
+
 /// One full-width row of the sidebar: a button with its text on the left,
-/// filled only when it is current or under the pointer.
-fn sidebar_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
+/// filled only when it is current or under the pointer. `running` gives a
+/// conversation's row its mark: filled while its request runs.
+fn sidebar_row(ui: &mut Ui, label: &str, selected: bool, running: Option<bool>) -> egui::Response {
     let palette = theme::palette(ui);
     let size = Vec2::new(ui.available_width(), SIDEBAR_ROW_HEIGHT);
     ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
@@ -3744,28 +3837,15 @@ fn sidebar_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
         visuals.selection.bg_fill = palette.selected;
         visuals.selection.stroke.color = palette.contrast_text;
         // The growing gap after the text keeps the text on the left.
-        ui.add(Button::selectable(selected, (label, egui::Atom::grow())).truncate().min_size(size))
+        let mark = match running {
+            Some(true) => RichText::new("●").size(8.0).color(palette.accent),
+            Some(false) => RichText::new("○").size(8.0).color(palette.weak_text),
+            None => RichText::new(""),
+        };
+        // The title is the part that gives way when the row is too narrow.
+        ui.add(Button::selectable(selected, (mark, egui::AtomExt::atom_shrink(egui::Atom::from(label), true), egui::Atom::grow())).truncate().min_size(size))
     })
     .inner
-}
-
-/// The row of controls under the composer that says where and how the next
-/// request runs: provider, mode, workspace and what each provider adds.
-pub(super) fn controls_strip(root_ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    Panel::bottom("taceta-agent-controls")
-        .show_separator_line(false)
-        .frame(egui::Frame::side_top_panel(root_ui.style()).inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 10 }))
-        .show_inside(root_ui, |ui| {
-            let available = ui.available_width();
-            let column = (available - 2.0 * READING_COLUMN_MARGIN).clamp(1.0, READING_COLUMN_WIDTH);
-            ui.horizontal(|ui| {
-                ui.add_space(((available - column) / 2.0).max(0.0));
-                ui.vertical(|ui| {
-                    ui.set_width(column);
-                    add_contents(ui);
-                });
-            });
-        });
 }
 
 /// How an action shown in a conversation ended, or that it has not yet.
@@ -3968,10 +4048,6 @@ impl eframe::App for TacetaApp {
         theme::apply_style(ui);
         self.show_sidebar(ui);
         self.show_top_bar(ui);
-
-        if self.screen == Screen::Chat {
-            self.show_agent_controls(ui);
-        }
 
         match self.screen {
             Screen::Chat => {

@@ -40,7 +40,7 @@ Google 検索では、AI による概要があれば生成完了を確認して�
 
 Ollamaのモデルは、Tacetaが次の2つの時点でメモリから解放します。別のモデルで送信するときは、そのモデルを読み込む前に、読み込み中の他のモデルを解放します。2つのモデルを同時に抱えてメモリが足りなくなることを防ぐためです。Tacetaを終了するときは、その起動中にローカルのモデルを使っていれば、読み込み中のモデルを解放してから終了します。どちらも接続先のOllamaに読み込まれている全モデルが対象で、他のアプリが使用するモデルも含みます。モデルファイルと会話は残ります。解放できなかった場合、送信は新しいモデルを読み込まずに失敗として表示します。終了時の待ち時間は20秒までで、強制終了や異常終了では解放されません。
 
-画面右上の「全モデル解放」は、上の自動解放で足りないときに手動で使うものです。接続先のOllamaに読み込み中の全モデルを解放します。生成中・モデル取得中は操作できません。何も読み込まれていなければ「読み込み中のモデルはありません」と表示します。一部の解放に失敗した場合は対象名を表示し、全件成功とは扱いません。
+入力欄の下の「…」にある「全モデルを解放」は、上の自動解放で足りないときに手動で使うものです。接続先のOllamaに読み込み中の全モデルを解放します。生成中・モデル取得中は操作できません。何も読み込まれていなければ「読み込み中のモデルはありません」と表示します。一部の解放に失敗した場合は対象名を表示し、全件成功とは扱いません。
 
 ![Tacetaの日本語設定画面](docs/images/taceta-settings-ja.png)
 
@@ -100,7 +100,7 @@ GrokとClaudeは、各社の公式CLIを無改変のまま子プロセスとし�
 
 CLIは利用者の通常のログインと設定（`~/.grok`、`~/.claude`）をそのまま使います。そのCLIに設定済みのMCPサーバー、フック、スキルも働きます。
 
-GrokとClaudeには「作業」と「チャット」があります。新しい会話は「作業」で始まり、作業フォルダーが必要です。「チャット」は会話だけを行い、作業フォルダーを使わず、ファイルの読み書きもコマンドの実行もしません。Claudeは組み込みの道具もMCPサーバーもなしで起動し、Grokには道具を止める起動オプションがないため、Tacetaが読み込ませる小さなプラグインのフックがすべての道具の呼び出しを拒否します（`~/Library/Application Support/Taceta/GrokApprovalPluginNoTools`）。Grokのフックは、時間切れや異常終了のときは呼び出しを止めない作りなので、その場合はGrok自身の権限設定が判断します。CLIはTaceta専用の空のフォルダー（`~/Library/Application Support/Taceta/CliChatWorkspace`）で動きます。モードを切り替えると、その会話のCLIセッションは作り直し、それまでの会話は次の送信で渡します。どちらのモードでも、添付とTaceta LinkによるWeb検索は提供しません。
+GrokとClaudeには「Code」と「Chat」があります（画面左上で切り替えます）。「Code」は作業フォルダーが必要です。「Chat」は会話だけを行い、作業フォルダーを使わず、ファイルの読み書きもコマンドの実行もしません。Claudeは組み込みの道具もMCPサーバーもなしで起動し、Grokには道具を止める起動オプションがないため、Tacetaが読み込ませる小さなプラグインのフックがすべての道具の呼び出しを拒否します（`~/Library/Application Support/Taceta/GrokApprovalPluginNoTools`）。Grokのフックは、時間切れや異常終了のときは呼び出しを止めない作りなので、その場合はGrok自身の権限設定が判断します。CLIはTaceta専用の空のフォルダー（`~/Library/Application Support/Taceta/CliChatWorkspace`）で動きます。モードを切り替えると、その会話のCLIセッションは作り直し、それまでの会話は次の送信で渡します。どちらのモードでも、添付とTaceta LinkによるWeb検索は提供しません。
 
 「毎回確認」では、ファイルの変更とコマンドの実行を、実行前に1件ずつTacetaで確認します。Claudeは手動の権限モード（`--permission-mode manual`）で起動します。Grokでは、ツール実行前のフックで確認を求める小さなプラグインをTacetaが読み込ませます。このプラグインは `~/Library/Application Support/Taceta/GrokApprovalPlugin` に置き、読み取り専用のツールについては確認しません。「自動承認」ではCLI自身の権限設定に従います。設定によっては、確認なしでファイルの変更とコマンドの実行が行われます。
 
@@ -120,12 +120,12 @@ Tacetaに保存された会話のメッセージが記録の正本です。Grok�
 
 以下はOllamaの作業モードです。GPTの作業は後述のCodex接続、GrokとClaudeの作業は前述の公式CLIを使います。
 
-1. 会話上部で「作業」を選び、作業フォルダーを指定します。
+1. 画面左上で「Code」を選び、入力欄の上で作業フォルダーを指定します。最近使ったフォルダーは同じメニューから選べ、Gitリポジトリならブランチ名も表示します。作業を始めた後は、フォルダーは会話の題名の横に表示します。
 2. ツール対応のOllamaモデルを選び、作業を送信します。
 3. ファイル編集・コマンドの内容が表示されたら、その1回を許可または拒否します。コマンドは作業フォルダーと専用一時領域だけへ書き込み、ネットワークを使用できません。
 4. 停止・上限到達・失敗の後は状態を確認し「再開」で続けます。再起動後も作業が復元されます。
 
-「コンテキストを整理」で手動の圧縮も開始できます。コンパクションは背景を要約し、原文履歴、ユーザーの指示・訂正、作業状態を別々に保持します。要約が指示を置き換えることはありません。過去の原文は履歴検索ツールで取り出せます。Thinking traceは要約入力にも後続の推論入力にも含めません。要約の推論も回数・時間制限に含め、必須の指示だけで入力上限を超える場合や要約に失敗した場合は原文を破壊せず停止します。
+入力欄の下の「…」にある「コンテキストを整理」で手動の圧縮も開始できます。コンパクションは背景を要約し、原文履歴、ユーザーの指示・訂正、作業状態を別々に保持します。要約が指示を置き換えることはありません。過去の原文は履歴検索ツールで取り出せます。Thinking traceは要約入力にも後続の推論入力にも含めません。要約の推論も回数・時間制限に含め、必須の指示だけで入力上限を超える場合や要約に失敗した場合は原文を破壊せず停止します。
 
 作業記録は現在ユーザーの `~/Library/Application Support/Taceta/AgentSessions/` に保存します。会話を削除すると、作業記録は同じ保存領域の復元用フォルダーへ退避します。再開しても、結果不明の編集やコマンドを自動で再実行しません。
 
@@ -134,9 +134,9 @@ Tacetaに保存された会話のメッセージが記録の正本です。Grok�
 ## GPTでコーディングする
 
 1. 公式Codex CLIを別途用意し、GPT画面の「ChatGPTにログイン」を押します。開いたブラウザーでログインを完了すると、利用できるモデルを自動で取得します。設定画面からも同じログインを開始できます。
-2. 接続先の「GPT (OAuth)」と、アカウントに返されたモデルを選びます。GPTの新しい会話は作業モードで始まります。
+2. 接続先の「GPT (OAuth)」と、アカウントに返されたモデルを選びます。新しい会話は、そのとき選んでいるChat／Codeで始まります。
 3. 作業フォルダーを選び、実装・修正したい内容を送信します。回答、コマンドの出力、ファイル変更、差分をTacetaで確認できます。
-4. Codexから承認や質問が届いたらTacetaで回答します。停止、保存済み作業の続行、手動コンパクションも同じ会話で行います。通常の会話には「チャット」を選びます。
+4. Codexから承認や質問が届いたらTacetaで回答します。停止、保存済み作業の続行、手動コンパクションも同じ会話で行います。通常の会話には「Chat」を選びます。
 
 GPT接続は公式の[Codex App Server](https://learn.chatgpt.com/docs/app-server)を標準入出力で利用します。TacetaはAPIキー接続を提供せず、OAuthと認証更新はCodexが担当します。認証はmacOS Keychain、Codexの設定と会話は `~/Library/Application Support/Taceta/gpt` の専用領域で管理します。既存のCodexの認証・設定・履歴をコピーしません。CLIが見つからない場合や必要なApp Server機能に対応していない場合は、その不足を表示して停止します。
 
@@ -269,7 +269,7 @@ Configure language, theme, model management, Web Search, the model location, and
 
 Taceta releases Ollama models from memory at two points. When you send with a different model, the other loaded models are released before that model is loaded, so two models are never held at once. When you quit Taceta after using a local model in that session, loaded models are released before the app exits. Both apply to every model loaded on the connected Ollama, including models another app is using. Model files and conversations are kept. If a model cannot be released, the send fails visibly without loading the new model. Quitting waits at most 20 seconds, and a forced or abnormal exit releases nothing.
 
-"Unload all models" at the top right is the manual fallback for when that is not enough. It releases every model loaded on the connected Ollama and is unavailable while generating or downloading. A partial failure names the models and is not reported as success.
+"Unload all models", under "…" below the composer, is the manual fallback for when that is not enough. It releases every model loaded on the connected Ollama and is unavailable while generating or downloading. A partial failure names the models and is not reported as success.
 
 ![Taceta settings in English](docs/images/taceta-settings-en.png)
 
@@ -329,7 +329,7 @@ Grok and Claude are used by running each vendor's official, unmodified CLI as a 
 
 Each CLI uses your normal login and settings (`~/.grok`, `~/.claude`) as they are, including that CLI's own MCP servers, hooks and skills.
 
-Grok and Claude have Task and Chat. A new conversation starts in Task, which needs a workspace. Chat is conversation only: it uses no workspace, reads and changes no file, and runs no command. Claude is started with no built-in tools and no MCP servers. Grok has no option that starts it without tools, so a small plugin loaded by Taceta refuses every tool call through its pre-tool hook (`~/Library/Application Support/Taceta/GrokApprovalPluginNoTools`). A Grok hook that times out or crashes does not stop the call; Grok's own permission settings then decide. The CLI runs in an empty folder of Taceta's own (`~/Library/Application Support/Taceta/CliChatWorkspace`). Switching the mode starts new CLI sessions for that conversation, and the conversation so far is handed over with the next request. Neither mode has attachments or Taceta Link Web Search.
+Grok and Claude have Code and Chat, switched at the top left. Code needs a workspace. Chat is conversation only: it uses no workspace, reads and changes no file, and runs no command. Claude is started with no built-in tools and no MCP servers. Grok has no option that starts it without tools, so a small plugin loaded by Taceta refuses every tool call through its pre-tool hook (`~/Library/Application Support/Taceta/GrokApprovalPluginNoTools`). A Grok hook that times out or crashes does not stop the call; Grok's own permission settings then decide. The CLI runs in an empty folder of Taceta's own (`~/Library/Application Support/Taceta/CliChatWorkspace`). Switching the mode starts new CLI sessions for that conversation, and the conversation so far is handed over with the next request. Neither mode has attachments or Taceta Link Web Search.
 
 With Ask every time, each file change and command is confirmed in Taceta before it runs. Claude is started with manual permission mode (`--permission-mode manual`). For Grok, Taceta loads a small plugin whose pre-tool hook asks; it is kept under `~/Library/Application Support/Taceta/GrokApprovalPlugin`, and read-only tools are not asked about. With Automatic, the CLI's own permission settings decide. Depending on them, files may change and commands may run without confirmation.
 
@@ -349,12 +349,12 @@ When you switch to GPT from an Ollama task that has a workspace, GPT receives th
 
 This section covers Ollama. GPT uses the Codex integration below; Grok and Claude use their official CLIs as described above.
 
-1. Select Agent above the conversation and choose a workspace.
+1. Select Code at the top left and choose the workspace above the composer. Folders used before are offered in the same menu, and a Git repository's branch is shown. Once the task has begun, the folder is shown beside the conversation's title.
 2. Select a tool-capable Ollama model and submit the task.
 3. Review each proposed edit or command and approve or deny that one action. Commands can write only to the workspace and their scratch area, and cannot access the network.
 4. After interruption, a limit or failure, inspect the state and choose Resume. Saved tasks recover after restart.
 
-“Compact context” starts manual compaction through the same path. Compaction summarizes background while retaining original events, user instructions and corrections, and structured work state separately. Summaries never replace instructions. The model can search and read original history. Thinking traces enter neither compaction nor later inference. Compaction calls count toward run limits. If mandatory instructions exceed the context limit or summarization fails, the run stops without destroying history.
+“Compact context”, under “…” below the composer, starts manual compaction through the same path. Compaction summarizes background while retaining original events, user instructions and corrections, and structured work state separately. Summaries never replace instructions. The model can search and read original history. Thinking traces enter neither compaction nor later inference. Compaction calls count toward run limits. If mandatory instructions exceed the context limit or summarization fails, the run stops without destroying history.
 
 Records are stored under the current user's `~/Library/Application Support/Taceta/AgentSessions/`. Deleting a chat moves its Agent records to a recovery folder in the same storage area. Resumption does not automatically repeat an edit or command whose outcome is unknown.
 
