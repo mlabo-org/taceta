@@ -77,4 +77,16 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# macOS remembers folder permissions by code signature. The default ad-hoc
+# signature changes with every build, so each rebuilt app is asked again.
+# Signing with one local code-signing certificate keeps the app's identity
+# across builds. The certificate stays in the keychain, never in this repo.
+if [[ -n "${TACETA_SIGN_IDENTITY:-}" ]]; then
+  codesign --force --sign "$TACETA_SIGN_IDENTITY" \
+    --identifier org.mlabo.taceta.link-host "$MACOS_DIR/taceta-link-host"
+  codesign --force --sign "$TACETA_SIGN_IDENTITY" "$APP_DIR"
+  codesign --verify --strict --deep "$APP_DIR"
+  printf 'Signed with %s\n' "$TACETA_SIGN_IDENTITY"
+fi
+
 printf 'Built %s\n' "$APP_DIR"
