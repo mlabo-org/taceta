@@ -2659,7 +2659,8 @@ impl TacetaApp {
                     ui.add_space(
                         (context_tick_width / 2.0 - handle_inset).max(0.0),
                     );
-                    ui.add(
+                    theme::slider(
+                        ui,
                         egui::Slider::new(&mut context_index, 0..=6)
                             .integer()
                             .show_value(false)
@@ -2756,17 +2757,17 @@ impl TacetaApp {
                         "Max ChatGPT requests",
                     ));
                     let mut value = self.state.chatgpt_web_request_limit as i32;
-                    if ui
-                        .add(
-                            egui::Slider::new(
-                                &mut value,
-                                MIN_CHATGPT_WEB_REQUEST_LIMIT as i32
-                                    ..=MAX_CHATGPT_WEB_REQUEST_LIMIT as i32,
-                            )
-                            .integer()
-                            .show_value(true),
+                    if theme::slider(
+                        ui,
+                        egui::Slider::new(
+                            &mut value,
+                            MIN_CHATGPT_WEB_REQUEST_LIMIT as i32
+                                ..=MAX_CHATGPT_WEB_REQUEST_LIMIT as i32,
                         )
-                        .changed()
+                        .integer()
+                        .show_value(true),
+                    )
+                    .changed()
                     {
                         self.state.chatgpt_web_request_limit = value as u8;
                     }
@@ -2783,7 +2784,7 @@ impl TacetaApp {
                 ui.horizontal(|ui| {
                     ui.label(text(language, "最大検索結果", "Max results"));
                     let mut value = self.state.max_search_results as i32;
-                    if ui.add(egui::Slider::new(&mut value, 1..=5).integer().show_value(true)).changed() {
+                    if theme::slider(ui, egui::Slider::new(&mut value, 1..=5).integer().show_value(true)).changed() {
                         self.state.max_search_results = value as u8;
                     }
                 });

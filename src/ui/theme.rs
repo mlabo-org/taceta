@@ -119,6 +119,20 @@ pub fn palette(ui: &egui::Ui) -> TacetaPalette {
     }
 }
 
+/// Adds a slider whose rail stands out from the card it sits on.
+///
+/// egui paints the rail with `widgets.inactive.bg_fill`, which this theme
+/// keeps equal to the card fill so idle controls stay quiet; without this the
+/// rail disappears and only the handle shows.
+pub fn slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> egui::Response {
+    let rail = palette(ui).border;
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.inactive.bg_fill = rail;
+        ui.add(slider)
+    })
+    .inner
+}
+
 pub fn card(fill: Color32, border: Color32, radius: u8, margin: i8) -> Frame {
     Frame::new()
         .fill(fill)
