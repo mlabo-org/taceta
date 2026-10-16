@@ -159,6 +159,8 @@ pub struct TacetaApp {
     ollama_used: bool,
     generation: Option<ActiveGeneration>,
     external_preview_ids: HashSet<Uuid>,
+    /// Whether a turn was running when the composer was last drawn.
+    composer_saw_busy: bool,
     notice: Option<Notice>,
     /// Stored state this build could not decode; kept verbatim on the next save.
     unreadable_state: Option<String>,
@@ -345,6 +347,7 @@ impl TacetaApp {
             ollama_used: false,
             generation: None,
             external_preview_ids: HashSet::new(),
+            composer_saw_busy: false,
             notice: None,
             unreadable_state: None,
             unreadable_state_dialog: false,
@@ -3698,7 +3701,19 @@ impl TacetaApp {
                                 self.stop_generation();
                             } else if send_clicked || keyboard_send {
                                 self.start_generation();
+                                // The send button takes focus from the draft; the
+                                // next message is typed there.
+                                ui.memory_mut(|memory| memory.request_focus(composer_editor_id()));
                             }
+                            // When a reply ends and nothing else holds focus,
+                            // it is the user's turn to type.
+                            let busy = self.is_generating();
+                            if self.composer_saw_busy && !busy
+                                && ui.memory(|memory| memory.focused().is_none())
+                            {
+                                ui.memory_mut(|memory| memory.request_focus(composer_editor_id()));
+                            }
+                            self.composer_saw_busy = busy;
                         });
                     });
                 });
@@ -4021,6 +4036,9 @@ fn show_composer_editor(
                 |ui| {
                     ui.add(
                         TextEdit::multiline(draft)
+                            // A fixed id keeps focus while lines above the
+                            // composer come and go during a turn.
+                            .id(composer_editor_id())
                             .hint_text(hint_text)
                             .desired_rows(3)
                             .desired_width(editor_width)
@@ -4031,6 +4049,10 @@ fn show_composer_editor(
             )
             .inner
         })
+}
+
+fn composer_editor_id() -> egui::Id {
+    egui::Id::new("taceta-composer-draft")
 }
 
 fn composer_editor_viewport_height(
@@ -4720,6 +4742,35 @@ mod composer_tests {
             ..Default::default()
         };
         let _ = context.run_ui(input, |ui| add_contents(ui));
+    }
+
+    #[test]
+    fn the_draft_keeps_focus_when_a_line_appears_above_it() {
+        let context = egui::Context::default();
+        context.set_fonts(egui::FontDefinitions::default());
+        let mut draft = String::new();
+        let mut frame = |status_line: bool| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 800.0))),
+                ..Default::default()
+            };
+            let mut focused = false;
+            let _ = context.run_ui(input, |ui| {
+                // A running turn adds its status line above the composer.
+                if status_line {
+                    ui.label("running");
+                }
+                let output = show_composer_editor(ui, &mut draft, "何でもどうぞ", egui::Color32::GRAY, 60.0);
+                focused = output.inner.has_focus();
+            });
+            focused
+        };
+        frame(false);
+        context.memory_mut(|memory| memory.request_focus(composer_editor_id()));
+        assert!(frame(false));
+        assert!(frame(true));
+        assert!(frame(true));
+        assert!(frame(false));
     }
 
     #[test]
