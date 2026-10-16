@@ -200,44 +200,52 @@ impl AgentUiState {
 }
 
 impl TacetaApp {
-    pub(super) fn show_agent_settings(&mut self, ui: &mut Ui) {
+    /// The time limit every engine's run shares.
+    pub(super) fn show_run_limit_settings(&mut self, ui: &mut Ui) {
         let language = self.language();
-        ui.heading(text(
-            language,
-            "作業とコンパクション",
-            "Agent work and compaction",
-        ));
-        ui.label(text(language,
-            "作業モードでは履歴の原文、ユーザーの指示、作業状態をこのMacに保存します。コンテキストが満ちる前に背景を要約し、指示と未完了の状態を保持して続行します。",
-            "Agent mode saves original events, user instructions and work state on this Mac. Before context fills up, it summarizes background while retaining instructions and unfinished work."));
-        ui.add_enabled_ui(!self.is_generating(), |ui| {
-            ui.horizontal(|ui| {
-                ui.label(text(
-                    language,
-                    "1回の実行の推論回数上限",
-                    "Inference calls per run",
-                ));
-                ui.add(egui::DragValue::new(&mut self.state.agent_max_steps).range(1..=1_000));
-            });
-            ui.horizontal(|ui| {
-                ui.label(text(
-                    language,
-                    "1回の実行時間（分）",
-                    "Run duration (minutes)",
-                ));
-                let mut minutes = self.state.agent_max_duration_secs / 60;
-                if ui
-                    .add(egui::DragValue::new(&mut minutes).range(1..=720))
-                    .changed()
-                {
-                    self.state.agent_max_duration_secs = minutes * 60;
-                }
+        let palette = theme::palette(ui);
+        theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(text(language, "1回の実行時間の上限", "Time limit per run"));
+            ui.add_space(4.0);
+            ui.label(RichText::new(text(language,
+                "Ollamaの作業モードの1回の実行と、GPT・Grok・Claudeへの1回の送信に効きます。上限に達すると、その実行を止めます。",
+                "Applies to one Ollama agent run and to one send to GPT, Grok or Claude. A run that reaches it is stopped.")).weak());
+            ui.add_space(10.0);
+            ui.add_enabled_ui(!self.is_generating(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(text(language, "分", "Minutes"));
+                    let mut minutes = self.state.agent_max_duration_secs / 60;
+                    if ui.add(egui::DragValue::new(&mut minutes).range(1..=720)).changed() {
+                        self.state.agent_max_duration_secs = minutes * 60;
+                    }
+                });
             });
         });
-        ui.label(RichText::new(text(language,
-            "要約の推論も上限に含めます。上限到達と中断は完了と区別して保存し、画面の「再開」から続けられます。",
-            "Compaction calls count toward the limit. Limit reached and interrupted runs are saved separately from completed work and can be resumed.")).small().weak());
-        ui.add_space(20.0);
+    }
+
+    /// Ollama's agent mode: how many inference calls one run may make.
+    pub(super) fn show_agent_settings(&mut self, ui: &mut Ui) {
+        let language = self.language();
+        let palette = theme::palette(ui);
+        theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(text(language, "作業モード", "Agent mode"));
+            ui.add_space(4.0);
+            ui.label(RichText::new(text(language,
+                "作業モードでは履歴の原文、ユーザーの指示、作業状態をこのMacに保存します。コンテキストが満ちる前に背景を要約し、指示と未完了の状態を保持して続行します。",
+                "Agent mode saves original events, user instructions and work state on this Mac. Before context fills up, it summarizes background while retaining instructions and unfinished work.")).weak());
+            ui.add_space(10.0);
+            ui.add_enabled_ui(!self.is_generating(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(text(language, "1回の実行の推論回数上限", "Inference calls per run"));
+                    ui.add(egui::DragValue::new(&mut self.state.agent_max_steps).range(1..=1_000));
+                });
+            });
+            ui.label(RichText::new(text(language,
+                "要約の推論も上限に含めます。上限到達と中断は完了と区別して保存し、画面の「再開」から続けられます。",
+                "Compaction calls count toward the limit. Limit reached and interrupted runs are saved separately from completed work and can be resumed.")).small().weak());
+        });
     }
 
     fn agent_can_resume(&self) -> bool {

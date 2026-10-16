@@ -2412,7 +2412,6 @@ impl TacetaApp {
 
     fn show_settings(&mut self, root_ui: &mut Ui) {
         let language = self.language();
-        let selected_model_context = self.selected_model().and_then(|model| model.context_length);
         CentralPanel::default().show_inside(root_ui, |ui| {
             ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let width = (ui.available_width() - 2.0 * READING_COLUMN_MARGIN).clamp(1.0, READING_COLUMN_WIDTH);
@@ -2427,361 +2426,412 @@ impl TacetaApp {
                         ui.label(
                             RichText::new(text(
                                 language,
-                                "表示と言語はこのMacだけに保存されます。",
-                                "Display and language preferences stay on this Mac.",
+                                "設定はすべてこのMacに保存されます。",
+                                "All settings stay on this Mac.",
                             ))
                             .weak(),
                         );
-                        ui.add_space(20.0);
 
+                        settings_group(
+                            ui,
+                            text(language, "全エンジン共通", "All engines"),
+                            text(
+                                language,
+                                "Ollama・GPT・Grok・Claudeのどれを使っていても効きます。",
+                                "Applies whichever of Ollama, GPT, Grok or Claude you use.",
+                            ),
+                        );
                         self.show_provider_settings(ui);
-                        self.show_agent_settings(ui);
+                        ui.add_space(14.0);
+                        self.show_appearance_settings(ui);
+                        ui.add_space(14.0);
+                        self.show_run_limit_settings(ui);
 
-                        let palette = theme::palette(ui);
-                        theme::card(
-                            ui.visuals().faint_bg_color,
-                            palette.border,
-                            14,
-                            16,
-                        )
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.strong(text(language, "表示", "Appearance"));
-                            ui.add_space(12.0);
-                            let change = show_app_shell_preferences(
-                                ui,
-                                &mut self.shell_preferences,
-                                self.system_language,
-                                "taceta-main-settings",
-                            );
-                            if change.changed {
-                                apply_app_shell_preferences(
-                                    ui.ctx(),
-                                    self.shell_preferences,
-                                );
-                            }
-                        });
-                        ui.add_space(14.0);
-                        let palette = theme::palette(ui);
-                        theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.strong(text(language, "モデル", "Models"));
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(text(language, "インストール済みモデルを取得・確認・削除します。", "Download, inspect, and delete installed models.")).weak());
-                            ui.add_space(10.0);
-                            if ui.button(text(language, "モデルを管理", "Manage models")).clicked() {
-                                self.screen = Screen::Models;
-                                self.refresh_models();
-                            }
-                        });
-                        ui.add_space(14.0);
-                        let palette = theme::palette(ui);
-                        theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.strong(text(language, "Web検索", "Web Search"));
-                            if self.state.inference_provider == InferenceProvider::Gpt {
-                                ui.label(text(language, "GPTではTaceta LinkのWeb検索を使いません。", "GPT does not use Taceta Link Web Search."));
-                                return;
-                            }
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(text(
+                        settings_group(
+                            ui,
+                            "GPT・Grok・Claude",
+                            text(
                                 language,
-                                "Web ON時は、現在の入力だけをローカルLLMが判定します。必要なときだけ選択中の検索先へ送ります。",
-                                "When Web is ON, the local LLM classifies only the current input. Taceta uses the selected search route only when needed.",
-                            )).weak());
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.label(text(language, "Web実行方式", "Web executor"));
-                                let api_selected = matches!(self.state.web_search_provider, ProviderKind::Brave | ProviderKind::Ollama);
-                                if ui.selectable_label(api_selected, "API").clicked() && !api_selected {
-                                    self.state.web_search_provider = ProviderKind::Brave;
-                                }
-                                let link_selected = matches!(self.state.web_search_provider, ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb);
-                                if ui.selectable_label(link_selected, "Taceta Link").clicked() && !link_selected {
-                                    self.state.web_search_provider = ProviderKind::GoogleSearch;
-                                }
-                            });
-                            ui.horizontal(|ui| {
-                                let api_selected = matches!(self.state.web_search_provider, ProviderKind::Brave | ProviderKind::Ollama);
-                                ui.label(text(language, if api_selected { "APIプロバイダー" } else { "ブラウザーワークフロー" }, if api_selected { "API provider" } else { "Browser workflow" }));
-                                let providers = if api_selected {
-                                    [ProviderKind::Brave, ProviderKind::Ollama]
-                                } else {
-                                    browser_provider_options()
-                                };
-                                for provider in providers {
-                                    if ui.selectable_label(self.state.web_search_provider == provider, provider.label()).clicked() {
-                                        self.state.web_search_provider = provider;
-                                    }
-                                }
-                            });
-                            if self.state.web_search_provider == ProviderKind::ChatGptWeb {
-                                ui.horizontal(|ui| {
-                                    ui.label(text(
-                                        language,
-                                        "ChatGPT最大質問回数",
-                                        "Max ChatGPT requests",
-                                    ));
-                                    let mut value = self.state.chatgpt_web_request_limit as i32;
-                                    if ui
-                                        .add(
-                                            egui::Slider::new(
-                                                &mut value,
-                                                MIN_CHATGPT_WEB_REQUEST_LIMIT as i32
-                                                    ..=MAX_CHATGPT_WEB_REQUEST_LIMIT as i32,
-                                            )
-                                            .integer()
-                                            .show_value(true),
-                                        )
-                                        .changed()
-                                    {
-                                        self.state.chatgpt_web_request_limit = value as u8;
-                                    }
-                                });
-                                ui.label(
-                                    RichText::new(text(
-                                        language,
-                                        "通常は1回です。2〜3回を明示した場合だけ、ローカルモデルの追加調査案を元の質問に添えて送り、回答をまとめます。",
-                                        "The normal setting is 1. Only when 2–3 is explicitly selected are the local model's additional research angles sent with the original question and the answers combined.",
-                                    ))
-                                    .weak(),
-                                );
-                            } else {
-                                ui.horizontal(|ui| {
-                                    ui.label(text(language, "最大検索結果", "Max results"));
-                                    let mut value = self.state.max_search_results as i32;
-                                    if ui.add(egui::Slider::new(&mut value, 1..=5).integer().show_value(true)).changed() {
-                                        self.state.max_search_results = value as u8;
-                                    }
-                                });
-                                ui.checkbox(&mut self.state.fetch_search_pages, text(language, "検索結果の本文も取得", "Fetch result pages"));
-                            }
-                            if let Some(account) = self.state.web_search_provider.account_name() {
-                                ui.add_space(8.0);
-                                ui.label(text(language, "APIキー（macOS Keychainに保存）", "API key (saved in macOS Keychain)"));
-                                ui.add(egui::TextEdit::singleline(&mut self.web_key_draft).password(true).hint_text(text(language, "キーを入力して保存", "Enter key to save")));
-                                ui.horizontal(|ui| {
-                                    if ui.button(text(language, "保存", "Save")).clicked() {
-                                        let secret = std::mem::take(&mut self.web_key_draft);
-                                        let result = web_search::save_keychain_secret(account, &secret);
-                                        self.web_key_status = None;
-                                        self.notice = Some(match result {
-                                            Ok(()) => Notice { kind: NoticeKind::Info, text: text(language, "APIキーをKeychainに保存しました。", "API key saved to Keychain.").to_owned() },
-                                            Err(error) => Notice { kind: NoticeKind::Error, text: error.to_string() },
-                                        });
-                                    }
-                                    if ui.button(text(language, "削除", "Delete")).clicked() {
-                                        let result = web_search::delete_keychain_secret(account);
-                                        self.web_key_status = None;
-                                        self.notice = Some(match result {
-                                            Ok(()) => Notice { kind: NoticeKind::Info, text: text(language, "APIキーを削除しました。", "API key deleted.").to_owned() },
-                                            Err(error) => Notice { kind: NoticeKind::Error, text: error.to_string() },
-                                        });
-                                    }
-                                    let key_status = match self.web_key_status {
-                                        Some((checked, status)) if checked == account => status,
-                                        _ => {
-                                            let status = web_search::keychain_status(account);
-                                            self.web_key_status = Some((account, status));
-                                            status
-                                        }
-                                    };
-                                    let status = match key_status {
-                                        web_search::KeychainStatus::Configured => text(language, "設定済み", "Configured"),
-                                        web_search::KeychainStatus::Missing => text(language, "未設定", "Not configured"),
-                                        web_search::KeychainStatus::Unavailable => text(language, "Keychainを確認できません", "Keychain could not be checked"),
-                                    };
-                                    ui.label(RichText::new(status).weak());
-                                });
-                            } else if matches!(
-                                self.state.web_search_provider,
-                                ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb
-                            ) {
-                                ui.add_space(8.0);
-                                ui.label(RichText::new(text(
-                                    language,
-                                    "Taceta Link経由で、選択したブラウザー操作を実行します。APIキーは不要です。",
-                                    "Runs the selected browser workflow through Taceta Link. No API key is required.",
-                                )).weak());
-                                self.show_link_settings(ui, language);
-                            } else {
-                            }
-                        });
-                        ui.add_space(14.0);
-                        let palette = theme::palette(ui);
-                        theme::card(
-                            ui.visuals().faint_bg_color,
-                            palette.border,
-                            14,
-                            16,
-                        )
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.strong(text(language, "モデル格納先", "Model location"));
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(text(
-                                    language,
-                                    "ローカルモデルが保存されている場所です。",
-                                    "Location where local models are stored.",
-                                ))
-                                .weak(),
-                            );
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                let mut path = self.model_storage_path.display().to_string();
-                                let button_width = 108.0;
-                                ui.add_sized(
-                                    [
-                                        (ui.available_width() - button_width - 8.0).max(160.0),
-                                        30.0,
-                                    ],
-                                    TextEdit::singleline(&mut path).interactive(false),
-                                );
-                                if ui
-                                    .add_sized(
-                                        [button_width, 30.0],
-                                        Button::new(text(
-                                            language,
-                                            "Finderで開く",
-                                            "Reveal",
-                                        )),
-                                    )
-                                    .clicked()
-                                {
-                                    self.reveal_model_storage();
-                                }
-                            });
+                                "各社の公式CLIで動きます。下のOllamaの設定はどれも効きません。",
+                                "These run through each vendor's official CLI. None of the Ollama settings below apply.",
+                            ),
+                        );
+                        self.show_cli_settings(ui);
 
-                            ui.add_space(20.0);
-                            ui.horizontal(|ui| {
-                                ui.strong(text(language, "コンテキスト長", "Context length"));
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.monospace(format_context_length(
-                                        self.state.context_length,
-                                    ));
-                                });
-                            });
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(text(
-                                    language,
-                                    "会話で保持・参照できる情報量です。長いほどメモリを使い、生成開始が遅くなる場合があります。",
-                                    "How much of the conversation the model can retain and use. Longer contexts use more memory and may start more slowly.",
-                                ))
-                                .weak(),
-                            );
-                            ui.add_space(8.0);
-                            let configured_context = self.state.context_length;
-                            let reported_limit = selected_model_context;
-                            ui.horizontal(|ui| {
-                                ui.label(text(
-                                    language,
-                                    "選択中モデルの上限（参考）",
-                                    "Selected model limit (reference)",
-                                ));
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.monospace(
-                                        reported_limit
-                                            .map(format_context_length)
-                                            .unwrap_or_else(|| {
-                                                text(language, "不明", "Unknown").to_owned()
-                                            }),
-                                    );
-                                });
-                            });
-                            let exceeds_reported_limit = reported_limit
-                                .is_some_and(|limit| configured_context > limit);
-                            let adjustment_note = text(
+                        settings_group(
+                            ui,
+                            text(language, "Ollama（ローカルモデル）", "Ollama (local models)"),
+                            text(
                                 language,
-                                if exceeds_reported_limit {
-                                    "設定値がモデル上限を超えています。Ollama側でモデルが利用可能な範囲へ調整されます。"
-                                } else {
-                                    "上限を超える設定は、Ollama側でモデルが利用可能な範囲へ調整されます。"
-                                },
-                                if exceeds_reported_limit {
-                                    "The configured value exceeds this model's limit. Ollama adjusts it to the range the model can use."
-                                } else {
-                                    "Values above the limit are adjusted by Ollama to the range the model can use."
-                                },
-                            );
-                            let note = RichText::new(adjustment_note).small();
-                            ui.label(if exceeds_reported_limit {
-                                note.color(palette.warning)
-                            } else {
-                                note.weak()
-                            });
-                            ui.add_space(10.0);
-                            let mut context_index = CONTEXT_LENGTH_OPTIONS
-                                .iter()
-                                .position(|value| *value == self.state.context_length)
-                                .unwrap_or(3) as u32;
-                            let context_control_width = ui.available_width();
-                            let context_tick_width =
-                                context_control_width / CONTEXT_LENGTH_OPTIONS.len() as f32;
-                            let handle_aspect_ratio = 0.75;
-                            let slider_height = ui
-                                .text_style_height(&egui::TextStyle::Body)
-                                .max(ui.spacing().interact_size.y);
-                            let handle_inset = slider_height / 2.5 * handle_aspect_ratio;
-                            let context_slider_width = context_control_width
-                                - context_tick_width
-                                + 2.0 * handle_inset;
-                            let slider_response = ui
-                                .horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 0.0;
-                                    ui.spacing_mut().slider_width = context_slider_width;
-                                    ui.add_space(
-                                        (context_tick_width / 2.0 - handle_inset).max(0.0),
-                                    );
-                                    ui.add(
-                                        egui::Slider::new(&mut context_index, 0..=6)
-                                            .integer()
-                                            .show_value(false)
-                                            .handle_shape(egui::style::HandleShape::Rect {
-                                                aspect_ratio: handle_aspect_ratio,
-                                            }),
-                                    )
-                                })
-                                .inner;
-                            if slider_response.changed() {
-                                self.state.context_length =
-                                    CONTEXT_LENGTH_OPTIONS[context_index as usize];
-                            }
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                let width = ui.available_width()
-                                    / CONTEXT_LENGTH_OPTIONS.len() as f32;
-                                for value in CONTEXT_LENGTH_OPTIONS {
-                                    ui.add_sized(
-                                        [width, 16.0],
-                                        egui::Label::new(
-                                            RichText::new(format_context_length(value))
-                                                .small()
-                                                .weak(),
-                                        ),
-                                    );
-                                }
-                            });
-                            ui.add_space(8.0);
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .small_button(text(
-                                        language,
-                                        "既定値（32k）に戻す",
-                                        "Reset to 32k",
-                                    ))
-                                    .clicked()
-                                {
-                                    self.state.context_length = DEFAULT_CONTEXT_LENGTH;
-                                }
-                            });
-                        });
-                        ui.add_space(14.0);
+                                "ローカルモデルを使うときだけ効きます。",
+                                "Applies only when you use local models.",
+                            ),
+                        );
                         self.show_ollama_endpoint_settings(ui, language);
+                        ui.add_space(14.0);
+                        self.show_model_settings(ui);
+                        ui.add_space(14.0);
+                        self.show_context_settings(ui);
+                        ui.add_space(14.0);
+                        self.show_web_settings(ui);
+                        ui.add_space(14.0);
+                        self.show_agent_settings(ui);
+                        ui.add_space(28.0);
                     });
                 });
             });
+        });
+    }
+
+    fn show_appearance_settings(&mut self, ui: &mut Ui) {
+        let language = self.language();
+        let palette = theme::palette(ui);
+        theme::card(
+            ui.visuals().faint_bg_color,
+            palette.border,
+            14,
+            16,
+        )
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(text(language, "表示", "Appearance"));
+            ui.add_space(12.0);
+            let change = show_app_shell_preferences(
+                ui,
+                &mut self.shell_preferences,
+                self.system_language,
+                "taceta-main-settings",
+            );
+            if change.changed {
+                apply_app_shell_preferences(
+                    ui.ctx(),
+                    self.shell_preferences,
+                );
+            }
+        });
+    }
+
+    /// Ollama's models: managing them and where they are stored.
+    fn show_model_settings(&mut self, ui: &mut Ui) {
+        let language = self.language();
+        let palette = theme::palette(ui);
+        theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(text(language, "モデル", "Models"));
+            ui.add_space(4.0);
+            ui.label(RichText::new(text(language, "インストール済みモデルを取得・確認・削除します。", "Download, inspect, and delete installed models.")).weak());
+            ui.add_space(10.0);
+            if ui.button(text(language, "モデルを管理", "Manage models")).clicked() {
+                self.screen = Screen::Models;
+                self.refresh_models();
+            }
+            ui.add_space(16.0);
+            ui.strong(text(language, "モデル格納先", "Model location"));
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(text(
+                    language,
+                    "ローカルモデルが保存されている場所です。",
+                    "Location where local models are stored.",
+                ))
+                .weak(),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let mut path = self.model_storage_path.display().to_string();
+                let button_width = 108.0;
+                ui.add_sized(
+                    [
+                        (ui.available_width() - button_width - 8.0).max(160.0),
+                        30.0,
+                    ],
+                    TextEdit::singleline(&mut path).interactive(false),
+                );
+                if ui
+                    .add_sized(
+                        [button_width, 30.0],
+                        Button::new(text(
+                            language,
+                            "Finderで開く",
+                            "Reveal",
+                        )),
+                    )
+                    .clicked()
+                {
+                    self.reveal_model_storage();
+                }
+            });
+        });
+    }
+
+    fn show_context_settings(&mut self, ui: &mut Ui) {
+        let language = self.language();
+        let palette = theme::palette(ui);
+        theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.strong(text(language, "コンテキスト長", "Context length"));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.monospace(format_context_length(
+                        self.state.context_length,
+                    ));
+                });
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(text(
+                    language,
+                    "会話で保持・参照できる情報量です。長いほどメモリを使い、生成開始が遅くなる場合があります。",
+                    "How much of the conversation the model can retain and use. Longer contexts use more memory and may start more slowly.",
+                ))
+                .weak(),
+            );
+            ui.add_space(8.0);
+            let configured_context = self.state.context_length;
+            // Only an Ollama model's limit describes this setting.
+            let reported_limit = (self.state.inference_provider == InferenceProvider::Ollama)
+                .then(|| self.selected_model().and_then(|model| model.context_length))
+                .flatten();
+            ui.horizontal(|ui| {
+                ui.label(text(
+                    language,
+                    "選択中モデルの上限（参考）",
+                    "Selected model limit (reference)",
+                ));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.monospace(
+                        reported_limit
+                            .map(format_context_length)
+                            .unwrap_or_else(|| {
+                                text(language, "不明", "Unknown").to_owned()
+                            }),
+                    );
+                });
+            });
+            let exceeds_reported_limit = reported_limit
+                .is_some_and(|limit| configured_context > limit);
+            let adjustment_note = text(
+                language,
+                if exceeds_reported_limit {
+                    "設定値がモデル上限を超えています。Ollama側でモデルが利用可能な範囲へ調整されます。"
+                } else {
+                    "上限を超える設定は、Ollama側でモデルが利用可能な範囲へ調整されます。"
+                },
+                if exceeds_reported_limit {
+                    "The configured value exceeds this model's limit. Ollama adjusts it to the range the model can use."
+                } else {
+                    "Values above the limit are adjusted by Ollama to the range the model can use."
+                },
+            );
+            let note = RichText::new(adjustment_note).small();
+            ui.label(if exceeds_reported_limit {
+                note.color(palette.warning)
+            } else {
+                note.weak()
+            });
+            ui.add_space(10.0);
+            let mut context_index = CONTEXT_LENGTH_OPTIONS
+                .iter()
+                .position(|value| *value == self.state.context_length)
+                .unwrap_or(3) as u32;
+            let context_control_width = ui.available_width();
+            let context_tick_width =
+                context_control_width / CONTEXT_LENGTH_OPTIONS.len() as f32;
+            let handle_aspect_ratio = 0.75;
+            let slider_height = ui
+                .text_style_height(&egui::TextStyle::Body)
+                .max(ui.spacing().interact_size.y);
+            let handle_inset = slider_height / 2.5 * handle_aspect_ratio;
+            let context_slider_width = context_control_width
+                - context_tick_width
+                + 2.0 * handle_inset;
+            let slider_response = ui
+                .horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.spacing_mut().slider_width = context_slider_width;
+                    ui.add_space(
+                        (context_tick_width / 2.0 - handle_inset).max(0.0),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut context_index, 0..=6)
+                            .integer()
+                            .show_value(false)
+                            .handle_shape(egui::style::HandleShape::Rect {
+                                aspect_ratio: handle_aspect_ratio,
+                            }),
+                    )
+                })
+                .inner;
+            if slider_response.changed() {
+                self.state.context_length =
+                    CONTEXT_LENGTH_OPTIONS[context_index as usize];
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let width = ui.available_width()
+                    / CONTEXT_LENGTH_OPTIONS.len() as f32;
+                for value in CONTEXT_LENGTH_OPTIONS {
+                    ui.add_sized(
+                        [width, 16.0],
+                        egui::Label::new(
+                            RichText::new(format_context_length(value))
+                                .small()
+                                .weak(),
+                        ),
+                    );
+                }
+            });
+            ui.add_space(8.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .small_button(text(
+                        language,
+                        "既定値（32k）に戻す",
+                        "Reset to 32k",
+                    ))
+                    .clicked()
+                {
+                    self.state.context_length = DEFAULT_CONTEXT_LENGTH;
+                }
+            });
+        });
+    }
+
+    fn show_web_settings(&mut self, ui: &mut Ui) {
+        let language = self.language();
+        let palette = theme::palette(ui);
+        theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(text(language, "Web検索", "Web Search"));
+            ui.add_space(4.0);
+            ui.label(RichText::new(text(
+                language,
+                "OllamaのChatで「Web: ON」にしたときだけ使います。作業モードと、GPT・Grok・Claudeでは使いません。",
+                "Used only when Web is ON in an Ollama chat. Agent mode, GPT, Grok and Claude do not use it.",
+            )).weak());
+            ui.add_space(4.0);
+            ui.label(RichText::new(text(
+                language,
+                "Web ON時は、現在の入力だけをローカルLLMが判定します。必要なときだけ選択中の検索先へ送ります。",
+                "When Web is ON, the local LLM classifies only the current input. Taceta uses the selected search route only when needed.",
+            )).weak());
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(text(language, "Web実行方式", "Web executor"));
+                let api_selected = matches!(self.state.web_search_provider, ProviderKind::Brave | ProviderKind::Ollama);
+                if ui.selectable_label(api_selected, "API").clicked() && !api_selected {
+                    self.state.web_search_provider = ProviderKind::Brave;
+                }
+                let link_selected = matches!(self.state.web_search_provider, ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb);
+                if ui.selectable_label(link_selected, "Taceta Link").clicked() && !link_selected {
+                    self.state.web_search_provider = ProviderKind::GoogleSearch;
+                }
+            });
+            ui.horizontal(|ui| {
+                let api_selected = matches!(self.state.web_search_provider, ProviderKind::Brave | ProviderKind::Ollama);
+                ui.label(text(language, if api_selected { "APIプロバイダー" } else { "ブラウザーワークフロー" }, if api_selected { "API provider" } else { "Browser workflow" }));
+                let providers = if api_selected {
+                    [ProviderKind::Brave, ProviderKind::Ollama]
+                } else {
+                    browser_provider_options()
+                };
+                for provider in providers {
+                    if ui.selectable_label(self.state.web_search_provider == provider, provider.label()).clicked() {
+                        self.state.web_search_provider = provider;
+                    }
+                }
+            });
+            if self.state.web_search_provider == ProviderKind::ChatGptWeb {
+                ui.horizontal(|ui| {
+                    ui.label(text(
+                        language,
+                        "ChatGPT最大質問回数",
+                        "Max ChatGPT requests",
+                    ));
+                    let mut value = self.state.chatgpt_web_request_limit as i32;
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut value,
+                                MIN_CHATGPT_WEB_REQUEST_LIMIT as i32
+                                    ..=MAX_CHATGPT_WEB_REQUEST_LIMIT as i32,
+                            )
+                            .integer()
+                            .show_value(true),
+                        )
+                        .changed()
+                    {
+                        self.state.chatgpt_web_request_limit = value as u8;
+                    }
+                });
+                ui.label(
+                    RichText::new(text(
+                        language,
+                        "通常は1回です。2〜3回を明示した場合だけ、ローカルモデルの追加調査案を元の質問に添えて送り、回答をまとめます。",
+                        "The normal setting is 1. Only when 2–3 is explicitly selected are the local model's additional research angles sent with the original question and the answers combined.",
+                    ))
+                    .weak(),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(text(language, "最大検索結果", "Max results"));
+                    let mut value = self.state.max_search_results as i32;
+                    if ui.add(egui::Slider::new(&mut value, 1..=5).integer().show_value(true)).changed() {
+                        self.state.max_search_results = value as u8;
+                    }
+                });
+                ui.checkbox(&mut self.state.fetch_search_pages, text(language, "検索結果の本文も取得", "Fetch result pages"));
+            }
+            if let Some(account) = self.state.web_search_provider.account_name() {
+                ui.add_space(8.0);
+                ui.label(text(language, "APIキー（macOS Keychainに保存）", "API key (saved in macOS Keychain)"));
+                ui.add(egui::TextEdit::singleline(&mut self.web_key_draft).password(true).hint_text(text(language, "キーを入力して保存", "Enter key to save")));
+                ui.horizontal(|ui| {
+                    if ui.button(text(language, "保存", "Save")).clicked() {
+                        let secret = std::mem::take(&mut self.web_key_draft);
+                        let result = web_search::save_keychain_secret(account, &secret);
+                        self.web_key_status = None;
+                        self.notice = Some(match result {
+                            Ok(()) => Notice { kind: NoticeKind::Info, text: text(language, "APIキーをKeychainに保存しました。", "API key saved to Keychain.").to_owned() },
+                            Err(error) => Notice { kind: NoticeKind::Error, text: error.to_string() },
+                        });
+                    }
+                    if ui.button(text(language, "削除", "Delete")).clicked() {
+                        let result = web_search::delete_keychain_secret(account);
+                        self.web_key_status = None;
+                        self.notice = Some(match result {
+                            Ok(()) => Notice { kind: NoticeKind::Info, text: text(language, "APIキーを削除しました。", "API key deleted.").to_owned() },
+                            Err(error) => Notice { kind: NoticeKind::Error, text: error.to_string() },
+                        });
+                    }
+                    let key_status = match self.web_key_status {
+                        Some((checked, status)) if checked == account => status,
+                        _ => {
+                            let status = web_search::keychain_status(account);
+                            self.web_key_status = Some((account, status));
+                            status
+                        }
+                    };
+                    let status = match key_status {
+                        web_search::KeychainStatus::Configured => text(language, "設定済み", "Configured"),
+                        web_search::KeychainStatus::Missing => text(language, "未設定", "Not configured"),
+                        web_search::KeychainStatus::Unavailable => text(language, "Keychainを確認できません", "Keychain could not be checked"),
+                    };
+                    ui.label(RichText::new(status).weak());
+                });
+            } else if matches!(
+                self.state.web_search_provider,
+                ProviderKind::GoogleSearch | ProviderKind::ChatGptWeb
+            ) {
+                ui.add_space(8.0);
+                ui.label(RichText::new(text(
+                    language,
+                    "Taceta Link経由で、選択したブラウザー操作を実行します。APIキーは不要です。",
+                    "Runs the selected browser workflow through Taceta Link. No API key is required.",
+                )).weak());
+                self.show_link_settings(ui, language);
+            } else {
+            }
         });
     }
 
@@ -4164,6 +4214,15 @@ fn ollama_endpoint_error_message(
             )
         ),
     }
+}
+
+/// A heading over the settings that share one scope, and what that scope is.
+fn settings_group(ui: &mut Ui, title: &str, scope: &str) {
+    ui.add_space(28.0);
+    ui.heading(title);
+    ui.add_space(2.0);
+    ui.label(RichText::new(scope).weak());
+    ui.add_space(12.0);
 }
 
 fn format_context_length(value: u32) -> String {

@@ -67,12 +67,17 @@ impl TacetaApp {
 
     pub(super) fn show_provider_settings(&mut self, ui: &mut Ui) {
         let language = self.language();
-        ui.heading(text(language, "推論の接続先", "Inference provider"));
-        self.show_provider_selector(ui);
-        ui.label(text(language,
-            "Ollamaは設定したサーバーを使います。GPTはOpenAI、GrokはxAI、ClaudeはAnthropicへ、会話と作業に必要な内容を送ります。GPT・Grok・Claudeは、このMacに入っている各社の公式CLI（Codex・Grok・Claude Code）を、あなた自身のログインと設定のまま使います。サインインは各CLIで行ってください。",
-            "Ollama uses your configured server. GPT sends task context to OpenAI, Grok to xAI and Claude to Anthropic. GPT, Grok and Claude run each vendor's official CLI (Codex, Grok, Claude Code) installed on this Mac with your own login and settings. Sign in with each CLI itself."));
-        ui.add_space(20.0);
+        let palette = theme::palette(ui);
+        theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(text(language, "推論の接続先", "Inference provider"));
+            ui.add_space(4.0);
+            ui.label(RichText::new(text(language,
+                "会話に使うエンジンです。Ollamaは下で設定したローカルのサーバー、GPT・Grok・Claudeは各社の公式CLIを使います。",
+                "The engine conversations use. Ollama uses the local server set below; GPT, Grok and Claude use each vendor's official CLI.")).weak());
+            ui.add_space(10.0);
+            self.show_provider_selector(ui);
+        });
     }
 }
 
