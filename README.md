@@ -177,7 +177,9 @@ cargo run
 ./scripts/install-macos-app.sh
 ```
 
-既定のインストール先は `~/Applications` です。別の場所へ置く場合は `./scripts/install-macos-app.sh --install-dir /Applications` のように指定します。`cargo run` は開発用であり、インストール済みランタイムとしては使用しないでください。署名、公証、インストーラー作成は現在のスクリプトの範囲外です。
+既定のインストール先は `~/Applications` です。別の場所へ置く場合は `./scripts/install-macos-app.sh --install-dir /Applications` のように指定します。`cargo run` は開発用であり、インストール済みランタイムとしては使用しないでください。公証とインストーラー作成は現在のスクリプトの範囲外です。
+
+既定では仮の署名（ad-hoc）だけで、ビルドのたびにアプリの識別が変わります。macOS はフォルダーへのアクセス許可を署名で覚えるため、デスクトップや書類フォルダーを作業フォルダーにすると、ビルドし直すたびに許可を聞き直されます。ログインキーチェーンにあるコード署名用の証明書を `TACETA_SIGN_IDENTITY` に指定すると、その証明書で署名し、更新後も同じアプリとして扱われます（例: `TACETA_SIGN_IDENTITY="My Local Signing" ./scripts/install-macos-app.sh`）。仮の署名から切り替えた直後だけ、許可を一度聞かれます。このローカル署名は、配布用の Apple 公証とは別のものです。
 
 ## Taceta Link のセットアップ
 
@@ -398,7 +400,9 @@ Install and launch the bundle for the current user:
 ./scripts/install-macos-app.sh
 ```
 
-The default destination is `~/Applications`; use `./scripts/install-macos-app.sh --install-dir /Applications` for another destination. `cargo run` is a development command, not the installed runtime. Code signing, notarization, and installer creation are outside the current scripts.
+The default destination is `~/Applications`; use `./scripts/install-macos-app.sh --install-dir /Applications` for another destination. `cargo run` is a development command, not the installed runtime. Notarization and installer creation are outside the current scripts.
+
+By default the app has only an ad-hoc signature, which changes with every build. macOS remembers folder permissions by signature, so a workspace in Desktop or Documents is asked about again after each rebuild. Set `TACETA_SIGN_IDENTITY` to a code-signing certificate in your login keychain to sign with it and keep the app's identity across updates (for example `TACETA_SIGN_IDENTITY="My Local Signing" ./scripts/install-macos-app.sh`). Only the first launch after switching from the ad-hoc signature asks again. This local signature is separate from Apple notarization for distribution.
 
 ## Set up Taceta Link
 
