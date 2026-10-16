@@ -34,7 +34,8 @@ pub(super) fn input(prompt: &str, attachments: &[Attachment], images: bool) -> R
 /// inside the workspace and commands off the network; a conversation without
 /// tools gets a read-only sandbox and nothing to act with; otherwise the
 /// CLI's own configuration decides and nothing about permissions is sent.
-pub(super) fn thread_params(request: &RunRequest, cwd: &str) -> Value {
+/// `mcp_servers` names the MCP servers a conversation without tools turns off.
+pub(super) fn thread_params(request: &RunRequest, cwd: &str, mcp_servers: &[String]) -> Value {
     let mut params = json!({"modelProvider":"openai", "cwd":cwd});
     if let Some(model) = &request.model { params["model"] = json!(model); }
     match request.approval {
@@ -48,6 +49,9 @@ pub(super) fn thread_params(request: &RunRequest, cwd: &str) -> Value {
                 "features.hooks":false, "features.plugin_hooks":false,
                 "features.shell_tool":false, "features.multi_agent":false, "features.multi_agent_v2":false
             });
+            // The read-only sandbox does not reach an MCP server, which runs as
+            // its own process, so each one is turned off for this thread.
+            for name in mcp_servers { params["config"][format!("mcp_servers.{name}.enabled")] = json!(false); }
         }
         ApprovalPolicy::AskEveryTime => {
             params["approvalPolicy"] = json!("untrusted");
@@ -65,6 +69,21 @@ pub(super) fn thread_params(request: &RunRequest, cwd: &str) -> Value {
     if let Some(thread_id) = &request.session_id { params["threadId"] = json!(thread_id); }
     else { params["ephemeral"] = json!(false); }
     params
+}
+
+/// The MCP servers in Codex's effective configuration, from a `config/read`
+/// answer. A name that cannot be written as one segment of a dotted override
+/// could not be turned off, so it stops the run.
+pub(super) fn mcp_server_names(response: &Value) -> Result<Vec<String>, String> {
+    let servers = match response.pointer("/config/mcp_servers") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Object(servers)) => servers,
+        Some(_) => return Err("Codex reported its MCP servers in an unknown form. No work was started.".into()),
+    };
+    servers.keys().map(|name| {
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') { Ok(name.clone()) }
+        else { Err(format!("The Codex MCP server name {name:?} cannot be turned off for a conversation without tools. No work was started.")) }
+    }).collect()
 }
 
 pub(super) fn turn_params(thread_id: &str, request: &RunRequest, cwd: &str, input: Vec<Value>) -> Value {
@@ -494,23 +513,37 @@ pub(super) mod tests {
 
     #[test]
     fn each_approval_policy_asks_codex_for_its_own_permissions() {
-        let ask = thread_params(&request(ApprovalPolicy::AskEveryTime),"/workspace");
+        let ask = thread_params(&request(ApprovalPolicy::AskEveryTime),"/workspace",&["node_repl".into()]);
         assert_eq!(ask["approvalPolicy"],"untrusted");
         assert_eq!(ask["sandbox"],"workspace-write");
         assert_eq!(ask["config"]["sandbox_workspace_write.network_access"],false);
         // The CLI's own configuration decides: nothing about permissions is sent.
-        for params in [thread_params(&request(ApprovalPolicy::FollowCli),"/workspace"), turn_params("thread",&request(ApprovalPolicy::FollowCli),"/workspace",vec![])] {
+        for params in [thread_params(&request(ApprovalPolicy::FollowCli),"/workspace",&["node_repl".into()]), turn_params("thread",&request(ApprovalPolicy::FollowCli),"/workspace",vec![])] {
             for key in ["approvalPolicy","approvalsReviewer","sandbox","sandboxPolicy","config"] { assert!(params.get(key).is_none(),"{key}"); }
         }
         let chat = request(ApprovalPolicy::NoTools);
-        let thread = thread_params(&chat,"/private/chat");
+        let thread = thread_params(&chat,"/private/chat",&["node_repl".into(),"cloudflare-api".into()]);
         let turn = turn_params("thread",&chat,"/private/chat",vec![]);
         assert_eq!(thread["environments"],json!([]));
         assert_eq!(thread["sandbox"],"read-only");
         assert_eq!(thread["config"]["features.shell_tool"],false);
+        assert_eq!(thread["config"]["mcp_servers.node_repl.enabled"],false);
+        assert_eq!(thread["config"]["mcp_servers.cloudflare-api.enabled"],false);
+        // Only a conversation without tools turns MCP servers off.
+        assert!(ask["config"].get("mcp_servers.node_repl.enabled").is_none());
         assert_eq!(turn["environments"],json!([]));
         assert_eq!(turn["approvalPolicy"],"never");
         assert_eq!(turn["sandboxPolicy"],json!({"type":"readOnly","networkAccess":false}));
+    }
+
+    #[test]
+    fn every_mcp_server_in_the_effective_config_is_named_and_an_unwritable_name_stops_the_run() {
+        let names = mcp_server_names(&json!({"config":{"mcp_servers":{"node_repl":{"command":"node"},"cloudflare-api":{"url":"https://example.invalid"}}}})).unwrap();
+        assert_eq!(names.len(),2);
+        assert!(names.contains(&"node_repl".to_owned()) && names.contains(&"cloudflare-api".to_owned()));
+        assert!(mcp_server_names(&json!({"config":{}})).unwrap().is_empty());
+        assert!(mcp_server_names(&json!({"config":{"mcp_servers":[]}})).is_err());
+        assert!(mcp_server_names(&json!({"config":{"mcp_servers":{"a.b":{}}}})).is_err());
     }
 
     #[test]

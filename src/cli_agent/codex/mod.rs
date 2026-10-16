@@ -199,8 +199,12 @@ async fn prepare(connection: &mut Connection, request: &RunRequest, cwd: &Path, 
     }
     let input = protocol::input(&request.prompt, &request.attachments, images)?;
     let cwd = cwd.to_str().ok_or("The workspace path is not valid UTF-8.")?;
+    let mcp_servers = match request.approval {
+        ApprovalPolicy::NoTools => protocol::mcp_server_names(&connection.call("config/read", json!({"cwd":cwd})).await?)?,
+        _ => Vec::new(),
+    };
     let method = if request.session_id.is_some() { "thread/resume" } else { "thread/start" };
-    let response = connection.call(method, protocol::thread_params(request, cwd)).await?;
+    let response = connection.call(method, protocol::thread_params(request, cwd, &mcp_servers)).await?;
     if request.model.as_deref().is_some_and(|model| response.get("model").and_then(Value::as_str) != Some(model)) {
         return Err("Codex did not accept the selected GPT model. No work was started.".into());
     }
@@ -408,6 +412,37 @@ mod tests {
         // Codex reports network access on, which was not asked for.
         let error=prepare(&mut connection,&req,Path::new("/workspace"),false).await.err().unwrap();
         assert!(error.contains("network access"),"{error}");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_conversation_without_tools_starts_its_thread_with_every_configured_mcp_server_off() {
+        let (client,server)=duplex(16384);let (read,write)=split(client);let mut connection=Connection::from_io(read,write);
+        let req=request(ApprovalPolicy::NoTools);
+        let peer=tokio::spawn(async move{
+            let (read,mut write)=split(server);let mut read=BufReader::new(read);
+            for _ in 0..4 {
+                let mut line=String::new();read.read_line(&mut line).await.unwrap();let call:Value=serde_json::from_str(&line).unwrap();
+                let result=match call["method"].as_str().unwrap() {
+                    "account/read"=>json!({"account":{"type":"chatgpt"}}),
+                    "model/list"=>json!({"data":[{"model":"model","inputModalities":["text"]}]}),
+                    "config/read"=>{
+                        assert_eq!(call["params"]["cwd"],"/workspace");
+                        json!({"config":{"mcp_servers":{"node_repl":{"command":"node"},"byteglass":{"command":"byteglass"}}}})
+                    }
+                    "thread/start"=>{
+                        assert_eq!(call["params"]["config"]["mcp_servers.node_repl.enabled"],false);
+                        assert_eq!(call["params"]["config"]["mcp_servers.byteglass.enabled"],false);
+                        json!({"model":"model","modelProvider":"openai","cwd":"/workspace","approvalPolicy":"never","approvalsReviewer":"user",
+                            "sandbox":{"type":"readOnly","networkAccess":false},"thread":{"id":"thread"}})
+                    }
+                    other=>panic!("unexpected {other}"),
+                };
+                write.write_all(format!("{}\n",json!({"id":call["id"],"result":result})).as_bytes()).await.unwrap();
+            }
+        });
+        let prepared=prepare(&mut connection,&req,Path::new("/workspace"),false).await.unwrap();
+        assert_eq!(prepared.thread_id,"thread");
         peer.await.unwrap();
     }
 }
