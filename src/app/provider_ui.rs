@@ -193,6 +193,7 @@ mod tests {
                     vision: false,
                     tools: true,
                     context_length: Some(131_072),
+                    remote_host: None,
                 }]),
             ))
             .unwrap();
@@ -220,6 +221,7 @@ mod tests {
                 vision: false,
                 tools: true,
                 context_length: None,
+                remote_host: None,
             }])))
             .unwrap();
         app.drain_background_work();

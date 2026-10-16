@@ -110,6 +110,7 @@ pub(super) fn model_descriptor(option: ModelOption) -> ModelDescriptor {
         vision: option.images,
         tools: true,
         context_length: option.context_window.and_then(|window| u32::try_from(window).ok()),
+        remote_host: None,
     }
 }
 

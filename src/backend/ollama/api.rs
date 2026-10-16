@@ -28,6 +28,9 @@ pub(super) struct TagModel {
     pub name: String,
     #[serde(default)]
     pub size: u64,
+    /// Present when the server relays the model to another host.
+    #[serde(default)]
+    pub remote_host: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 pub(super) struct ShowResponse {

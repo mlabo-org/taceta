@@ -178,6 +178,19 @@ pub struct ModelDescriptor {
     /// Context capacity reported by the backend for this exact model.
     #[serde(default)]
     pub context_length: Option<u32>,
+    /// The upstream host a local Ollama relays this model to, such as
+    /// Ollama's cloud. `None` for a model that runs on the Ollama server
+    /// itself, and for every CLI engine's model.
+    #[serde(default)]
+    pub remote_host: Option<String>,
+}
+
+impl ModelDescriptor {
+    /// Whether the Ollama server passes this model's requests on to another
+    /// host instead of running it.
+    pub fn is_remote(&self) -> bool {
+        self.remote_host.is_some()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

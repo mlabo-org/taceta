@@ -54,9 +54,12 @@ pub(super) async fn classify(
         .json(&body)
         .send()
         .await
-        .map_err(routing_request_error)?
-        .error_for_status()
         .map_err(routing_request_error)?;
+    // A cloud model's refusal is not a Web failure.
+    let response = super::client::checked(response).await.map_err(|error| match error {
+        BackendError::Request(error) => routing_request_error(error),
+        other => other,
+    })?;
     let response: ChatChunk = response.json().await.map_err(routing_request_error)?;
     if let Some(error) = response.error {
         return Err(BackendError::Web(format!(
