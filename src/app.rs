@@ -8,6 +8,7 @@ use std::{
 };
 
 mod agent_ui;
+mod base_prompt;
 mod cli_ui;
 mod compaction;
 mod provider_ui;
@@ -1320,8 +1321,13 @@ impl TacetaApp {
         let Some(backend) = self.backend.clone() else {
             return;
         };
+        let base_prompt = self.rendered_base_prompt(&model.name);
+        // The base prompt goes with every request, so the conversation gets
+        // what it leaves of the budget.
+        let budget = compaction::handover_budget(Some(context_length))
+            .saturating_sub(base_prompt.as_ref().map_or(0, |prompt| prompt.chars().count()));
         if self
-            .handover_or_compact(0, compaction::handover_budget(Some(context_length)), {
+            .handover_or_compact(0, budget, {
                 let (backend, model) = (backend.clone(), model.name.clone());
                 move || compaction::Summarizer::Local { backend, model, context_length }
             })
@@ -1345,18 +1351,17 @@ impl TacetaApp {
         }
         let conversation_id = conversation.id;
         conversation.messages.push(user_message);
-        let request_messages = match &conversation.summary {
-            Some(summary) => {
-                let covered = summary.covers_messages.min(conversation.messages.len());
-                let mut messages = vec![ChatMessage::new_system(format!(
-                    "Summary of the conversation up to this point:\n{}",
-                    summary.text
-                ))];
-                messages.extend_from_slice(&conversation.messages[covered..]);
-                messages
-            }
-            None => conversation.messages.clone(),
-        };
+        let covered = conversation
+            .summary
+            .as_ref()
+            .map_or(0, |summary| summary.covers_messages.min(conversation.messages.len()));
+        let request_messages: Vec<ChatMessage> = base_prompt::leading_message(
+            base_prompt,
+            conversation.summary.as_ref().map(|summary| summary.text.as_str()),
+        )
+        .into_iter()
+        .chain(conversation.messages[covered..].iter().cloned())
+        .collect();
         let assistant_message = ChatMessage::new_assistant("");
         let assistant_id = assistant_message.id;
         conversation.messages.push(assistant_message);
@@ -2472,6 +2477,8 @@ impl TacetaApp {
                         self.show_model_settings(ui);
                         ui.add_space(14.0);
                         self.show_context_settings(ui);
+                        ui.add_space(14.0);
+                        self.show_base_prompt_settings(ui);
                         ui.add_space(14.0);
                         self.show_web_settings(ui);
                         ui.add_space(14.0);
@@ -4874,7 +4881,8 @@ mod model_manager_tests {
         let mut app = test_app(services.clone());
         app.models = vec![model("chosen-model")];
         app.state.selected_model = Some("chosen-model".into());
-        app.state.context_length = 2_000;
+        // Room for the base prompt on top of what the conversation is sized for.
+        app.state.context_length = 2_000 + 2 * app.rendered_base_prompt("chosen-model").map_or(0, |prompt| prompt.chars().count() as u32);
         let conversation = app.state.active_conversation_mut();
         for turn in 0..3 {
             conversation.messages.push(ChatMessage::new_user(format!("question {turn} {}", "あ".repeat(400))));
@@ -5041,6 +5049,7 @@ mod model_manager_tests {
         }
 
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_handle = Arc::clone(&requests);
         let mut app = test_app(Arc::new(RecordingServices::default()));
         app.backend = Some(Arc::new(ModelRouteRecorder { requests: Arc::clone(&requests) }));
         app.models = vec![model("model-a"), model("model-b")];
@@ -5058,11 +5067,16 @@ mod model_manager_tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.iter().map(|request| request.model.as_str()).collect::<Vec<_>>(),
             ["model-a", "model-b"]);
-        assert_eq!(requests[0].messages.len(), 1);
-        assert_eq!(requests[1].messages.len(), 3);
-        assert_eq!(requests[1].messages[1].content, "Recorded answer");
-        assert!(requests.iter().all(|request| request.messages.iter()
-            .all(|message| message.role != Role::System)));
+        // Each request starts with the base prompt naming the model it goes
+        // to; the conversation follows with no other system message.
+        assert_eq!(requests[0].messages.len(), 2);
+        assert_eq!(requests[1].messages.len(), 4);
+        assert_eq!(requests[1].messages[2].content, "Recorded answer");
+        for request in requests.iter() {
+            assert_eq!(request.messages[0].role, Role::System);
+            assert!(request.messages[0].content.contains(&request.model), "{}", request.messages[0].content);
+            assert!(request.messages[1..].iter().all(|message| message.role != Role::System));
+        }
 
         let restored: PersistedAppState = serde_json::from_str(
             &serde_json::to_string(&app.state).unwrap()).unwrap();
@@ -5074,6 +5088,18 @@ mod model_manager_tests {
         assert_eq!(identities[0].reported_model.as_deref(), Some("model-a-build"));
         assert_eq!(identities[1].requested_model, "model-b");
         assert_eq!(identities[1].reported_model.as_deref(), Some("model-b-build"));
+        // An emptied prompt sends nothing ahead of the conversation.
+        drop(requests);
+        drop(identities);
+        app.state.local_system_prompt = Some(String::new());
+        app.state.draft = "Again.".into();
+        app.start_generation();
+        wait_until(|| {
+            app.drain_background_work();
+            app.generation.is_none()
+        });
+        let requests = requests_handle.lock().unwrap();
+        assert!(requests[2].messages.iter().all(|message| message.role != Role::System));
     }
 
     #[test]
