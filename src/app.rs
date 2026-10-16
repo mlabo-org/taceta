@@ -888,6 +888,22 @@ impl TacetaApp {
                             self.notice = None;
                         }
                     }
+                    Err(BackendError::Cloud { status, message }) => {
+                        // Ollama itself answered, so the local connection
+                        // stays as it was.
+                        let error = cloud_refusal_text(self.language(), status, &message);
+                        self.notice = Some(Notice { kind: NoticeKind::Error, text: error.clone() });
+                        // Browser text still shown was never accepted as an answer.
+                        if external_preview_remains {
+                            self.remove_message(conversation_id, assistant_id);
+                        }
+                        self.update_assistant(conversation_id, assistant_id, |message| {
+                            message.interrupted = true;
+                            if message.content.is_empty() {
+                                message.content = error;
+                            }
+                        });
+                    }
                     Err(error) => {
                         let web_failure = matches!(error, BackendError::Web(_));
                         let error = error.to_string();
@@ -2404,8 +2420,8 @@ impl TacetaApp {
             ui.label(
                 RichText::new(text(
                     language,
-                    "生成に必要な会話内容と添付は現在のOllama接続先だけへ送ります。設定はこのMacに保存します。",
-                    "Conversation context and attachments needed for generation are sent only to the current Ollama endpoint. Settings stay on this Mac.",
+                    "生成に必要な会話内容と添付は現在のOllama接続先だけへ送ります。ただし「クラウド」と表示されるモデルを選んだときは、Ollamaがその先のクラウドへ取り次ぎます。設定はこのMacに保存します。",
+                    "Conversation context and attachments needed for generation are sent only to the current Ollama endpoint. When you choose a model marked cloud, Ollama passes them on to its cloud. Settings stay on this Mac.",
                 ))
                 .weak(),
             );
@@ -2996,6 +3012,18 @@ impl TacetaApp {
                                                         .small(),
                                                     );
                                                 }
+                                                if is_cloud_tag(&candidate.model) {
+                                                    ui.label(
+                                                        RichText::new(text(language, "クラウド版", "Cloud"))
+                                                            .color(palette.warning)
+                                                            .small(),
+                                                    )
+                                                    .on_hover_text(text(
+                                                        language,
+                                                        "Ollama のクラウドで動く版です。取得しても重みは入らず、会話は Ollama を通って ollama.com へ送られます。使うには Ollama へのサインインと、モデルによっては有料の契約が必要です。",
+                                                        "Runs in Ollama's cloud. Getting it downloads no weights, and conversations go through Ollama to ollama.com. It needs an Ollama sign-in and, for some models, a paid plan.",
+                                                    ));
+                                                }
                                                 ui.with_layout(
                                                     Layout::right_to_left(Align::Center),
                                                     |ui| {
@@ -3130,7 +3158,11 @@ impl TacetaApp {
                                             ui.label(
                                                 RichText::new(format!(
                                                     "{} · {}{}{}",
-                                                    human_size(model.size),
+                                                    // A relayed model's local entry is only a pointer.
+                                                    match &model.remote_host {
+                                                        Some(host) => format!("{} · {host}", text(language, "クラウド", "Cloud")),
+                                                        None => human_size(model.size),
+                                                    },
                                                     capability_label(&model.thinking, language),
                                                     if model.vision { " · vision" } else { "" },
                                                     if model.tools { " · tools" } else { "" }
@@ -3436,11 +3468,16 @@ impl TacetaApp {
         // afterwards the title bar shows it.
         let show_workspace = self.code_mode() && !self.session_started();
         let show_status = self.session_status_visible();
+        // A relayed model leaves this Mac; say so where the message is sent.
+        let cloud_host = (self.state.inference_provider == InferenceProvider::Ollama)
+            .then(|| self.selected_model().and_then(|model| model.remote_host.clone()))
+            .flatten();
         let panel_height = COMPOSER_PANEL_BASE_HEIGHT
             + (editor_viewport_height - COMPOSER_EDITOR_MIN_HEIGHT)
             + attachment_height
             + if show_workspace { line_height } else { 0.0 }
-            + if show_status { line_height } else { 0.0 };
+            + if show_status { line_height } else { 0.0 }
+            + if cloud_host.is_some() { line_height } else { 0.0 };
         Panel::bottom("taceta-composer-panel")
             .exact_size(panel_height)
             .show_separator_line(false)
@@ -3468,6 +3505,19 @@ impl TacetaApp {
                         }
                         if show_status {
                             line(ui, &mut |ui| self.show_session_status(ui));
+                        }
+                        if let Some(host) = &cloud_host {
+                            let notice = match language {
+                                AppShellLanguage::Japanese => format!(
+                                    "このモデルはクラウドで動きます。会話は Ollama を通って {host} へ送られます。"
+                                ),
+                                AppShellLanguage::English => format!(
+                                    "This model runs in the cloud. The conversation goes through Ollama to {host}."
+                                ),
+                            };
+                            line(ui, &mut |ui| {
+                                ui.label(RichText::new(&notice).small().color(palette.warning));
+                            });
                         }
                         let mut keyboard_send = false;
                         let card_response = theme::card(palette.composer, palette.border, 14, 12)
@@ -3664,9 +3714,17 @@ impl TacetaApp {
             .selected_model
             .clone()
             .unwrap_or_else(|| text(language, "モデルなし", "No model").to_owned());
+        let cloud = text(language, "クラウド", "cloud");
+        let label = |model: &ModelDescriptor, name: String| {
+            if model.is_remote() { format!("{name} · {cloud}") } else { name }
+        };
+        let button_text = match self.selected_model() {
+            Some(model) => label(model, compact_model_name(&selected)),
+            None => compact_model_name(&selected),
+        };
         let mut changed = false;
         egui::containers::menu::MenuButton::from_button(
-            Button::new(compact_model_name(&selected))
+            Button::new(button_text)
                 .min_size(Vec2::new(0.0, control.row_height))
                 .right_text("▼")
                 .corner_radius(radius),
@@ -3679,7 +3737,7 @@ impl TacetaApp {
                     ui,
                     &mut selected_model,
                     Some(model.name.clone()),
-                    &model.name,
+                    &label(model, model.name.clone()),
                 )
                 .clicked()
                 {
@@ -4120,6 +4178,15 @@ fn image_media_type(extension: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether a library tag names a cloud model. Ollama stores a pulled cloud
+/// model as `<name>:cloud` or `<name>:<tag>-cloud`; there is no other mark
+/// on a library tag before it is pulled, so this is a hint for the list.
+fn is_cloud_tag(model: &str) -> bool {
+    model
+        .rsplit_once(':')
+        .is_some_and(|(_, tag)| tag == "cloud" || tag.ends_with("-cloud"))
+}
+
 fn compact_model_name(name: &str) -> String {
     let mut compact = name.chars().take(24).collect::<String>();
     if name.chars().count() > 24 {
@@ -4221,6 +4288,28 @@ fn ollama_endpoint_error_message(
                 "The Ollama endpoint configuration is invalid."
             )
         ),
+    }
+}
+
+/// What to tell the user when Ollama's cloud refused a relayed model.
+fn cloud_refusal_text(language: AppShellLanguage, status: u16, message: &str) -> String {
+    let reason = if status == 401 {
+        text(
+            language,
+            "このモデルは Ollama のクラウドで動くため、Ollama へのサインインが必要です。Ollama アプリか、ターミナルの `ollama signin` でサインインしてください。",
+            "This model runs in Ollama's cloud and needs you to sign in to Ollama. Sign in with the Ollama app or `ollama signin` in Terminal.",
+        )
+    } else {
+        text(
+            language,
+            "Ollama のクラウドがこのモデルの利用を断りました。契約に含まれていないか、Ollama のクラウド機能が無効になっています。",
+            "Ollama's cloud refused this model. It is not in your plan, or Ollama's cloud features are turned off.",
+        )
+    };
+    if message.is_empty() {
+        reason.to_owned()
+    } else {
+        format!("{reason}\n({message})")
     }
 }
 
@@ -4851,6 +4940,7 @@ mod model_manager_tests {
             vision: false,
             tools: false,
             context_length: None,
+            remote_host: None,
         }
     }
 
@@ -5018,6 +5108,56 @@ mod model_manager_tests {
             "Test answer"
         );
         assert!(app.state.draft.is_empty());
+    }
+
+    #[test]
+    fn a_cloud_refusal_explains_itself_and_leaves_the_local_connection_ready() {
+        struct RefusingCloud;
+        impl InferenceBackend for RefusingCloud {
+            fn list_models(&self) -> BackendFuture<Vec<ModelDescriptor>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn stream_chat(
+                &self,
+                _request: ChatRequest,
+                _events: mpsc::UnboundedSender<GenerationEvent>,
+            ) -> BackendFuture<()> {
+                Box::pin(async {
+                    Err(BackendError::Cloud { status: 401, message: "unauthorized".into() })
+                })
+            }
+        }
+
+        let mut app = test_app(Arc::new(RecordingServices::default()));
+        app.backend = Some(Arc::new(RefusingCloud));
+        app.connection = ConnectionState::Ready;
+        app.models = vec![ModelDescriptor {
+            remote_host: Some("https://ollama.com:443".into()),
+            ..model("gemma4:cloud")
+        }];
+        app.state.selected_model = Some("gemma4:cloud".into());
+        app.state.draft = "Hello".into();
+        app.start_generation();
+        wait_until(|| {
+            app.drain_background_work();
+            app.generation.is_none()
+        });
+        assert!(matches!(app.connection, ConnectionState::Ready));
+        let notice = app.notice.as_ref().unwrap();
+        assert!(matches!(notice.kind, NoticeKind::Error));
+        assert!(notice.text.contains("ollama signin") && notice.text.contains("unauthorized"), "{}", notice.text);
+        let answer = app.state.active_conversation().messages.last().unwrap();
+        assert!(answer.interrupted);
+    }
+
+    #[test]
+    fn only_a_cloud_tag_is_marked_as_a_cloud_candidate() {
+        for cloud in ["gemma4:cloud", "gpt-oss:120b-cloud", "hf.co/user/model:q4-cloud"] {
+            assert!(is_cloud_tag(cloud), "{cloud}");
+        }
+        for local in ["gemma4:latest", "gemma4:26b-mlx", "cloud", "cloudy:7b", "my-cloud-model:8b"] {
+            assert!(!is_cloud_tag(local), "{local}");
+        }
     }
 
     #[test]

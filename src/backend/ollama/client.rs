@@ -541,13 +541,10 @@ impl InferenceBackend for OllamaClient {
                     },
                     format: None,
                 };
-                let response = client
-                    .http
-                    .post(client.url("/api/chat"))
-                    .json(&body)
-                    .send()
-                    .await?
-                    .error_for_status()?;
+                let response = checked(
+                    client.http.post(client.url("/api/chat")).json(&body).send().await?,
+                )
+                .await?;
                 let streamed = if web_tool_phase_started {
                     stream::consume_research(response.bytes_stream(), events.clone()).await?
                 } else {
@@ -660,13 +657,10 @@ impl InferenceBackend for OllamaClient {
                 "取得したWeb情報を要約しています".into(),
             ));
             let body = web_summary_body(&request, current_input, &messages);
-            let response = client
-                .http
-                .post(client.url("/api/chat"))
-                .json(&body)
-                .send()
-                .await?
-                .error_for_status()?;
+            let response = checked(
+                client.http.post(client.url("/api/chat")).json(&body).send().await?,
+            )
+            .await?;
             let summary = stream::consume_research(response.bytes_stream(), events.clone()).await?;
             if !summary.tool_calls.is_empty() {
                 return Err(BackendError::Web(
@@ -1397,6 +1391,19 @@ impl OllamaModelManager {
     }
 }
 
+/// `error_for_status` for a chat request, except that a 401 or 403, which a
+/// local Ollama returns only for a model it relays to its cloud, becomes
+/// `BackendError::Cloud` with Ollama's own message.
+pub(super) async fn checked(response: reqwest::Response) -> Result<reqwest::Response, BackendError> {
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        let message = body.get("error").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        return Err(BackendError::Cloud { status: status.as_u16(), message });
+    }
+    Ok(response.error_for_status()?)
+}
+
 async fn installed_models(
     http: &reqwest::Client,
     endpoint: &OllamaEndpoint,
@@ -1412,14 +1419,37 @@ async fn installed_models(
     let mut result = Vec::with_capacity(tags.models.len());
     for model in tags.models {
         let name = model.name;
-        let show: ShowResponse = http
-            .post(format!("{}{path}", endpoint.base_url(), path = "/api/show"))
-            .json(&serde_json::json!({"model": name.clone()}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let remote_host = model.remote_host.filter(|host| !host.is_empty());
+        let show = async {
+            http.post(format!("{}{path}", endpoint.base_url(), path = "/api/show"))
+                .json(&serde_json::json!({"model": name.clone()}))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<ShowResponse>()
+                .await
+        }
+        .await;
+        let show = match show {
+            Ok(show) => show,
+            // Ollama answers /api/show for a relayed model from the remote
+            // host, which fails while signed out or with cloud features off.
+            // That model is still listed, with nothing claimed about it; the
+            // local models are not lost with it.
+            Err(_) if remote_host.is_some() => {
+                result.push(ModelDescriptor {
+                    name,
+                    size: model.size,
+                    thinking: crate::domain::ThinkingCapability::Unverified,
+                    vision: false,
+                    tools: false,
+                    context_length: None,
+                    remote_host,
+                });
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let thinking = capability::classify(&name, &show.details.family);
         let vision = capability::has_vision(&show.capabilities);
         let tools = capability::has_tools(&show.capabilities);
@@ -1431,6 +1461,7 @@ async fn installed_models(
             vision,
             tools,
             context_length,
+            remote_host,
         });
     }
     Ok(result)
@@ -2030,6 +2061,81 @@ mod tests {
                 assert_eq!(result.unwrap(), if scenario == 1 { 2 } else { 0 });
             }
         }
+    }
+
+    /// Answers each request on its own connection with the reply `route`
+    /// picks from the request text: (status line, JSON body).
+    fn spawn_routed_server(
+        requests: usize,
+        route: fn(&str) -> (&'static str, &'static str),
+    ) -> String {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 8192];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let (status, body) = route(&String::from_utf8_lossy(&request[..read]));
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn custom_endpoint(base_url: &str) -> OllamaEndpoint {
+        OllamaEndpoint::resolve_from_values(OllamaEndpointMode::Custom, base_url, None, None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_relayed_model_whose_details_fail_stays_listed_beside_the_local_models() {
+        let base_url = spawn_routed_server(4, |request| {
+            if request.starts_with("GET /api/version") {
+                ("200 OK", "{}")
+            } else if request.starts_with("GET /api/tags") {
+                ("200 OK", r#"{"models":[{"name":"gemma4:26b","size":1000},{"name":"gemma4:cloud","size":300,"remote_model":"gemma4","remote_host":"https://ollama.com:443"}]}"#)
+            } else if request.contains("gemma4:cloud") {
+                // Ollama asks its cloud for these details; with cloud features off it refuses.
+                ("403 Forbidden", r#"{"error":"remote model details are unavailable"}"#)
+            } else {
+                ("200 OK", r#"{"capabilities":["completion","tools"],"details":{"family":"gemma4"},"model_info":{}}"#)
+            }
+        });
+        let models = installed_models(&reqwest::Client::new(), &custom_endpoint(&base_url)).await.unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name, "gemma4:26b");
+        assert!(!models[0].is_remote() && models[0].tools);
+        assert_eq!(models[1].remote_host.as_deref(), Some("https://ollama.com:443"));
+        assert!(!models[1].tools && models[1].context_length.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cloud_refusal_is_its_own_error_with_ollamas_message() {
+        let base_url = spawn_routed_server(3, |request| {
+            if request.contains("signed-out") {
+                ("401 Unauthorized", r#"{"error":"unauthorized","signin_url":"https://ollama.com/connect?key=x"}"#)
+            } else if request.contains("not-in-plan") {
+                ("403 Forbidden", r#"{"error":"this model requires a subscription"}"#)
+            } else {
+                ("500 Internal Server Error", r#"{"error":"boom"}"#)
+            }
+        });
+        let http = reqwest::Client::new();
+        let send = |model: &'static str| {
+            let request = http.post(format!("{base_url}/api/chat")).body(model);
+            async move { checked(request.send().await.unwrap()).await }
+        };
+        assert!(matches!(send("signed-out").await,
+            Err(BackendError::Cloud { status: 401, message }) if message == "unauthorized"));
+        assert!(matches!(send("not-in-plan").await,
+            Err(BackendError::Cloud { status: 403, message }) if message.contains("subscription")));
+        // Any other failure stays an ordinary request error.
+        assert!(matches!(send("other").await, Err(BackendError::Request(_))));
     }
 
     fn spawn_pull_server(body: &'static [u8]) -> String {

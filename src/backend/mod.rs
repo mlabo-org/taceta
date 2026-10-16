@@ -27,6 +27,12 @@ pub enum BackendError {
     OllamaStartFailed(String),
     #[error("Ollama did not become ready within 10 seconds")]
     OllamaReadinessTimeout,
+    /// Ollama relayed the request to its cloud and the cloud refused it:
+    /// 401 when the Mac is not signed in to Ollama, 403 when the model is
+    /// not in the plan or cloud features are turned off. The local Ollama
+    /// server itself answered and is reachable.
+    #[error("Ollama's cloud refused the request ({status}): {message}")]
+    Cloud { status: u16, message: String },
 }
 
 pub type BackendFuture<T> = Pin<Box<dyn Future<Output = Result<T, BackendError>> + Send>>;
