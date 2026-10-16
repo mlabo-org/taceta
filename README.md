@@ -72,6 +72,7 @@ Taceta Link は `browser-extension/` の MV3 拡張、Native Messaging Host `org
 - Grok CLIとClaude Code CLIは、それぞれの提供元の規約に基づいて、CLI自身の利用状況データを送信することがあります。Tacetaはその送信を制御しません。
 - TacetaはGPT・Grok・Claudeのサインインを行わず、その認証情報を保存しません。CLIは利用者の通常のログインと設定（`~/.codex`、`~/.grok`、`~/.claude`）で動き、そのCLIに設定済みのMCPサーバー、フック、スキルも働きます。
 - Ollamaの既定接続先は `http://127.0.0.1:11434` です。TacetaはOllamaの設定を自動解決でき、Ollamaとモデルは同梱・再配布しません。
+- Ollamaのクラウドのモデル（画面に「クラウド」と表示）を選んだ場合、会話の内容と添付はローカルのOllamaを通って ollama.com へ送られます。詳しくは「Ollamaのクラウドモデル」を参照してください。
 - Web Search を有効にした場合だけ、設定した検索先へ query、または選択した Web executor の request が送られます。送信前に画面で確認できます。
 - API key が必要な検索 provider の key は macOS Keychain に保存します。Cookie やブラウザーの認証 token を読み出したり、エクスポートしたりしません。
 - Taceta Link の `tabs`、`tabGroups`、`scripting`、`debugger`、`nativeMessaging`、HTTPS host access などの権限は、作業経路と検索ページを扱うために必要です。拡張は Taceta が追跡している tab 以外を対象にしない設計です。
@@ -153,6 +154,22 @@ Ollamaが `0.0.0.0` または `::` で待ち受ける設定は、Ollama公式の
 `OLLAMA_HOST=127.0.0.1:23456 ollama serve` のように、一つのシェルだけへ設定して起動したOllamaのportは、別のGUIアプリから取得できる公式APIがありません。その場合は設定画面で「手動」を選び、接続先を指定してください。既定フォールバック以外の接続先が未到達でも、Tacetaは `11434` へ勝手に戻りません。また、誤ったportで別のOllamaを起動しないよう、Tacetaからの自動起動は既定フォールバック時だけ行います。
 
 Ollamaの公式仕様は [API Base URL](https://docs.ollama.com/api/introduction#base-url)、[macOSの環境変数設定](https://docs.ollama.com/faq#setting-environment-variables-on-mac)、[ネットワーク公開設定](https://docs.ollama.com/faq#how-can-i-expose-ollama-on-my-network) を参照してください。
+
+### Ollamaのクラウドモデル（作者は未検証）
+
+> **注意**：作者は Ollama の有料プランを契約しておらず、クラウドのモデルを実際に動かして確かめる手段が今はありません。この節の内容と Taceta の対応は、Ollama の公式文書、API 仕様、ソースコードから分かったことに基づいて用意したものです。動かない、または説明と違う動きをする可能性があります。使う場合は自己責任で試してください。不具合を見つけたら知らせてもらえると助かります。
+
+Ollama にサインインすると、Ollama のクラウドで動くモデルを、ローカルの Ollama サーバーを通して使えるようになります（[Ollama Cloud](https://docs.ollama.com/cloud)）。Taceta が話す相手はこれまでどおりローカルの Ollama サーバーだけですが、クラウドのモデルを選ぶと、会話の内容と添付は Ollama を通って ollama.com へ送られます。
+
+Taceta での扱いは次のとおりです。
+
+- 取得したクラウドのモデルは、Ollama のモデル一覧（`/api/tags`）に `remote_host` が付いて現れます。Taceta はこれを見て、モデルの選択欄とモデル管理に「クラウド」と表示し、入力欄の上に「会話は Ollama を通って（ホスト）へ送られます」と表示します。
+- モデル管理の取得候補では、`:cloud` または `:<タグ>-cloud` で終わるタグに「クラウド版」と表示します。取得しても重みはダウンロードされず、Ollama に参照だけが登録されます。
+- サインインしていないと 401、プランに含まれないモデルやクラウド機能を止めている場合は 403 が返ります。Taceta はこれを「未接続」とは扱わず、サインインやプランの確認を促すメッセージと Ollama のエラー文を表示します。サインインやプランの変更は Taceta からは行いません。Ollama アプリか、ターミナルの `ollama signin` で行ってください。
+- クラウドのモデルの詳細（Thinking、画像入力、ツール対応、文脈の長さ）を Ollama から取得できない場合も、そのモデルは一覧から消さずに表示します。この場合、Web Search と作業モードはそのモデルでは使えません。
+- まだ対応していない点：作業モードで断られた場合のエラー文は一般的な表示のままです。また、クラウドのモデルで送信するときも、ローカルで読み込み中のモデルは解放されます。
+
+Taceta の側でクラウドへの送信を止めることはできません。確実にローカルだけで使いたい場合は、Ollama の側でクラウド機能を止めてください。`~/.ollama/server.json` に `"disable_ollama_cloud": true` を書くか、環境変数 `OLLAMA_NO_CLOUD=1` を設定して Ollama を再起動します（[Ollama FAQ](https://docs.ollama.com/faq#how-do-i-disable-ollama-cloud-features)）。
 
 ## ソースからビルドして使う
 
@@ -319,6 +336,7 @@ For a direct search request, the first ChatGPT Web request sends the current com
 - The Grok CLI and the Claude Code CLI may also send their own usage telemetry under their vendors' terms. Taceta does not control that.
 - Taceta performs no sign-in for GPT, Grok or Claude and stores no credentials for them. Each CLI runs with your normal login and settings (`~/.codex`, `~/.grok`, `~/.claude`), including that CLI's own MCP servers, hooks and skills.
 - Ollama's default endpoint is `http://127.0.0.1:11434`. Taceta can resolve Ollama's configuration automatically and does not bundle or redistribute Ollama or models.
+- When you choose an Ollama cloud model (marked cloud on screen), conversation content and attachments go through the local Ollama to ollama.com. See "Ollama cloud models".
 - Only when Web Search is enabled, the configured search provider receives a query or request. The UI asks for confirmation before sending.
 - Where a search provider requires an API key, it is stored in the macOS Keychain. Browser cookies and authentication tokens are never read or exported.
 - Taceta Link requests `tabs`, `tabGroups`, `scripting`, `debugger`, `nativeMessaging`, HTTPS host access, and related permissions to operate its working route and search pages. It is designed to act only on tabs tracked as Taceta-owned.
@@ -400,6 +418,22 @@ Wildcard bind addresses `0.0.0.0` and `::` are converted to the connectable loop
 There is no official API through which a separate GUI application can discover an Ollama server started with a shell-only setting such as `OLLAMA_HOST=127.0.0.1:23456 ollama serve`. Select **Manual** in Settings for that case. Taceta does not silently fall back to port `11434` when a configured non-default endpoint is unreachable. To avoid starting another server on the wrong port, Taceta auto-starts Ollama only when using the final default fallback.
 
 See Ollama's official documentation for the [API base URL](https://docs.ollama.com/api/introduction#base-url), [macOS environment configuration](https://docs.ollama.com/faq#setting-environment-variables-on-mac), and [network binding](https://docs.ollama.com/faq#how-can-i-expose-ollama-on-my-network).
+
+### Ollama cloud models (not verified by the author)
+
+> **Note:** The author has no paid Ollama plan and currently has no way to run a cloud model to check this. This section and Taceta's handling are prepared from Ollama's official documentation, API specification and source code. They may not work, or may behave differently from what is described here. If you use them, try them at your own risk. Reports of problems are welcome.
+
+After you sign in to Ollama, models that run in Ollama's cloud can be used through the local Ollama server ([Ollama Cloud](https://docs.ollama.com/cloud)). Taceta still talks only to the local Ollama server, but when you choose a cloud model, conversation content and attachments go through Ollama to ollama.com.
+
+How Taceta handles them:
+
+- A cloud model you have pulled appears in Ollama's model list (`/api/tags`) with `remote_host`. Taceta uses it to mark the model as cloud in the model picker and Model Manager, and shows "The conversation goes through Ollama to (host)" above the message box.
+- In Model Manager's download options, tags ending in `:cloud` or `:<tag>-cloud` are marked as cloud versions. Getting one downloads no weights; Ollama registers only a reference.
+- Without a sign-in Ollama returns 401; for a model outside your plan, or with cloud features turned off, it returns 403. Taceta does not treat these as a lost connection. It shows a message to sign in or check your plan, together with Ollama's error text. Taceta does not sign in or change plans; use the Ollama app or `ollama signin` in Terminal.
+- If Ollama cannot provide a cloud model's details (Thinking, image input, tool support, context length), the model still stays in the list. Web Search and agent mode are then unavailable with that model.
+- Not handled yet: a refusal in agent mode is shown with the generic error text, and loaded local models are still released before a cloud model is used.
+
+Taceta itself cannot stop requests from going to the cloud. To keep everything local, turn cloud features off in Ollama: put `"disable_ollama_cloud": true` in `~/.ollama/server.json`, or set `OLLAMA_NO_CLOUD=1`, and restart Ollama ([Ollama FAQ](https://docs.ollama.com/faq#how-do-i-disable-ollama-cloud-features)).
 
 ## Build and run from source
 
