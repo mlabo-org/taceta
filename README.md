@@ -36,7 +36,9 @@ Google 検索では、AI による概要があれば生成完了を確認して�
 
 ### 設定
 
-表示言語、テーマ、モデル管理、Web Search、モデル保存先、context length を設定できます。
+設定は、効く範囲ごとに3つに分かれています。「全エンジン共通」は接続先、表示言語・テーマ・文字サイズ、1回の実行時間の上限です。「GPT・Grok・Claude」は各社の公式CLIで動き、ログイン、システムプロンプト、CLIの設定は各社のものがそのまま効きます。「Ollama（ローカルモデル）」は接続先、モデル管理と保存先、context length、ベースのシステムプロンプト、Web Search、作業モードの推論回数上限で、ローカルモデルを使うときだけ効きます。
+
+ベースのシステムプロンプトは、OllamaのChatで毎回会話の先頭に付ける短い指示です。既定では今日の日付、選んでいるモデル名、知らないことは知らないと言うこと、ユーザーと同じ言語で答えることを伝えます。`{date}` と `{model}` は送信時に置き換わり、空にすると何も付けません。Web Search と作業モードは、それぞれ専用の指示を使うので付けません。
 
 Ollamaのモデルは、Tacetaが次の2つの時点でメモリから解放します。別のモデルで送信するときは、そのモデルを読み込む前に、読み込み中の他のモデルを解放します。2つのモデルを同時に抱えてメモリが足りなくなることを防ぐためです。Tacetaを終了するときは、その起動中にローカルのモデルを使っていれば、読み込み中のモデルを解放してから終了します。どちらも接続先のOllamaに読み込まれている全モデルが対象で、他のアプリが使用するモデルも含みます。モデルファイルと会話は残ります。解放できなかった場合、送信は新しいモデルを読み込まずに失敗として表示します。終了時の待ち時間は20秒までで、強制終了や異常終了では解放されません。
 
@@ -179,7 +181,29 @@ cargo run
 
 既定のインストール先は `~/Applications` です。別の場所へ置く場合は `./scripts/install-macos-app.sh --install-dir /Applications` のように指定します。`cargo run` は開発用であり、インストール済みランタイムとしては使用しないでください。公証とインストーラー作成は現在のスクリプトの範囲外です。
 
-既定では仮の署名（ad-hoc）だけで、ビルドのたびにアプリの識別が変わります。macOS はフォルダーへのアクセス許可を署名で覚えるため、デスクトップや書類フォルダーを作業フォルダーにすると、ビルドし直すたびに許可を聞き直されます。ログインキーチェーンにあるコード署名用の証明書を `TACETA_SIGN_IDENTITY` に指定すると、その証明書で署名し、更新後も同じアプリとして扱われます（例: `TACETA_SIGN_IDENTITY="My Local Signing" ./scripts/install-macos-app.sh`）。仮の署名から切り替えた直後だけ、許可を一度聞かれます。このローカル署名は、配布用の Apple 公証とは別のものです。
+### アクセス許可を保つためのローカル署名（任意）
+
+既定のビルドは仮の署名（ad-hoc）だけです。macOS はデスクトップや書類フォルダーへのアクセス許可をアプリの署名で覚えるため、仮の署名のままだと許可が保たれません。作業フォルダーがデスクトップや書類にあると、起動し直すたびやビルドし直すたびに許可を求められます。自分用のコード署名証明書をログインキーチェーンに一度作り、その名前を `TACETA_SIGN_IDENTITY` に指定してビルドすると、更新後も同じアプリとして扱われ、許可は一度で済みます。
+
+1. キーチェーンアクセスを開きます。Spotlight で「キーチェーンアクセス」を検索してください（最近の macOS では `/System/Library/CoreServices/Applications/` にあります）。
+2. メニューの「キーチェーンアクセス」>「証明書アシスタント」>「証明書を作成…」を選びます。
+3. 「名前」に任意の名前（例: `My Local Signing`）を入れ、「固有名のタイプ」を「自己署名ルート」、「証明書のタイプ」を「コード署名」にして作成します。有効期間を決めたい場合は「デフォルトを無効化」を選ぶと指定できます。期限が切れると署名できなくなります。
+4. 使えるかを確認します。作った名前が表示されれば使えます。
+
+   ```sh
+   security find-identity -v -p codesigning
+   ```
+
+   表示されない場合は、キーチェーンアクセスでその証明書を開き、「信頼」の「コード署名」を「常に信頼」にしてから、もう一度確認します。
+5. 名前を指定してビルドし、インストールします。スクリプトは補助プログラム `taceta-link-host` とアプリ本体をその証明書で署名し、署名を検証します。指定しなければ、これまでどおり仮の署名です。
+
+   ```sh
+   TACETA_SIGN_IDENTITY="My Local Signing" ./scripts/install-macos-app.sh
+   ```
+
+6. 署名を確かめるには `codesign -d -r- ~/Applications/Taceta.app` を実行します。`identifier "org.mlabo.taceta" and certificate leaf = H"…"` と出れば、その証明書で署名されています。`cdhash` が出る場合は仮の署名のままです。
+
+仮の署名から切り替えた直後の最初の起動だけ、許可をもう一度求められます。証明書を作り直した場合も、新しい証明書で署名した最初の起動で一度求められます。証明書と秘密鍵はキーチェーンに置いたままにし、リポジトリには含めないでください。このローカル署名は、配布用の Apple 公証とは別のものです。
 
 ## Taceta Link のセットアップ
 
@@ -259,7 +283,9 @@ The main view keeps local-model output, the Thinking trace, Markdown tables and 
 
 ### Settings
 
-Configure language, theme, model management, Web Search, the model location, and context length.
+Settings are grouped by what they apply to. "All engines" holds the provider, language, theme and text size, and the time limit per run. "GPT, Grok and Claude" run through each vendor's official CLI, whose login, system prompt and settings apply as they are. "Ollama (local models)" holds the endpoint, model management and location, context length, the base system prompt, Web Search, and agent mode's inference call limit, and applies only to local models.
+
+The base system prompt is a short instruction put ahead of every Ollama chat request. By default it gives today's date and the selected model's name, and asks the model to say when it does not know and to answer in the user's language. `{date}` and `{model}` are filled in when sending, and an empty prompt sends nothing. Web Search and agent mode use their own instructions instead.
 
 Taceta releases Ollama models from memory at two points. When you send with a different model, the other loaded models are released before that model is loaded, so two models are never held at once. When you quit Taceta after using a local model in that session, loaded models are released before the app exits. Both apply to every model loaded on the connected Ollama, including models another app is using. Model files and conversations are kept. If a model cannot be released, the send fails visibly without loading the new model. Quitting waits at most 20 seconds, and a forced or abnormal exit releases nothing.
 
@@ -402,7 +428,29 @@ Install and launch the bundle for the current user:
 
 The default destination is `~/Applications`; use `./scripts/install-macos-app.sh --install-dir /Applications` for another destination. `cargo run` is a development command, not the installed runtime. Notarization and installer creation are outside the current scripts.
 
-By default the app has only an ad-hoc signature, which changes with every build. macOS remembers folder permissions by signature, so a workspace in Desktop or Documents is asked about again after each rebuild. Set `TACETA_SIGN_IDENTITY` to a code-signing certificate in your login keychain to sign with it and keep the app's identity across updates (for example `TACETA_SIGN_IDENTITY="My Local Signing" ./scripts/install-macos-app.sh`). Only the first launch after switching from the ad-hoc signature asks again. This local signature is separate from Apple notarization for distribution.
+### Local signing to keep folder permissions (optional)
+
+The default build has only an ad-hoc signature. macOS remembers Desktop and Documents folder permissions by the app's signature, so with an ad-hoc signature the permission does not stick: a workspace in Desktop or Documents is asked about again after each relaunch or rebuild. Create a code-signing certificate for yourself in the login keychain once and build with its name in `TACETA_SIGN_IDENTITY`; the app then keeps its identity across updates and asks only once.
+
+1. Open Keychain Access. Search for it with Spotlight (recent macOS versions keep it in `/System/Library/CoreServices/Applications/`).
+2. Choose Keychain Access > Certificate Assistant > Create a Certificate….
+3. Enter any Name (for example `My Local Signing`), set Identity Type to Self Signed Root and Certificate Type to Code Signing, and create it. Select "Let me override defaults" to choose the validity period. An expired certificate can no longer sign.
+4. Check that it can be used. It is usable when its name is listed.
+
+   ```sh
+   security find-identity -v -p codesigning
+   ```
+
+   If it is not listed, open the certificate in Keychain Access, set Code Signing under Trust to Always Trust, and check again.
+5. Build and install with the name. The script signs the `taceta-link-host` helper and then the app with that certificate, and verifies the signature. Without the variable the build keeps the ad-hoc signature.
+
+   ```sh
+   TACETA_SIGN_IDENTITY="My Local Signing" ./scripts/install-macos-app.sh
+   ```
+
+6. To check the signature, run `codesign -d -r- ~/Applications/Taceta.app`. `identifier "org.mlabo.taceta" and certificate leaf = H"…"` means it is signed with your certificate; a `cdhash` means it still has the ad-hoc signature.
+
+Only the first launch after switching from the ad-hoc signature asks again, and so does the first launch after signing with a newly created certificate. Keep the certificate and its private key in the keychain and out of the repository. This local signature is separate from Apple notarization for distribution.
 
 ## Set up Taceta Link
 
