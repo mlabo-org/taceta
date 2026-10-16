@@ -154,6 +154,10 @@ pub struct PersistedAppState {
     /// CLI's own permission settings decide.
     #[serde(default = "default_cli_ask_every_time")]
     pub cli_ask_every_time: bool,
+    /// The system prompt put ahead of a plain Ollama chat. `None` uses the
+    /// built-in one in the current language; an empty text sends nothing.
+    #[serde(default)]
+    pub local_system_prompt: Option<String>,
 }
 
 fn default_cli_ask_every_time() -> bool {
@@ -184,6 +188,7 @@ impl Default for PersistedAppState {
             ollama_endpoint_mode: OllamaEndpointMode::Auto,
             ollama_custom_endpoint: String::new(),
             taceta_link_setup_acknowledged: false,
+            local_system_prompt: None,
         }
     }
 }

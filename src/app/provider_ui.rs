@@ -152,6 +152,8 @@ mod tests {
         state.agent_max_steps = 120;
         state.agent_max_duration_secs = 7_200;
         state.show_thinking_trace = true;
+        assert!(state.local_system_prompt.is_none());
+        state.local_system_prompt = Some(String::new());
         save_app_state(&mut storage, &state, &mut None);
         let restored = load_app_state(Some(&storage)).state;
         assert_eq!(restored.inference_provider, InferenceProvider::Grok);
@@ -168,6 +170,8 @@ mod tests {
         assert_eq!(restored.agent_max_steps, 120);
         assert_eq!(restored.agent_max_duration_secs, 7_200);
         assert!(restored.show_thinking_trace);
+        // An emptied prompt stays empty rather than returning to the default.
+        assert_eq!(restored.local_system_prompt.as_deref(), Some(""));
     }
 
     #[test]
