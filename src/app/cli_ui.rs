@@ -165,6 +165,28 @@ impl TacetaApp {
 
     /// Who approves what a coding CLI does: Taceta each time, or the CLI's
     /// own settings. Always in view, and marked when nothing is asked here.
+    /// What GPT, Grok and Claude use, and where their one Taceta control is.
+    pub(super) fn show_cli_settings(&mut self, ui: &mut Ui) {
+        let language = self.language();
+        let palette = theme::palette(ui);
+        theme::card(ui.visuals().faint_bg_color, palette.border, 14, 16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(text(language, "各社の公式CLI", "Official vendor CLIs"));
+            ui.add_space(4.0);
+            ui.label(RichText::new(text(language,
+                "GPTはCodex、GrokはGrok CLI、ClaudeはClaude Codeを、このMacに入っているまま使います。ログイン、システムプロンプト、各CLIの設定は各社のものがそのまま効きます。サインインは各CLIで行ってください。",
+                "GPT uses Codex, Grok the Grok CLI and Claude Claude Code, as installed on this Mac. Each vendor's login, system prompt and CLI settings apply as they are. Sign in with each CLI itself.")).weak());
+            ui.add_space(6.0);
+            ui.label(RichText::new(text(language,
+                "会話と作業に必要な内容は、GPTはOpenAI、GrokはxAI、ClaudeはAnthropicへ送られます。",
+                "The content a conversation or task needs is sent to OpenAI for GPT, xAI for Grok and Anthropic for Claude.")).weak());
+            ui.add_space(6.0);
+            ui.label(RichText::new(text(language,
+                "Codeモードで操作を毎回確認するか自動で承認するかは、入力欄の横のボタンで切り替えます。",
+                "Whether Code mode asks before each action or approves automatically is switched with the button beside the message box.")).weak());
+        });
+    }
+
     pub(super) fn show_cli_approval_chip(&mut self, ui: &mut Ui) {
         if self.state.active_conversation().cli_chat {
             return;
