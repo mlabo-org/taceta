@@ -8,6 +8,18 @@ mod types;
 mod workspace;
 
 pub use context::reserved_output_tokens;
+
+/// How a run's error begins when the search Web ON requires failed before
+/// any work, so the UI can explain it as Chat explains a Web failure.
+pub const WEB_RESEARCH_FAILED: &str = "Web research failed before work began";
+
+/// Whether these messages, with their attachments, fit the one record a Chat
+/// import or a user instruction is saved as. Checked before anything is sent.
+pub fn fits_one_record(messages: &[AgentMessage]) -> bool {
+    // The record's own envelope is small next to this margin.
+    const ENVELOPE: u64 = 64 * 1024;
+    serde_json::to_vec(messages).is_ok_and(|bytes| bytes.len() as u64 + ENVELOPE <= journal::MAX_RECORD_BYTES)
+}
 pub use types::*;
 
 use context::ContextPlan;
@@ -314,9 +326,12 @@ impl AgentSession {
         if config
             .prompt
             .as_ref()
-            .is_some_and(|prompt| prompt.trim().is_empty())
+            .is_some_and(|prompt| prompt.trim().is_empty() && config.attachments.is_empty())
         {
             return Err("An added user instruction cannot be empty".into());
+        }
+        if config.prompt.is_none() && !config.attachments.is_empty() {
+            return Err("Attachments need an added user instruction".into());
         }
         let _lock = self.journal.lock()?;
         self.reload()?;
@@ -332,6 +347,7 @@ impl AgentSession {
         if let Some(prompt) = &config.prompt {
             self.record(EventData::UserInput {
                 content: prompt.clone(),
+                attachments: config.attachments.clone(),
             })?;
         }
         if self.state.instructions.is_empty() {
@@ -354,10 +370,34 @@ impl AgentSession {
         })?;
         self.send_snapshot(&events);
         let deadline = Instant::now() + Duration::from_secs(config.max_duration_secs);
-        let definitions = tool_definitions();
+        let mut definitions = tool_definitions();
+        if let Some(web) = &config.web {
+            definitions.extend(web.0.tools());
+        }
+        let mut seen_call_ids = self.journal.seen_call_ids();
+        // Web ON searches each new instruction before any work, as Chat does.
+        if let (Some(web), Some(prompt), false) = (&config.web, &config.prompt, config.compact_only) {
+            let research = tokio::select! {
+                biased;
+                _ = cancellation(cancel.clone()) => return self.finish(SessionStatus::Interrupted, Some("Stopped by the user during Web research".into()), &events),
+                _ = tokio::time::sleep_until(deadline) => return self.finish(SessionStatus::LimitReached, Some("The total run time limit was reached during Web research".into()), &events),
+                result = web.0.research(prompt.clone(), progress_lines(&events)) => result,
+            };
+            let (call, result) = match research {
+                Ok(research) => research,
+                Err(error) => return self.finish(SessionStatus::Failed, Some(format!("{WEB_RESEARCH_FAILED}: {error}")), &events),
+            };
+            let turn = AgentTurn { tool_calls: vec![call.clone()], ..AgentTurn::default() };
+            if let Err(error) = validate_turn(&turn, &mut seen_call_ids) {
+                return self.finish(SessionStatus::Failed, Some(error), &events);
+            }
+            self.record(EventData::AssistantTurn { turn })?;
+            self.record(EventData::ToolStarted { call: call.clone() })?;
+            self.tool_result(&call, Ok(result))?;
+            self.send_snapshot(&events);
+        }
         let mut calls = 0;
         let mut failures = 0;
-        let mut seen_call_ids = self.journal.seen_call_ids();
         loop {
             if *cancel.borrow() {
                 return self.finish(
@@ -500,7 +540,7 @@ impl AgentSession {
                         &events,
                     );
                 }
-                let prepared = match self.prepare(&workspace, &call) {
+                let prepared = match self.prepare(&workspace, config.web.as_ref(), &call) {
                     Ok(tool) => tool,
                     Err(error) => {
                         self.tool_result(&call, Err(error))?;
@@ -581,6 +621,15 @@ impl AgentSession {
                     }
                     Prepared::HistorySearch(arguments) => self.search_history(arguments),
                     Prepared::HistoryRead(arguments) => self.read_history(arguments),
+                    Prepared::Web(web) => {
+                        let instruction = self.state.instructions.last().map(|(_, text, _)| text.clone()).unwrap_or_default();
+                        tokio::select! {
+                            biased;
+                            _ = cancellation(cancel.clone()) => return self.finish(SessionStatus::Interrupted, Some("Stopped during Web research".into()), &events),
+                            _ = tokio::time::sleep_until(deadline) => return self.finish(SessionStatus::LimitReached, Some("The total run time limit was reached during Web research".into()), &events),
+                            result = web.0.call(call.clone(), instruction, progress_lines(&events)) => result,
+                        }
+                    }
                 };
                 if result.is_err() {
                     failures += 1;
@@ -616,8 +665,14 @@ impl AgentSession {
     fn prepare(
         &self,
         workspace: &WorkspaceTools,
+        web: Option<&WebAccess>,
         call: &AgentToolCall,
     ) -> Result<Prepared, String> {
+        if let Some(web) = web
+            && web.0.tools().iter().any(|tool| tool.name == call.name)
+        {
+            return Ok(Prepared::Web(web.clone()));
+        }
         match call.name.as_str() {
             "update_work_state" => {
                 let state: WorkState = serde_json::from_value(call.arguments.clone())
@@ -801,6 +856,8 @@ enum Prepared {
     WorkState(WorkState),
     HistorySearch(HistorySearch),
     HistoryRead(HistoryRead),
+    /// Read-only and run by Taceta, so it needs no approval, as in Chat.
+    Web(WebAccess),
 }
 impl Prepared {
     fn proposal(&self) -> Option<(String, String)> {
@@ -853,6 +910,18 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","additionalProperties":false,"required":["seq"],"properties":{"seq":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":16384}}}) },
     ]);
     tools
+}
+
+/// A sender for display lines that arrive as [`AgentEvent::Progress`].
+fn progress_lines(events: &UnboundedSender<AgentEvent>) -> UnboundedSender<String> {
+    let (lines, mut received) = mpsc::unbounded_channel();
+    let events = events.clone();
+    tokio::spawn(async move {
+        while let Some(line) = received.recv().await {
+            let _ = events.send(AgentEvent::Progress(line));
+        }
+    });
+    lines
 }
 
 struct Stop {

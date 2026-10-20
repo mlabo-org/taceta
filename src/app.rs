@@ -23,7 +23,7 @@ use eframe::egui::{
 };
 use taceta::{
     backend::{
-        BackendError, InferenceBackend, ModelManager, OllamaClient, OllamaEndpoint, OllamaEndpointError,
+        BackendError, InferenceBackend, ModelManager, OllamaAgentWeb, OllamaClient, OllamaEndpoint, OllamaEndpointError,
         OllamaEndpointMode, OllamaEndpointSource, OllamaModelManager,
     },
     domain::{
@@ -3590,7 +3590,7 @@ impl TacetaApp {
                                 .add_enabled(
                                     !self.is_generating() && match self.cli_ui.agent(self.state.inference_provider) {
                                         Some(agent) => agent.accepts_attachments(),
-                                        None => !self.state.active_conversation().agent_enabled,
+                                        None => true,
                                     },
                                     Button::new("＋")
                                         .min_size(Vec2::splat(control.row_height))
@@ -3606,16 +3606,13 @@ impl TacetaApp {
                                 .state
                                 .active_conversation()
                                 .web_search_enabled
-                                && self.state.inference_provider == InferenceProvider::Ollama
-                                && !self.state.active_conversation().agent_enabled;
+                                && self.state.inference_provider == InferenceProvider::Ollama;
                             let web_available = self
                                 .selected_model()
                                 .is_some_and(|model| model.tools)
-                                && self.state.inference_provider == InferenceProvider::Ollama
-                                && !self.state.active_conversation().agent_enabled;
+                                && self.state.inference_provider == InferenceProvider::Ollama;
                             let web_label = if web_enabled { "Web: ON" } else { "Web: OFF" };
                             if self.state.inference_provider == InferenceProvider::Ollama
-                                && !self.state.active_conversation().agent_enabled
                                 && ui
                                 .add_enabled(
                                     web_available && !self.is_generating(),

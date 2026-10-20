@@ -1,6 +1,6 @@
-use crate::domain::ThinkingMode;
+use crate::domain::{Attachment, ThinkingMode};
 use serde::{Deserialize, Serialize};
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
@@ -11,6 +11,41 @@ pub trait AgentModel: Send + Sync {
         request: AgentRequest,
         events: UnboundedSender<ModelDelta>,
     ) -> Pin<Box<dyn Future<Output = Result<AgentTurn, String>> + Send>>;
+}
+
+pub type AgentWebFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// Web research for a run the user turned Web on for. The adapter owns the
+/// providers, the browser link and the request budgets for the whole run, the
+/// same ones Chat uses; the executor only decides when to call it. Progress
+/// lines are for display.
+pub trait AgentWeb: Send + Sync {
+    /// The web tools, declared as Chat declares them.
+    fn tools(&self) -> Vec<ToolDefinition>;
+    /// The search Web ON requires for each new instruction before any work,
+    /// as the call that was made and its result.
+    fn research(
+        &self,
+        instruction: String,
+        progress: UnboundedSender<String>,
+    ) -> AgentWebFuture<Result<(AgentToolCall, String), String>>;
+    /// Runs one web tool call the model made for `instruction`.
+    fn call(
+        &self,
+        call: AgentToolCall,
+        instruction: String,
+        progress: UnboundedSender<String>,
+    ) -> AgentWebFuture<Result<String, String>>;
+}
+
+/// Shares one run's [`AgentWeb`]; Debug names only whether it is there.
+#[derive(Clone)]
+pub struct WebAccess(pub Arc<dyn AgentWeb>);
+
+impl std::fmt::Debug for WebAccess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WebAccess")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +75,9 @@ pub struct AgentMessage {
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub tool_name: Option<String>,
+    /// Files the user attached to this message, sent the way Chat sends them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 /// Portable, public work records from another execution service. They carry
@@ -75,6 +113,7 @@ impl AgentMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
+            attachments: Vec::new(),
         }
     }
 }
@@ -191,12 +230,16 @@ pub struct RunConfig {
     pub context_length: u32,
     /// None resumes an unfinished task; Some durably adds a user instruction.
     pub prompt: Option<String>,
+    /// Files attached to `prompt`. A prompt may be empty when it has some.
+    pub attachments: Vec<Attachment>,
     /// Total inference calls, including compaction calls.
     pub max_steps: u32,
     /// Includes inference, tools, and time waiting for approval.
     pub max_duration_secs: u64,
     /// Uses the shared compaction path, then stops without running work tools.
     pub compact_only: bool,
+    /// Present when the user turned Web on for this conversation.
+    pub web: Option<WebAccess>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

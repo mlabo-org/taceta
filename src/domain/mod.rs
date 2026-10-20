@@ -40,6 +40,33 @@ pub struct Attachment {
     pub payload: AttachmentPayload,
 }
 
+/// A message's text as a model receives it, in Chat and in Code alike: each
+/// text attachment follows the typed text under its own name. Images travel
+/// beside the text, see [`attachment_images`].
+pub fn text_with_attachments(content: &str, attachments: &[Attachment]) -> String {
+    let mut text = content.to_owned();
+    for attachment in attachments {
+        if let AttachmentPayload::Text(body) = &attachment.payload {
+            text.push_str("\n\n--- ");
+            text.push_str(&attachment.name);
+            text.push_str(" ---\n");
+            text.push_str(body);
+        }
+    }
+    text
+}
+
+/// The base64 data of each image attachment, in order.
+pub fn attachment_images(attachments: &[Attachment]) -> Vec<String> {
+    attachments
+        .iter()
+        .filter_map(|attachment| match &attachment.payload {
+            AttachmentPayload::Image { base64, .. } => Some(base64.clone()),
+            AttachmentPayload::Text(_) => None,
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: Uuid,

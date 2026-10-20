@@ -62,6 +62,6 @@ pub trait ModelManager: Send + Sync {
 }
 
 pub use ollama::{
-    DEFAULT_OLLAMA_BASE_URL, OllamaClient, OllamaEndpoint, OllamaEndpointError, OllamaEndpointMode,
+    DEFAULT_OLLAMA_BASE_URL, OllamaAgentWeb, OllamaClient, OllamaEndpoint, OllamaEndpointError, OllamaEndpointMode,
     OllamaEndpointSource, OllamaModelManager,
 };

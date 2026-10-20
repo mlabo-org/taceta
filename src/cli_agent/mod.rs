@@ -185,9 +185,10 @@ pub trait CliAgent: Send + Sync {
         Box::pin(async { None })
     }
 
-    /// Whether a prompt may carry [`RunRequest::attachments`].
+    /// Whether a prompt may carry [`RunRequest::attachments`]. Images also
+    /// need a model whose [`ModelOption::images`] is set.
     fn accepts_attachments(&self) -> bool {
-        false
+        true
     }
 
     /// Runs one prompt to its end. Dropping the returned future, or setting
@@ -199,4 +200,14 @@ pub trait CliAgent: Send + Sync {
         controls: mpsc::UnboundedReceiver<Control>,
         cancel: watch::Receiver<bool>,
     ) -> CliFuture<RunOutcome>;
+}
+
+/// An attached text file as every CLI is given it, as its own text block.
+pub(crate) fn attached_text(attachment: &Attachment, content: &str) -> String {
+    format!("Attached document: {}\n\n{content}", attachment.name)
+}
+
+/// The image types every CLI here accepts.
+pub(crate) fn accepted_image_type(media_type: &str) -> bool {
+    matches!(media_type, "image/png" | "image/jpeg" | "image/webp" | "image/gif")
 }

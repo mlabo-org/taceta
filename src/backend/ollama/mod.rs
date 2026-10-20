@@ -8,7 +8,7 @@ mod router;
 mod stream;
 mod web_tools;
 
-pub use client::{OllamaClient, OllamaModelManager};
+pub use client::{OllamaAgentWeb, OllamaClient, OllamaModelManager};
 pub use endpoint::{
     DEFAULT_OLLAMA_BASE_URL, OllamaEndpoint, OllamaEndpointError, OllamaEndpointMode,
     OllamaEndpointSource,

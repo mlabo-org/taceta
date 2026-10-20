@@ -325,6 +325,30 @@ fn replace_file(path: &Path, content: &[u8], mode: u32) -> Result<(), String> {
 // JSON-RPC plumbing
 // ---------------------------------------------------------------------------
 
+/// The prompt's content blocks: the text, then each attachment. The CLI's
+/// `initialize` answers `promptCapabilities.image: false`, yet an ACP image
+/// block is read (measured with CLI 1.0.52), so images are sent as such.
+fn prompt_blocks(prompt: &str, attachments: &[crate::domain::Attachment]) -> Result<Vec<Value>, String> {
+    let mut blocks = Vec::new();
+    if !prompt.is_empty() || attachments.is_empty() {
+        blocks.push(json!({"type": "text", "text": prompt}));
+    }
+    for attachment in attachments {
+        match &attachment.payload {
+            crate::domain::AttachmentPayload::Text(text) => {
+                blocks.push(json!({"type": "text", "text": super::attached_text(attachment, text)}));
+            }
+            crate::domain::AttachmentPayload::Image { media_type, base64 } => {
+                if !super::accepted_image_type(media_type) || base64.is_empty() {
+                    return Err(format!("Grok accepts PNG, JPEG, WebP and GIF images; {} was not sent.", attachment.name));
+                }
+                blocks.push(json!({"type": "image", "mimeType": media_type, "data": base64}));
+            }
+        }
+    }
+    Ok(blocks)
+}
+
 fn request_message(id: u64, method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
 }
@@ -558,7 +582,8 @@ fn parse_model_option(model: &Value) -> Result<ModelOption, String> {
         context_window,
         efforts,
         default_effort,
-        images: false,
+        // Read over ACP although `initialize` does not declare it; see prompt_blocks.
+        images: true,
     })
 }
 
@@ -677,9 +702,13 @@ async fn drive(
         refused: false,
     };
     let prompt_id = 100;
+    let blocks = match prompt_blocks(&request.prompt, &request.attachments) {
+        Ok(blocks) => blocks,
+        Err(error) => return RunOutcome::failed(Some(turn.session_id), error),
+    };
     let prompt = json!({
         "sessionId": turn.session_id,
-        "prompt": [{"type": "text", "text": request.prompt}]
+        "prompt": blocks
     });
     if let Err(error) = process
         .send(&request_message(prompt_id, "session/prompt", prompt))
@@ -1380,6 +1409,20 @@ fn approval_detail(tool_call: &Value, tracked: Option<&ToolItem>) -> String {
 mod tests {
     use super::*;
     use std::time::Instant as StdInstant;
+
+    #[test]
+    fn attachments_follow_the_prompt_as_acp_content_blocks() {
+        use crate::domain::{Attachment, AttachmentPayload};
+        let notes = Attachment { name: "notes.txt".into(), payload: AttachmentPayload::Text("the notes".into()) };
+        let photo = Attachment { name: "photo.png".into(), payload: AttachmentPayload::Image { media_type: "image/png".into(), base64: "aW1hZ2U=".into() } };
+        assert_eq!(prompt_blocks("look", &[notes, photo]).unwrap(), vec![
+            json!({"type": "text", "text": "look"}),
+            json!({"type": "text", "text": "Attached document: notes.txt\n\nthe notes"}),
+            json!({"type": "image", "mimeType": "image/png", "data": "aW1hZ2U="}),
+        ]);
+        let bitmap = Attachment { name: "old.bmp".into(), payload: AttachmentPayload::Image { media_type: "image/bmp".into(), base64: "Qk0=".into() } };
+        assert!(prompt_blocks("look", &[bitmap]).is_err());
+    }
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf},
         task::JoinHandle,
@@ -2126,7 +2169,7 @@ mod tests {
                 context_window: Some(256000),
                 efforts: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
                 default_effort: Some("high".into()),
-                images: false,
+                images: true,
             }]
         );
         let plain = json!({"availableModels": [{"modelId": "m"}]});
@@ -2138,7 +2181,7 @@ mod tests {
                 context_window: None,
                 efforts: vec![],
                 default_effort: None,
-                images: false,
+                images: true,
             }]
         );
         assert!(parse_model_options(&json!({})).is_err());

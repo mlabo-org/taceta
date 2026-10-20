@@ -18,6 +18,9 @@ pub(super) struct ActiveAgent {
     thinking: String,
     progress: String,
     submitted_prompt: Option<String>,
+    /// Files sent with `submitted_prompt`, given back with it when the run
+    /// ends before recording them.
+    submitted_attachments: Vec<Attachment>,
     /// Messages from other engines that this run imports into the task
     /// record. Once the run has a result they are part of that record.
     imported_external: Vec<Uuid>,
@@ -339,19 +342,49 @@ impl TacetaApp {
             );
             return;
         };
-        if !self.state.pending_attachments.is_empty() {
-            self.agent_notice(
-                "作業モードでは添付を外し、作業フォルダー内のファイルを指定してください。",
-                "Remove attachments and refer to files inside the workspace in Agent mode.",
-            );
+        if !resume && self.state.draft.trim().is_empty() && self.state.pending_attachments.is_empty() {
             return;
         }
-        if !resume && self.state.draft.trim().is_empty() {
+        // Web is the same switch with the same settings as in Chat, and
+        // needs the same tool support, which Code requires anyway.
+        let web_search_enabled = self.state.active_conversation().web_search_enabled && !compact_only;
+        if !resume
+            && !model.vision
+            && self
+                .state
+                .pending_attachments
+                .iter()
+                .any(|attachment| matches!(attachment.payload, AttachmentPayload::Image { .. }))
+        {
+            self.agent_notice(
+                "このモデルは画像入力に対応していません。画像は送信されませんでした。",
+                "This model does not support image input. Nothing was sent.",
+            );
             return;
         }
         let data_root = self.agent_ui.data_root.clone();
         let id = self.state.active_conversation_id;
         let prior = importable_messages(&self.state.active_conversation().messages);
+        // The task record saves an instruction, or the Chat it starts from,
+        // as one record; what cannot be saved is not sent.
+        if !self.agent_ui.has_record(id) && !taceta::agent::fits_one_record(&prior) {
+            self.agent_notice(
+                "この会話のこれまでの添付が大きすぎて、作業記録に取り込めません（合計約64MBまで）。何も送っていません。新しい会話で「Code」を始めてください。",
+                "This conversation's earlier attachments are too large for the task record (about 64 MB in total). Nothing was sent. Start Code in a new conversation.",
+            );
+            return;
+        }
+        if !resume {
+            let mut instruction = AgentMessage::text(AgentRole::User, self.state.draft.clone());
+            instruction.attachments = self.state.pending_attachments.clone();
+            if !taceta::agent::fits_one_record(&[instruction]) {
+                self.agent_notice(
+                    "添付が大きすぎて作業記録に保存できません（1回の発言で合計約64MBまで）。何も送っていません。",
+                    "The attachments are too large for the task record (about 64 MB in total per message). Nothing was sent.",
+                );
+                return;
+            }
+        }
         // Turns another engine answered since the task record was last
         // written back are imported into it before the run.
         let (external, imported_external) = {
@@ -362,30 +395,62 @@ impl TacetaApp {
                 .unwrap_or_default();
             external_records(unseen)
         };
-        let prompt = if resume {
-            None
+        let (prompt, attachments) = if resume {
+            (None, Vec::new())
         } else {
-            Some(std::mem::take(&mut self.state.draft))
+            (Some(std::mem::take(&mut self.state.draft)), std::mem::take(&mut self.state.pending_attachments))
         };
         if let Some(prompt) = &prompt {
+            let fallback = attachments.first().map_or("Taceta", |attachment| attachment.name.as_str());
             let conversation = self.state.active_conversation_mut();
             if conversation.should_generate_title() {
-                conversation.title = conversation_title(prompt, "Taceta");
+                conversation.title = conversation_title(prompt, fallback);
             }
         }
+        let context_length = self
+            .state
+            .context_length
+            .min(model.context_length.unwrap_or(self.state.context_length));
+        let thinking = self.selected_thinking_mode();
+        let web = if web_search_enabled {
+            let request = ChatRequest {
+                model: model.name.clone(),
+                messages: Vec::new(),
+                thinking,
+                context_length,
+                web_search_provider: Some(self.state.web_search_provider),
+                max_search_results: self.state.max_search_results,
+                chatgpt_web_request_limit: self.state.chatgpt_web_request_limit,
+                fetch_search_pages: self.state.fetch_search_pages,
+                web_authorization: Some(WebAuthorization { request_id: Uuid::new_v4(), session_id: Uuid::new_v4() }),
+            };
+            let client = OllamaClient::new(self.ollama_endpoint.clone()).with_link_service(Arc::clone(&self.link_service));
+            match OllamaAgentWeb::new(client, request) {
+                Ok(web) => Some(taceta::agent::WebAccess(Arc::new(web))),
+                Err(error) => {
+                    self.notice = Some(Notice {
+                        kind: NoticeKind::Error,
+                        text: web_search_error_message(&error, language),
+                    });
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let config = RunConfig {
             model: model.name,
-            thinking: self.selected_thinking_mode(),
-            context_length: self
-                .state
-                .context_length
-                .min(model.context_length.unwrap_or(self.state.context_length)),
+            thinking,
+            context_length,
             prompt,
+            attachments,
             max_steps: self.state.agent_max_steps,
             max_duration_secs: self.state.agent_max_duration_secs,
             compact_only,
+            web,
         };
         let submitted_prompt = config.prompt.clone();
+        let submitted_attachments = config.attachments.clone();
         let backend: Arc<dyn AgentModel> = match self.state.inference_provider {
             InferenceProvider::Ollama => {
                 self.ollama_used = true;
@@ -437,6 +502,7 @@ impl TacetaApp {
             thinking: String::new(),
             progress: text(language, "作業を開始しています…", "Starting task…").into(),
             submitted_prompt,
+            submitted_attachments,
             imported_external,
         });
         self.notice = None;
@@ -543,6 +609,9 @@ impl TacetaApp {
                                 });
                             if !recorded {
                                 self.state.draft = prompt.clone();
+                                if self.state.pending_attachments.is_empty() {
+                                    self.state.pending_attachments = active.submitted_attachments.clone();
+                                }
                             }
                         }
                     }
@@ -565,7 +634,13 @@ impl TacetaApp {
                         } else {
                             NoticeKind::Info
                         },
-                        text: snapshot.error.clone().unwrap_or(status),
+                        text: match &snapshot.error {
+                            Some(error) if error.starts_with(taceta::agent::WEB_RESEARCH_FAILED) => {
+                                web_search_error_message(error, self.language())
+                            }
+                            Some(error) => error.clone(),
+                            None => status,
+                        },
                     });
                     self.remember_agent_snapshot(snapshot, &imported_external);
                 }
@@ -883,18 +958,13 @@ fn importable_messages(messages: &[ChatMessage]) -> Vec<AgentMessage> {
                 Role::Assistant => AgentRole::Assistant,
                 Role::System => return None,
             };
-            let mut content = message.content.clone();
-            for attachment in &message.attachments {
-                if let AttachmentPayload::Text(text) = &attachment.payload {
-                    content.push_str(&format!("\n\nUser attachment: {}\n{text}", attachment.name));
-                }
-            }
             Some(AgentMessage {
                 role,
-                content,
+                content: message.content.clone(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_name: None,
+                attachments: message.attachments.clone(),
             })
         })
         .collect()
@@ -936,6 +1006,7 @@ fn transcript_message(id: Uuid, index: usize, message: &AgentMessage) -> Option<
     if evidence.as_ref().is_some_and(|value| value["record_kind"] == "ToolResult") { return None; }
     let content = evidence.as_ref().and_then(|value| value["content"].as_str()).unwrap_or(&message.content);
     let mut result = ChatMessage::new(role, content);
+    result.attachments = message.attachments.clone();
     result.id = Uuid::from_u128(id.as_u128() ^ ((index as u128) + 1));
     Some(result)
 }
@@ -988,7 +1059,7 @@ mod tests {
             goal: "Earlier task".into(), user_instructions: vec!["Earlier instruction".into()],
             work_state: Default::default(), messages: vec![AgentMessage {
                 role: AgentRole::Assistant, content: "Old result".into(), tool_calls: vec![],
-                tool_call_id: None, tool_name: None,
+                tool_call_id: None, tool_name: None, attachments: vec![],
             }], error: None, event_count: 1, summary: None, latest_model: Some("grok-test".into()),
         }, &[]);
         assert_eq!(app.state.active_conversation().messages[0].content, "Current GPT result");
@@ -1004,7 +1075,7 @@ mod tests {
             goal: "Task".into(), user_instructions: vec![], work_state: Default::default(),
             messages: vec![AgentMessage {
                 role: AgentRole::Assistant, content: "Task result".into(), tool_calls: vec![],
-                tool_call_id: None, tool_name: None,
+                tool_call_id: None, tool_name: None, attachments: vec![],
             }], error: None, event_count: 1, summary: None, latest_model: None,
         };
         let contents = |app: &TacetaApp| app.state.active_conversation().messages.iter()
@@ -1030,7 +1101,7 @@ mod tests {
             goal: "Task".into(), user_instructions: vec![], work_state: Default::default(),
             messages: contents.iter().map(|content| AgentMessage {
                 role: AgentRole::Assistant, content: (*content).into(), tool_calls: vec![],
-                tool_call_id: None, tool_name: None,
+                tool_call_id: None, tool_name: None, attachments: vec![],
             }).collect(),
             error: None, event_count: 1, summary: None, latest_model: None,
         };
@@ -1134,6 +1205,7 @@ mod tests {
             thinking: String::new(),
             progress: String::new(),
             submitted_prompt: None,
+            submitted_attachments: Vec::new(),
             imported_external: Vec::new(),
         });
         let request_id = Uuid::new_v4();

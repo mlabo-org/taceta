@@ -127,7 +127,7 @@ async fn gpt_reverse_import_resumes_completed_work_after_restart_without_duplica
     fixture.write("work.rs", "// already changed by GPT\n");
     let id = Uuid::new_v4();
     let mut session = AgentSession::create(&fixture.store, id, &fixture.workspace).unwrap();
-    session.record(EventData::UserInput { content: "Fix the parser without changing the public API.".into() }).unwrap();
+    session.record(EventData::UserInput { content: "Fix the parser without changing the public API.".into(), attachments: Vec::new() }).unwrap();
     session.record(EventData::StatusChanged { status: SessionStatus::Completed, message: None }).unwrap();
     let handoff = ExternalWorkHandoff {
         source: "codex".into(), source_session_id: "thread-gpt".into(), workspace: fixture.workspace.clone(),
@@ -202,9 +202,11 @@ fn config(prompt: Option<&str>) -> RunConfig {
         thinking: crate::domain::ThinkingMode::Default,
         context_length: 48_000,
         prompt: prompt.map(str::to_owned),
+        attachments: Vec::new(),
         max_steps: 30,
         max_duration_secs: 30,
         compact_only: false,
+        web: None,
     }
 }
 fn saved_work_state() -> WorkState {
@@ -508,11 +510,13 @@ fn long_session(fixture: &Fixture) -> (AgentSession, u64, Vec<u8>) {
         .record(EventData::UserInput {
             content: "Never edit secrets.txt. Preserve exact path src/result.txt and number 731."
                 .into(),
+            attachments: Vec::new(),
         })
         .unwrap();
     session
         .record(EventData::UserInput {
             content: "Correction: task-7 is unfinished; never infer that it completed.".into(),
+            attachments: Vec::new(),
         })
         .unwrap();
     session
@@ -929,4 +933,114 @@ async fn the_request_ends_with_the_prompt_being_answered_and_keeps_the_turns_in_
         assert!(position("second question") < position("second answer"));
         assert!(position("second answer") < position("third question"));
     }
+}
+
+#[tokio::test]
+async fn attached_files_reach_every_later_request_and_the_transcript_after_reopening() {
+    let fixture = Fixture::new();
+    let id = Uuid::new_v4();
+    drop(AgentSession::create(&fixture.store, id, &fixture.workspace).unwrap());
+    let attachments = vec![
+        crate::domain::Attachment { name: "notes.txt".into(), payload: crate::domain::AttachmentPayload::Text("the notes".into()) },
+        crate::domain::Attachment { name: "photo.png".into(), payload: crate::domain::AttachmentPayload::Image { media_type: "image/png".into(), base64: "aW1hZ2U=".into() } },
+    ];
+    let run = |prompt: &str, attachments: Vec<crate::domain::Attachment>| {
+        let model = Arc::new(ScriptModel::new(vec![answer("done")]));
+        let session = AgentSession::open(&fixture.store, id).unwrap();
+        let (events, _received) = mpsc::unbounded_channel();
+        let (_approvals, approval_rx) = mpsc::unbounded_channel();
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let run_config = RunConfig { attachments, ..config(Some(prompt)) };
+        let model_ref = model.clone();
+        async move { (session.run(run_config, model, events, approval_rx, cancel_rx).await, model_ref) }
+    };
+    // Attached files alone are a complete instruction, as in Chat.
+    let (first, _) = run("", attachments.clone()).await;
+    let snapshot = first.unwrap();
+    assert_eq!(snapshot.messages[0].attachments, attachments);
+    let (_, model) = run("next", Vec::new()).await;
+    let request = &model.requests.lock().unwrap()[0];
+    assert!(request.messages.iter().any(|message| message.role == AgentRole::User && message.attachments == attachments));
+}
+
+struct FixtureWeb {
+    researched: Mutex<Vec<String>>,
+    called: Mutex<Vec<(String, String)>>,
+}
+impl AgentWeb for FixtureWeb {
+    fn tools(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition { name: "web_search".into(), description: "Search the web.".into(), parameters: json!({"type":"object"}) }]
+    }
+    fn research(&self, instruction: String, _progress: UnboundedSender<String>) -> AgentWebFuture<Result<(AgentToolCall, String), String>> {
+        self.researched.lock().unwrap().push(instruction.clone());
+        Box::pin(async move {
+            Ok((AgentToolCall { id: "research-1".into(), name: "web_search".into(), arguments: json!({"query": instruction}) }, "SOURCE_FROM_RESEARCH".into()))
+        })
+    }
+    fn call(&self, call: AgentToolCall, instruction: String, _progress: UnboundedSender<String>) -> AgentWebFuture<Result<String, String>> {
+        self.called.lock().unwrap().push((call.arguments["query"].as_str().unwrap_or_default().to_owned(), instruction));
+        Box::pin(async { Ok("SOURCE_FROM_CALL".into()) })
+    }
+}
+
+#[tokio::test]
+async fn web_on_searches_each_new_instruction_first_and_offers_web_tools_without_approval() {
+    let fixture = Fixture::new();
+    let id = Uuid::new_v4();
+    drop(AgentSession::create(&fixture.store, id, &fixture.workspace).unwrap());
+    let web = Arc::new(FixtureWeb { researched: Mutex::new(Vec::new()), called: Mutex::new(Vec::new()) });
+    let model = Arc::new(ScriptModel::new(vec![tool("web_search", json!({"query": "follow-up"})), answer("done")]));
+    let (events, _received) = mpsc::unbounded_channel();
+    let (_approvals, approval_rx) = mpsc::unbounded_channel();
+    let (_cancel, cancel_rx) = watch::channel(false);
+    let web_config = RunConfig { web: Some(WebAccess(web.clone())), ..config(Some("what changed in the release")) };
+    let snapshot = AgentSession::open(&fixture.store, id).unwrap()
+        .run(web_config, model.clone(), events, approval_rx, cancel_rx).await.unwrap();
+    assert_eq!(snapshot.status, SessionStatus::Completed);
+    assert_eq!(*web.researched.lock().unwrap(), ["what changed in the release"]);
+    // The model's own call ran with no approval asked, for the current instruction.
+    assert_eq!(*web.called.lock().unwrap(), [("follow-up".to_owned(), "what changed in the release".to_owned())]);
+    {
+        let requests = model.requests.lock().unwrap();
+        assert!(requests[0].tools.iter().any(|tool| tool.name == "web_search"));
+        assert!(requests[0].messages.iter().any(|message| message.role == AgentRole::Tool && message.content.contains("SOURCE_FROM_RESEARCH")));
+        assert!(requests[1].messages.iter().any(|message| message.role == AgentRole::Tool && message.content.contains("SOURCE_FROM_CALL")));
+    }
+
+    // Web OFF: no web tool, and a web call is not run.
+    let model = Arc::new(ScriptModel::new(vec![answer("done")]));
+    let (events, _received) = mpsc::unbounded_channel();
+    let (_approvals, approval_rx) = mpsc::unbounded_channel();
+    let (_cancel, cancel_rx) = watch::channel(false);
+    AgentSession::open(&fixture.store, id).unwrap()
+        .run(config(Some("next")), model.clone(), events, approval_rx, cancel_rx).await.unwrap();
+    assert!(!model.requests.lock().unwrap()[0].tools.iter().any(|tool| tool.name == "web_search"));
+    assert_eq!(web.researched.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_instruction_with_several_photos_is_saved_and_one_past_the_record_limit_is_refused_unsent() {
+    let fixture = Fixture::new();
+    let id = Uuid::new_v4();
+    drop(AgentSession::create(&fixture.store, id, &fixture.workspace).unwrap());
+    let photo = |megabytes: usize| crate::domain::Attachment {
+        name: "photo.png".into(),
+        payload: crate::domain::AttachmentPayload::Image { media_type: "image/png".into(), base64: "A".repeat(megabytes * 1024 * 1024) },
+    };
+    // Three 3 MB photos: past the limit the journal had before images were kept.
+    let photos = vec![photo(3), photo(3), photo(3)];
+    let mut message = AgentMessage::text(AgentRole::User, "look");
+    message.attachments = photos.clone();
+    assert!(fits_one_record(std::slice::from_ref(&message)));
+    let model = Arc::new(ScriptModel::new(vec![answer("done")]));
+    let (events, _received) = mpsc::unbounded_channel();
+    let (_approvals, approval_rx) = mpsc::unbounded_channel();
+    let (_cancel, cancel_rx) = watch::channel(false);
+    let snapshot = AgentSession::open(&fixture.store, id).unwrap()
+        .run(RunConfig { attachments: photos, ..config(Some("look")) }, model, events, approval_rx, cancel_rx).await.unwrap();
+    assert_eq!(snapshot.status, SessionStatus::Completed);
+    assert_eq!(AgentSession::open(&fixture.store, id).unwrap().snapshot().messages[0].attachments.len(), 3);
+
+    message.attachments = vec![photo(70)];
+    assert!(!fits_one_record(&[message]));
 }

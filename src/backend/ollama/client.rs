@@ -8,7 +8,7 @@ use super::{
 use crate::{
     backend::{BackendError, BackendFuture, InferenceBackend, ModelManager},
     domain::{
-        AttachmentPayload, ChatMessage, ChatRequest, GenerationEvent, ModelCandidate,
+        ChatMessage, ChatRequest, GenerationEvent, ModelCandidate,
         ModelDescriptor, ModelManagerEvent, ModelPullRequest, Role, ThinkingMode, WebWorkflow,
         normalize_chatgpt_web_request_limit,
     },
@@ -259,6 +259,174 @@ impl crate::agent::AgentModel for OllamaClient {
     }
 }
 
+/// The web research a Code run gets when the user turned Web on: Chat's
+/// tools, providers, browser link and request budgets, kept for the run.
+pub struct OllamaAgentWeb(Arc<AgentWebRun>);
+
+struct AgentWebRun {
+    client: OllamaClient,
+    /// Chat's request settings for the run; the messages are filled per call.
+    request: ChatRequest,
+    provider: Option<WebSearchProvider>,
+    link_workflow: Option<WebWorkflow>,
+    budgets: tokio::sync::Mutex<AgentWebBudgets>,
+}
+
+struct AgentWebBudgets {
+    chatgpt: ChatGptWebRequestBudget,
+    fetch: FetchBudget,
+    seen: HashSet<String>,
+}
+
+impl OllamaAgentWeb {
+    /// `request` carries the model and Web settings exactly as Chat sends
+    /// them, with the provider set. Its messages are not used.
+    pub fn new(client: OllamaClient, request: ChatRequest) -> Result<Self, String> {
+        let kind = match request.web_search_provider {
+            None => return Err("Web Search is off".into()),
+            Some(ProviderKind::Unknown) => return Err("unsupported web search provider".into()),
+            Some(kind) => kind,
+        };
+        let link_workflow = link_workflow(kind);
+        let provider = if link_workflow.is_some() {
+            if client.link_service.is_none() {
+                return Err("Taceta Link is unavailable".into());
+            }
+            None
+        } else {
+            Some(WebSearchProvider::from_kind(kind).map_err(|error| error.to_string())?)
+        };
+        let fetch = FetchBudget::for_context(
+            request.context_length,
+            Some(PageSummarizer {
+                http: client.http.clone(),
+                chat_url: client.url("/api/chat"),
+                model: request.model.clone(),
+                context_tokens: request.context_length as usize,
+            }),
+        );
+        let budgets = AgentWebBudgets {
+            chatgpt: ChatGptWebRequestBudget::new(request.chatgpt_web_request_limit),
+            fetch,
+            seen: HashSet::new(),
+        };
+        Ok(Self(Arc::new(AgentWebRun { client, request, provider, link_workflow, budgets: tokio::sync::Mutex::new(budgets) })))
+    }
+}
+
+/// A sender for Web progress whose display lines go on to `progress`, and
+/// the future that forwards them until the sender is dropped.
+fn web_progress(progress: UnboundedSender<String>) -> (UnboundedSender<GenerationEvent>, impl std::future::Future<Output = ()>) {
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let forward = async move {
+        while let Some(event) = received.recv().await {
+            if let GenerationEvent::SearchProgress(line) = event {
+                let _ = progress.send(line);
+            }
+        }
+    };
+    (events, forward)
+}
+
+impl crate::agent::AgentWeb for OllamaAgentWeb {
+    fn tools(&self) -> Vec<crate::agent::ToolDefinition> {
+        web_tools::tools(page_fetch_available(self.0.request.fetch_search_pages, self.0.link_workflow.as_ref()))
+    }
+
+    fn research(
+        &self,
+        instruction: String,
+        progress: UnboundedSender<String>,
+    ) -> crate::agent::AgentWebFuture<Result<(crate::agent::AgentToolCall, String), String>> {
+        let run = Arc::clone(&self.0);
+        Box::pin(async move {
+            let (events, forward) = web_progress(progress);
+            let work = async move {
+                let client = &run.client;
+                lifecycle::ensure_ready(&client.http, &client.endpoint).await?;
+                memory::release_all_but(&client.http, &client.endpoint, &run.request.model).await?;
+                let current = ChatMessage::new_user(instruction);
+                let mut request = run.request.clone();
+                request.messages = vec![current.clone()];
+                let thinking = client.web_routing_thinking(&request.model).await?;
+                let route = determine_web_route(client, &request, &current, &thinking, &events).await?;
+                let (call, trigger) = initial_web_search_call(&request, &route)?
+                    .ok_or_else(|| BackendError::Web("Web Search is off".into()))?;
+                let mut budgets = run.budgets.lock().await;
+                let budgets = &mut *budgets;
+                let mut messages = Vec::new();
+                perform_forced_web_search(
+                    client,
+                    &request,
+                    run.provider.as_ref(),
+                    run.link_workflow.clone(),
+                    Some(&current),
+                    call.clone(),
+                    &events,
+                    &mut budgets.chatgpt,
+                    &mut budgets.fetch,
+                    &mut budgets.seen,
+                    &mut messages,
+                    trigger,
+                )
+                .await?;
+                let content = messages.pop().map(|message| message.content).unwrap_or_default();
+                Ok::<_, BackendError>((
+                    crate::agent::AgentToolCall { id: uuid::Uuid::new_v4().to_string(), name: call.name, arguments: call.arguments },
+                    content,
+                ))
+            };
+            let (result, ()) = tokio::join!(work, forward);
+            result.map_err(|error| error.to_string())
+        })
+    }
+
+    fn call(
+        &self,
+        call: crate::agent::AgentToolCall,
+        instruction: String,
+        progress: UnboundedSender<String>,
+    ) -> crate::agent::AgentWebFuture<Result<String, String>> {
+        let run = Arc::clone(&self.0);
+        Box::pin(async move {
+            let (events, forward) = web_progress(progress);
+            let work = async move {
+                let call = ToolCall { name: call.name, arguments: call.arguments };
+                let current = ChatMessage::new_user(instruction);
+                let mut budgets = run.budgets.lock().await;
+                let budgets = &mut *budgets;
+                let ordinal = match budgets.chatgpt.admit(run.link_workflow.as_ref(), &call.name) {
+                    ChatGptWebAdmission::Exhausted => {
+                        return Ok(budget_payload(
+                            "Tacetaで設定したChatGPT Web質問回数に達しました。追加質問は実行せず、取得済みの回答を使ってください",
+                        ));
+                    }
+                    ChatGptWebAdmission::Allowed { ordinal, .. } => Some(ordinal),
+                    ChatGptWebAdmission::Passthrough => None,
+                };
+                let (content, _sources) = execute_tool(
+                    run.provider.as_ref(),
+                    run.client.link_service.as_ref(),
+                    run.link_workflow.clone(),
+                    run.request.web_authorization.clone(),
+                    Some(&current),
+                    ordinal,
+                    ChatGptPromptSource::LocalModelQuery,
+                    &call,
+                    &events,
+                    &mut budgets.fetch,
+                    run.request.max_search_results,
+                    run.request.fetch_search_pages,
+                )
+                .await?;
+                Ok::<_, BackendError>(content)
+            };
+            let (result, ()) = tokio::join!(work, forward);
+            result.map_err(|error| error.to_string())
+        })
+    }
+}
+
 fn agent_chat_body(request: crate::agent::AgentRequest) -> ChatBody {
     use crate::agent::AgentRole;
     let mut options = ChatOptions::generation(request.context_length);
@@ -272,8 +440,8 @@ fn agent_chat_body(request: crate::agent::AgentRequest) -> ChatBody {
                 AgentRole::Assistant => "assistant",
                 AgentRole::Tool => "tool",
             }.into(),
-            content: message.content,
-            images: Vec::new(),
+            content: crate::domain::text_with_attachments(&message.content, &message.attachments),
+            images: crate::domain::attachment_images(&message.attachments),
             tool_calls: (!message.tool_calls.is_empty()).then(|| message.tool_calls.into_iter()
                 .map(|call| serde_json::json!({"function":{"name":call.name,"arguments":call.arguments}})).collect()),
             tool_name: message.tool_name,
@@ -362,12 +530,12 @@ mod agent_adapter_tests {
             model: "fixture-model".into(), context_length: 32_768,
             thinking: ThinkingMode::Level(ThinkingLevel::Low),
             messages: vec![
-                AgentMessage { role: AgentRole::User, content: "Continue".into(), tool_calls: vec![], tool_call_id: None, tool_name: None },
+                AgentMessage { role: AgentRole::User, content: "Continue".into(), tool_calls: vec![], tool_call_id: None, tool_name: None, attachments: vec![] },
                 AgentMessage { role: AgentRole::Assistant, content: String::new(),
                     tool_calls: vec![AgentToolCall { id: "previous-call".into(), name: "read_file".into(), arguments: serde_json::json!({"path":"README.md"}) }],
-                    tool_call_id: None, tool_name: None },
+                    tool_call_id: None, tool_name: None, attachments: vec![] },
                 AgentMessage { role: AgentRole::Tool, content: "file contents".into(), tool_calls: vec![],
-                    tool_call_id: Some("previous-call".into()), tool_name: Some("read_file".into()) },
+                    tool_call_id: Some("previous-call".into()), tool_name: Some("read_file".into()), attachments: vec![] },
             ],
             tools: vec![ToolDefinition { name: "read_file".into(), description: "Read a workspace file".into(), parameters: serde_json::json!({"type":"object"}) }],
         };
@@ -418,24 +586,10 @@ impl InferenceBackend for OllamaClient {
             if request.web_search_provider == Some(ProviderKind::Unknown) {
                 return Err(BackendError::Web("unsupported web search provider".into()));
             }
-            let tools = request.web_search_provider.map(|_| web_tools::definitions());
+            let tools = request.web_search_provider.map(|_| web_tools::definitions(true));
             let mut routing_thinking = crate::domain::ThinkingCapability::Unverified;
             if tools.is_some() {
-                let show: ShowResponse = client
-                    .http
-                    .post(client.url("/api/show"))
-                    .json(&serde_json::json!({"model": request.model}))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
-                if !capability::has_tools(&show.capabilities) {
-                    return Err(BackendError::Web(
-                        "selected Ollama model does not advertise tool support".into(),
-                    ));
-                }
-                routing_thinking = capability::classify(&request.model, &show.details.family);
+                routing_thinking = client.web_routing_thinking(&request.model).await?;
             }
             let provider_kind = request.web_search_provider;
             let link_workflow = provider_kind.and_then(link_workflow);
@@ -466,9 +620,8 @@ impl InferenceBackend for OllamaClient {
             };
             // Offer page fetching only where a call can succeed; an offered tool
             // that always fails would end the whole turn.
-            let page_fetch_available = request.fetch_search_pages
-                && !matches!(&link_workflow, Some(crate::domain::WebWorkflow::ChatGptWeb));
-            let tools = tools.map(|tools| offered_web_tools(tools, page_fetch_available));
+            let page_fetch_available = page_fetch_available(request.fetch_search_pages, link_workflow.as_ref());
+            let tools = tools.map(|_| web_tools::definitions(page_fetch_available));
             let mut messages = generation_messages(&request.messages, tools.is_some());
             if request.fetch_search_pages
                 && matches!(
@@ -675,6 +828,26 @@ impl InferenceBackend for OllamaClient {
 }
 
 impl OllamaClient {
+    /// Checks that `model` can call the web tools and returns what the Web
+    /// router may assume about its Thinking.
+    async fn web_routing_thinking(&self, model: &str) -> Result<crate::domain::ThinkingCapability, BackendError> {
+        let show: ShowResponse = self
+            .http
+            .post(self.url("/api/show"))
+            .json(&serde_json::json!({"model": model}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if !capability::has_tools(&show.capabilities) {
+            return Err(BackendError::Web(
+                "selected Ollama model does not advertise tool support".into(),
+            ));
+        }
+        Ok(capability::classify(model, &show.details.family))
+    }
+
     fn clone_for_task(&self) -> Self {
         Self {
             http: self.http.clone(),
@@ -692,23 +865,10 @@ fn role(role: &Role) -> &'static str {
     }
 }
 fn wire_message(message: &ChatMessage) -> WireMessage {
-    let mut content = message.content.clone();
-    let mut images = Vec::new();
-    for attachment in &message.attachments {
-        match &attachment.payload {
-            AttachmentPayload::Text(text) => {
-                content.push_str("\n\n--- ");
-                content.push_str(&attachment.name);
-                content.push_str(" ---\n");
-                content.push_str(text);
-            }
-            AttachmentPayload::Image { base64, .. } => images.push(base64.clone()),
-        }
-    }
     WireMessage {
         role: role(&message.role).into(),
-        content,
-        images,
+        content: crate::domain::text_with_attachments(&message.content, &message.attachments),
+        images: crate::domain::attachment_images(&message.attachments),
         tool_calls: None,
         tool_name: None,
     }
@@ -917,22 +1077,10 @@ fn prepare_web_research(messages: &mut Vec<WireMessage>, page_fetch_available: b
     });
 }
 
-/// The declared tools minus page fetching when it cannot be used this turn.
-fn offered_web_tools(tools: serde_json::Value, page_fetch_available: bool) -> serde_json::Value {
-    if page_fetch_available {
-        return tools;
-    }
-    let mut offered: Vec<serde_json::Value> = tools
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|tool| tool["function"]["name"] == "web_search")
-        .cloned()
-        .collect();
-    for tool in &mut offered {
-        tool["function"]["description"] = "Search the web and return up to five sources.".into();
-    }
-    serde_json::Value::Array(offered)
+/// Whether a page fetch can succeed with these settings. The ChatGPT
+/// workflow answers by itself and offers no pages to read.
+fn page_fetch_available(fetch_search_pages: bool, link_workflow: Option<&WebWorkflow>) -> bool {
+    fetch_search_pages && !matches!(link_workflow, Some(WebWorkflow::ChatGptWeb))
 }
 
 /// A fresh summarizer gets no conversation history, research-model prose,
@@ -2194,6 +2342,7 @@ mod tests {
 
     #[test]
     fn wire_message_never_includes_thinking_and_routes_attachments() {
+        use crate::domain::AttachmentPayload;
         let mut m = ChatMessage::new_user("ask");
         m.thinking = "private trace".into();
         m.attachments.push(crate::domain::Attachment {
@@ -2210,6 +2359,15 @@ mod tests {
         let w = wire_message(&m);
         assert!(w.content.contains("context") && !w.content.contains("private trace"));
         assert_eq!(w.images, vec!["abc"]);
+
+        // Code sends the same message the same way.
+        let mut agent_message = crate::agent::AgentMessage::text(crate::agent::AgentRole::User, "ask");
+        agent_message.attachments = m.attachments.clone();
+        let body = agent_chat_body(crate::agent::AgentRequest {
+            model: "fixture-model".into(), messages: vec![agent_message], tools: Vec::new(),
+            thinking: ThinkingMode::Default, context_length: 32_768,
+        });
+        assert_eq!((&body.messages[0].content, &body.messages[0].images), (&w.content, &w.images));
     }
     #[test]
     fn thinking_modes_map_to_ollama_values() {
@@ -2325,9 +2483,9 @@ mod tests {
             tools.as_array().unwrap().iter()
                 .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned()).collect()
         };
-        let with_fetch = offered_web_tools(web_tools::definitions(), true);
+        let with_fetch = web_tools::definitions(true);
         assert_eq!(names(&with_fetch), ["web_search", "web_fetch"]);
-        let search_only = offered_web_tools(web_tools::definitions(), false);
+        let search_only = web_tools::definitions(false);
         assert_eq!(names(&search_only), ["web_search"]);
         assert!(!serde_json::to_string(&search_only).unwrap().contains("web_fetch"));
 

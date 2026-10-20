@@ -41,7 +41,8 @@ pub(super) struct UsageObservation {
 pub(super) struct State {
     pub snapshot: SessionSnapshot,
     pub groups: Vec<MessageGroup>,
-    pub instructions: Vec<(u64, String)>,
+    /// Each user instruction's journal event, text and attached files.
+    pub instructions: Vec<(u64, String, Vec<crate::domain::Attachment>)>,
     pub order: Vec<Turn>,
     pending: BTreeMap<String, (usize, AgentToolCall)>,
     started: BTreeSet<String>,
@@ -91,12 +92,12 @@ impl State {
         Ok(state)
     }
 
-    fn user_instruction(&mut self, seq: u64, text: &str) {
+    fn user_instruction(&mut self, seq: u64, text: &str, attachments: &[crate::domain::Attachment]) {
         if self.instructions.is_empty() {
             self.snapshot.goal = text.to_owned();
         }
         self.order.push(Turn::Instruction(self.instructions.len()));
-        self.instructions.push((seq, text.to_owned()));
+        self.instructions.push((seq, text.to_owned(), attachments.to_vec()));
         self.snapshot.user_instructions.push(text.to_owned());
     }
 
@@ -115,7 +116,7 @@ impl State {
             EventData::ImportedMessages { messages } => {
                 for (index, message) in messages.iter().enumerate() {
                     if message.role == AgentRole::User {
-                        self.user_instruction(record.seq, &message.content);
+                        self.user_instruction(record.seq, &message.content, &message.attachments);
                     } else if message.role == AgentRole::Assistant {
                         self.order.push(Turn::Group(self.groups.len()));
                         self.groups.push(MessageGroup {
@@ -132,7 +133,7 @@ impl State {
             }
             EventData::ExternalWorkImported { source, source_session_id, record: imported, .. } => {
                 let message = if imported.role == ExternalWorkRole::User {
-                    self.user_instruction(record.seq, &imported.content);
+                    self.user_instruction(record.seq, &imported.content, &[]);
                     AgentMessage::text(AgentRole::User, &imported.content)
                 } else {
                     let message = AgentMessage::text(AgentRole::Assistant,
@@ -161,8 +162,8 @@ impl State {
                 // the input after importing external execution records.
                 self.usage = None;
             }
-            EventData::UserInput { content } => {
-                self.user_instruction(record.seq, content);
+            EventData::UserInput { content, attachments } => {
+                self.user_instruction(record.seq, content, attachments);
                 // New durable input is unfinished even if the process exits
                 // before the following RunStarted event is written.
                 self.snapshot.status = SessionStatus::Interrupted;
@@ -170,11 +171,12 @@ impl State {
                 if let Some(usage) = &mut self.usage {
                     usage.projected_input_tokens = usage
                         .projected_input_tokens
-                        .saturating_add(content.len() as u64 + 384);
+                        .saturating_add(content.len() as u64 + 384)
+                        .saturating_add(super::context::attachment_units(attachments) as u64);
                 }
-                self.snapshot
-                    .messages
-                    .push(AgentMessage::text(AgentRole::User, content));
+                let mut message = AgentMessage::text(AgentRole::User, content);
+                message.attachments = attachments.clone();
+                self.snapshot.messages.push(message);
             }
             EventData::RunStarted {
                 model,

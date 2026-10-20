@@ -102,8 +102,6 @@ impl CliAgent for CodexCli {
         })
     }
 
-    fn accepts_attachments(&self) -> bool { true }
-
     fn run(
         &self, request: RunRequest, events: UnboundedSender<Event>,
         mut controls: UnboundedReceiver<Control>, mut cancel: watch::Receiver<bool>,

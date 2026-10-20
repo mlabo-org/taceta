@@ -10,6 +10,7 @@ use super::{
     RunOutcome, RunRequest, RunStatus, ToolItem, ToolStatus, Usage,
     process::{CliProcess, find_executable, usual_install_dirs},
 };
+use crate::domain::{Attachment, AttachmentPayload};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -80,7 +81,8 @@ impl CliAgent for ClaudeCode {
                     context_window: None,
                     efforts: EFFORTS.iter().map(|effort| (*effort).to_owned()).collect(),
                     default_effort: None,
-                    images: false,
+                    // Every current Claude model reads images.
+                    images: true,
                 })
                 .collect())
         })
@@ -107,6 +109,29 @@ impl CliAgent for ClaudeCode {
             drive(process, request, events, controls, cancel, limits).await
         })
     }
+}
+
+/// The user message's content blocks: the prompt, then each attachment.
+/// Images use the documented base64 image block of stream-json input.
+fn prompt_content(prompt: &str, attachments: &[Attachment]) -> Result<Vec<Value>, String> {
+    let mut content = Vec::new();
+    if !prompt.is_empty() || attachments.is_empty() {
+        content.push(json!({"type": "text", "text": prompt}));
+    }
+    for attachment in attachments {
+        match &attachment.payload {
+            AttachmentPayload::Text(text) => {
+                content.push(json!({"type": "text", "text": super::attached_text(attachment, text)}));
+            }
+            AttachmentPayload::Image { media_type, base64 } => {
+                if !super::accepted_image_type(media_type) || base64.is_empty() {
+                    return Err(format!("Claude accepts PNG, JPEG, WebP and GIF images; {} was not sent.", attachment.name));
+                }
+                content.push(json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64}}));
+            }
+        }
+    }
+    Ok(content)
 }
 
 /// Runs a short, inference-free subcommand and returns its standard output.
@@ -182,9 +207,16 @@ async fn drive(
     limits: Limits,
 ) -> RunOutcome {
     let deadline = Instant::now() + limits.duration;
+    let content = match prompt_content(&request.prompt, &request.attachments) {
+        Ok(content) => content,
+        Err(error) => {
+            process.shutdown().await;
+            return RunOutcome::failed(request.session_id, error);
+        }
+    };
     let prompt = json!({
         "type": "user",
-        "message": {"role": "user", "content": [{"type": "text", "text": request.prompt}]},
+        "message": {"role": "user", "content": content},
     });
     if let Err(error) = process.send(&prompt).await {
         process.shutdown().await;
@@ -698,6 +730,22 @@ fn bound(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn attachments_follow_the_prompt_as_documented_content_blocks() {
+        let attachments = vec![
+            Attachment { name: "notes.txt".into(), payload: AttachmentPayload::Text("the notes".into()) },
+            Attachment { name: "photo.png".into(), payload: AttachmentPayload::Image { media_type: "image/png".into(), base64: "aW1hZ2U=".into() } },
+        ];
+        assert_eq!(prompt_content("look", &attachments).unwrap(), vec![
+            json!({"type": "text", "text": "look"}),
+            json!({"type": "text", "text": "Attached document: notes.txt\n\nthe notes"}),
+            json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="}}),
+        ]);
+        assert_eq!(prompt_content("", &attachments).unwrap().len(), 2);
+        let bitmap = [Attachment { name: "old.bmp".into(), payload: AttachmentPayload::Image { media_type: "image/bmp".into(), base64: "Qk0=".into() } }];
+        assert!(prompt_content("look", &bitmap).is_err());
+    }
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines},
         task::JoinHandle,

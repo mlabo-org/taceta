@@ -12,7 +12,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+/// One record holds a user instruction or a Chat import with its attached
+/// images, so it is sized for several photos rather than for text alone.
+pub(super) const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 /// Raised when a record's meaning changes in a way an older build would
 /// misread. A build refuses sessions with a higher format than its own.
 pub(super) const FORMAT: u32 = 1;
@@ -42,6 +44,8 @@ pub(super) enum EventData {
     },
     UserInput {
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::domain::Attachment>,
     },
     RunStarted {
         model: String,

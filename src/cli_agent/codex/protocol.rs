@@ -16,11 +16,11 @@ pub(super) fn input(prompt: &str, attachments: &[Attachment], images: bool) -> R
     for attachment in attachments {
         match &attachment.payload {
             AttachmentPayload::Text(content) => result.push(json!({
-                "type":"text", "text":format!("Attached document: {}\n\n{}", attachment.name, content)
+                "type":"text", "text":super::super::attached_text(attachment, content)
             })),
             AttachmentPayload::Image { media_type, base64 } => {
                 if !images { return Err("The selected GPT model did not advertise image input support.".into()); }
-                if !matches!(media_type.as_str(), "image/png" | "image/jpeg" | "image/webp" | "image/gif") || base64.is_empty() {
+                if !super::super::accepted_image_type(media_type) || base64.is_empty() {
                     return Err("GPT image attachment has an unsupported media type or no image data.".into());
                 }
                 result.push(json!({"type":"image","url":format!("data:{media_type};base64,{base64}")}));
